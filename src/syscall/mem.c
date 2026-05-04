@@ -297,10 +297,10 @@ int64_t sys_mmap(guest_t *g,
     bool is_noreserve = is_anon && (flags & LINUX_MAP_NORESERVE) != 0;
     host_fd_ref_t backing_ref = {.fd = -1, .owned = 0};
     int host_backing_fd = -1, track_backing_fd = -1;
-    int track_flags = is_anon
-                          ? (LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS)
-                          : ((flags & LINUX_MAP_SHARED) ? LINUX_MAP_SHARED
-                                                        : LINUX_MAP_PRIVATE);
+    int track_flags =
+        ((flags & LINUX_MAP_SHARED) ? LINUX_MAP_SHARED : LINUX_MAP_PRIVATE);
+    if (is_anon)
+        track_flags |= LINUX_MAP_ANONYMOUS;
 
     /* Preserve MAP_NORESERVE in region metadata before merge checks run. */
     if (is_noreserve)
@@ -1018,6 +1018,29 @@ int64_t sys_mremap(guest_t *g,
 
 /* sys_madvise. */
 
+/* Returns true if [off, off+length) is fully covered by mapped regions.
+ * Mirrors Linux madvise_walk_vmas, which returns -ENOMEM whenever it would step
+ * over an unmapped sub-range. Caller holds mmap_lock.
+ */
+static bool madvise_range_mapped(const guest_t *g,
+                                 uint64_t off,
+                                 uint64_t length)
+{
+    uint64_t end = off + length;
+    uint64_t covered = off;
+    for (int i = 0; i < g->nregions; i++) {
+        const guest_region_t *r = &g->regions[i];
+        if (r->start >= end)
+            break;
+        if (r->end <= covered)
+            continue;
+        if (r->start > covered)
+            return false;
+        covered = r->end;
+    }
+    return covered >= end;
+}
+
 int64_t sys_madvise(guest_t *g, uint64_t addr, uint64_t length, int advice)
 {
     if (addr & 4095)
@@ -1029,61 +1052,91 @@ int64_t sys_madvise(guest_t *g, uint64_t addr, uint64_t length, int advice)
     if (length == 0)
         return 0;
 
+    /* Range must lie within the guest IPA window. Linux returns -ENOMEM
+     * (not -EINVAL) for addresses outside the process address space — see
+     * madvise(2): "Addresses in the specified range are not currently
+     * mapped, or are outside the address space of the process."
+     */
+    uint64_t off = addr - g->ipa_base;
+    if (off > g->guest_size || length > g->guest_size - off)
+        return -LINUX_ENOMEM;
+
     switch (advice) {
     case LINUX_MADV_DONTNEED: {
-        /* MADV_DONTNEED: zero the pages so next access sees zero-fill.
-         * Linux guarantees zero-fill on next access for anonymous pages.
+        /* MADV_DONTNEED: zero anon pages so next access sees zero-fill,
+         * restore file-backed pages from the current backing file contents.
          * Linux returns -ENOMEM if any part of the range is unmapped.
+         *
+         * Writable MAP_SHARED file-backed regions are preserved so elfuse
+         * does not overwrite unsynced in-memory writes with backing-file
+         * contents. Read-only MAP_SHARED mappings can be invalidated safely
+         * and should refault from the current file image.
+         *
+         * PROT_NONE anonymous regions still get zeroed so the guest's next
+         * mprotect-and-read sees zero-fill (Linux semantics: pages are
+         * detached, faulted in lazily as zero on re-grant).
          */
-        uint64_t off = addr - g->ipa_base;
-        if (off > g->guest_size || length > g->guest_size - off)
-            return -LINUX_EINVAL;
+        if (!madvise_range_mapped(g, off, length))
+            return -LINUX_ENOMEM;
 
         uint64_t end = off + length;
-
-        /* Verify the entire range is covered by regions (Linux returns
-         * -ENOMEM for unmapped holes). Walk regions and check for gaps.
-         */
-        uint64_t covered = off;
-        for (int i = 0; i < g->nregions; i++) {
-            const guest_region_t *r = &g->regions[i];
-            if (r->start >= end)
-                break;
-            if (r->end <= covered)
-                continue;
-            if (r->start > covered)
-                return -LINUX_ENOMEM; /* Unmapped hole */
-            covered = r->end;
-        }
-        if (covered < end)
-            return -LINUX_ENOMEM; /* Tail unmapped */
-
-        /* Anonymous pages become zero-fill. MAP_PRIVATE file mappings discard
-         * private pages so later reads see the backing file contents again.
-         */
         for (int i = 0; i < g->nregions; i++) {
             const guest_region_t *r = &g->regions[i];
             if (r->start >= end)
                 break;
             if (r->end <= off)
                 continue;
-            if (r->prot == LINUX_PROT_NONE)
-                continue;
             if (!(r->flags & LINUX_MAP_ANONYMOUS) && r->backing_fd < 0)
                 continue;
+            if (r->shared && r->backing_fd >= 0 && (r->prot & LINUX_PROT_WRITE))
+                continue;
 
-            /* Compute overlap with the requested range */
             uint64_t zstart = (r->start > off) ? r->start : off;
             uint64_t zend = (r->end < end) ? r->end : end;
             memset((uint8_t *) g->host_base + zstart, 0, zend - zstart);
             if (!(r->flags & LINUX_MAP_ANONYMOUS)) {
                 uint64_t file_off = r->offset + (zstart - r->start);
-                ssize_t nr =
-                    pread(r->backing_fd, (uint8_t *) g->host_base + zstart,
-                          zend - zstart, (off_t) file_off);
-                if (nr < 0)
-                    return linux_errno();
+                uint8_t *dst = (uint8_t *) g->host_base + zstart;
+                size_t remaining = zend - zstart;
+                while (remaining > 0) {
+                    ssize_t nr =
+                        pread(r->backing_fd, dst, remaining, (off_t) file_off);
+                    if (nr < 0) {
+                        if (errno == EINTR)
+                            continue;
+                        return linux_errno();
+                    }
+                    if (nr == 0)
+                        break; /* EOF: tail stays zero per mmap rules. */
+                    dst += nr;
+                    file_off += nr;
+                    remaining -= (size_t) nr;
+                }
             }
+        }
+        return 0;
+    }
+
+    case LINUX_MADV_FREE: {
+        /* MADV_FREE: only valid for private anonymous mappings. Linux returns
+         * -EINVAL for any non-anonymous vma (vma_is_anonymous check), even if
+         * the region is tracked without a live backing fd. Subsequent reads may
+         * legally return either old data or zero, so a no-op satisfies the spec
+         * for the anon case.
+         */
+        if (!madvise_range_mapped(g, off, length))
+            return -LINUX_ENOMEM;
+
+        uint64_t end = off + length;
+        for (int i = 0; i < g->nregions; i++) {
+            const guest_region_t *r = &g->regions[i];
+            if (r->start >= end)
+                break;
+            if (r->end <= off)
+                continue;
+            if (!(r->flags & LINUX_MAP_ANONYMOUS) ||
+                (r->flags & LINUX_MAP_SHARED))
+                return -LINUX_EINVAL;
         }
         return 0;
     }
@@ -1092,12 +1145,17 @@ int64_t sys_madvise(guest_t *g, uint64_t addr, uint64_t length, int advice)
     case LINUX_MADV_RANDOM:
     case LINUX_MADV_SEQUENTIAL:
     case LINUX_MADV_WILLNEED:
-    case LINUX_MADV_FREE:
     case LINUX_MADV_HUGEPAGE:
     case LINUX_MADV_NOHUGEPAGE:
     case LINUX_MADV_COLD:
     case LINUX_MADV_PAGEOUT:
-        /* Advisory hints: no-op in emulation */
+        /* Advisory hints: accept silently.  Linux walks vmas and returns
+         * -ENOMEM for any unmapped sub-range; mirror that for fidelity.
+         * No host swap means PAGEOUT/COLD do not actually evict — keeping
+         * data in place is a stricter guarantee than Linux's.
+         */
+        if (!madvise_range_mapped(g, off, length))
+            return -LINUX_ENOMEM;
         return 0;
 
     default:
