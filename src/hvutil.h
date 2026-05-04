@@ -63,7 +63,7 @@
      (1ULL << 7) /* ITD    */)
 
 /* TCR_EL1.
- * 4KB granule, 48-bit VA, EPD1=1 (TTBR1 walks disabled).
+ * 4KiB granule, 48-bit VA, EPD1=1 (TTBR1 walks disabled).
  * Used by main.c (initial setup) and syscall/exec.c (exec re-init).
  */
 #define TCR_EL1_VALUE 0x25B5903510ULL

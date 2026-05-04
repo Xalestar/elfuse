@@ -30,18 +30,18 @@
 /* Align x down to the previous multiple of a; a must be a power of two. */
 #define ALIGN_DOWN(x, a) ((uint64_t) (x) & ~((uint64_t) (a) - 1))
 
-/* The Linux ABI fixes the page size at 4KB on aarch64 regardless of the host
+/* The Linux ABI fixes the page size at 4KiB on aarch64 regardless of the host
  * page size, so this is shared by every guest memory path (mmap, brk,
  * mprotect, ELF loading).
  */
 #define GUEST_PAGE_SIZE 4096ULL
 #define PAGE_ALIGN_UP(x) ALIGN_UP(x, GUEST_PAGE_SIZE)
 
-/* 2MB block alignment shared by region setup, page table walking, and stack
- * placement. BLOCK_2MB itself is defined in core/guest.h.
+/* 2MiB block alignment shared by region setup, page table walking, and stack
+ * placement. BLOCK_2MIB itself is defined in core/guest.h.
  */
-#define ALIGN_2MB_DOWN(x) ALIGN_DOWN(x, 2ULL * 1024 * 1024)
-#define ALIGN_2MB_UP(x) ALIGN_UP(x, 2ULL * 1024 * 1024)
+#define ALIGN_2MIB_DOWN(x) ALIGN_DOWN(x, 2ULL * 1024 * 1024)
+#define ALIGN_2MIB_UP(x) ALIGN_UP(x, 2ULL * 1024 * 1024)
 
 /* Branchless range check: true when minx <= x < minx + size.
  *

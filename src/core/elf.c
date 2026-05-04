@@ -97,7 +97,7 @@ int elf_load(const char *path, elf_info_t *info)
         fclose(f);
         return -1;
     }
-    /* Linux kernel caps program headers at 64KB. Reject pathological inputs
+    /* Linux kernel caps program headers at 64KiB. Reject pathological inputs
      * before allocating to avoid attacker-controlled large allocations.
      */
     if ((size_t) ehdr.e_phnum * ehdr.e_phentsize > 65536) {

@@ -1360,12 +1360,13 @@ int vcpu_run_loop(hv_vcpu_t vcpu,
                      * EC=0x24 data abort) and forwards the faulting address
                      * here.
                      *
-                     * Toggling at 2MB granularity causes thrashing when the
+                     * Toggling at 2MiB granularity causes thrashing when the
                      * JIT writes new code and executes existing code within
-                     * the same 2MB block. Instead, the code splits the 2MB
-                     * block into 4KB L3 pages and toggle only the faulting 4KB
-                     * page. This allows different pages within a 2MB block to
-                     * have independent RW/RX permissions simultaneously.
+                     * the same 2MiB block. Instead, the code splits the 2MiB
+                     * block into 4KiB L3 pages and toggle only the faulting
+                     * 4KiB page. This allows different pages within a 2MiB
+                     * block to have independent RW/RX permissions
+                     * simultaneously.
                      *
                      * x0 = FAR_EL1 (faulting virtual address)
                      * x1 = type: 0 = exec fault -> flip to RX
@@ -1421,7 +1422,7 @@ int vcpu_run_loop(hv_vcpu_t vcpu,
                             prefix, (unsigned long long) far,
                             (type == 0) ? "RX" : "RW",
                             (unsigned long long) page_start);
-                    uint64_t block_start = far & ~(BLOCK_2MB - 1);
+                    uint64_t block_start = far & ~(BLOCK_2MIB - 1);
                     int sr = guest_split_block(g, block_start);
                     int ur =
                         guest_update_perms(g, page_start, page_end, new_perms);

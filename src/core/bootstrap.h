@@ -1,10 +1,10 @@
-#pragma once
-
-/* Guest bootstrap helpers for elfuse
+/* Guest bootstrap helpers
  *
  * Copyright 2026 elfuse contributors
  * SPDX-License-Identifier: Apache-2.0
  */
+
+#pragma once
 
 #include <Hypervisor/Hypervisor.h>
 #include <Hypervisor/hv_vcpu.h>

@@ -21,7 +21,7 @@
 
 #include "runtime/thread.h"
 #include "debug/log.h"
-#include "core/guest.h" /* SHIM_DATA_BASE, BLOCK_2MB, GUEST_IPA_BASE */
+#include "core/guest.h" /* SHIM_DATA_BASE, BLOCK_2MIB, GUEST_IPA_BASE */
 #include "hvutil.h"     /* vcpu_get_gpr, vcpu_get_sysreg */
 
 /* From syscall/signal.h, included here directly to avoid pulling in
@@ -32,8 +32,8 @@
 
 static void thread_ptrace_init(thread_entry_t *t);
 
-/* Top of the EL1 exception stack region (one 4KB slot per thread) */
-#define SP_EL1_TOP (GUEST_IPA_BASE + SHIM_DATA_BASE + BLOCK_2MB)
+/* Top of the EL1 exception stack region (one 4KiB slot per thread) */
+#define SP_EL1_TOP (GUEST_IPA_BASE + SHIM_DATA_BASE + BLOCK_2MIB)
 
 /* Thread table. */
 
@@ -61,7 +61,7 @@ static _Atomic int active_thread_count = 0;
 
 /* Bitmask tracking allocated SP_EL1 slots. Bit N set = slot N in use.
  * MAX_THREADS=64 fits exactly in a uint64_t. Slot 0 is the main thread (top of
- * shim data region); each subsequent slot is 4KB below.
+ * shim data region); each subsequent slot is 4KiB below.
  */
 static uint64_t sp_el1_allocated = 0;
 
@@ -272,8 +272,8 @@ uint64_t thread_alloc_sp_el1(void)
         log_error("thread: SP_EL1 slots exhausted");
     } else {
         int slot = bit_ctz64(free_mask);
-        /* Main thread's SP_EL1 = IPA_BASE + SHIM_DATA_BASE + 2MB.
-         * Each subsequent thread is 4KB below.
+        /* Main thread's SP_EL1 = IPA_BASE + SHIM_DATA_BASE + 2MiB.
+         * Each subsequent thread is 4KiB below.
          */
         uint64_t top = SP_EL1_TOP;
         sp = top - (uint64_t) slot * 4096;

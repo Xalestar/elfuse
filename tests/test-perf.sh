@@ -104,10 +104,10 @@ benchmark "elfuse guest wc" sh -c "'$ELFUSE' '$TOOL_BIN/wc' -l '$SRC_SUBDIR'/*.c
 echo
 
 # --- Test 4: I/O throughput — cat large file through wc ---
-printf "${YELLOW}▸ cat ~10MB | wc -l (I/O throughput)${RESET}\n"
+printf "${YELLOW}▸ cat ~10MiB | wc -l (I/O throughput)${RESET}\n"
 TMPFILE=$(mktemp)
 trap 'rm -f "$TMPFILE"' EXIT
-# Build ~10MB test file by repeating syscall.c (~100 times)
+# Build ~10MiB test file by repeating syscall.c (~100 times)
 for _ in $(seq 1 100); do cat "$SYSCALL_C" >> "$TMPFILE"; done
 TMPSIZE=$(wc -c < "$TMPFILE" | tr -d ' ')
 printf "  ${CYAN}(test file: %s bytes)${RESET}\n" "$TMPSIZE"

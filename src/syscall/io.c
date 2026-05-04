@@ -686,7 +686,7 @@ int64_t sys_pwrite64(guest_t *g,
 }
 
 /* Helper: build host iovec array from guest iovec array.
- * Uses guest_read for the iovec array (may cross 2MB block boundary)
+ * Uses guest_read for the iovec array (may cross 2MiB block boundary)
  * and guest_ptr_avail for each buffer (caps to contiguous bytes).
  * required_perms: MEM_PERM_W for readv (host writes to guest buffers),
  *                 MEM_PERM_R for writev (host reads from guest buffers).
@@ -808,7 +808,7 @@ int64_t sys_readv(guest_t *g, int fd, uint64_t iov_gva, int iovcnt)
             if (iovcnt <= 0)
                 return -LINUX_EINVAL;
             /* Use guest_read for the iov array since guest_ptr alone is unsafe
-             * if the array spans a 2MB block boundary.
+             * if the array spans a 2MiB block boundary.
              */
             linux_iovec_t giov;
             if (guest_read_small(g, iov_gva, &giov, sizeof(giov)) < 0)

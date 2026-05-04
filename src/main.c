@@ -8,7 +8,7 @@
  *   - A minimal EL1 shim (embedded as shim_blob.h) that provides exception
  *     vectors and forwards SVC #0 (Linux syscalls) to the host via HVC #5.
  *   - All system registers configured from the host before vCPU start.
- *   - Guest memory identity-mapped at GVA=GPA with 2MB block page tables.
+ *   - Guest memory identity-mapped at GVA=GPA with 2MiB block page tables.
  *   - Syscall handlers that translate Linux syscalls to macOS equivalents.
  *
  * Usage: elfuse [--verbose] [--timeout N] [--sysroot PATH] <elf-path> [args...]

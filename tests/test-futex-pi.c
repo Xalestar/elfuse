@@ -68,7 +68,7 @@ static long raw_futex_unlock_pi(uint32_t *addr)
 
 /* Child thread for dead-owner test */
 
-/* Stack for child thread (8KB, 16-byte aligned) */
+/* Stack for child thread (8KiB, 16-byte aligned) */
 static char child_stack_buf[8192] __attribute__((aligned(16)));
 
 /* Child: acquire PI lock, signal parent, exit WITHOUT releasing.

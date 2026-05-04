@@ -572,7 +572,7 @@ int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg)
          * macOS layout: {off_t l_start, off_t l_len, pid_t l_pid,
          *   short l_type, short l_whence}
          * Use guest_read/guest_write (not guest_ptr) to safely handle
-         * structs that span 2MB page table block boundaries.
+         * structs that span 2MiB page table block boundaries.
          */
         uint8_t lflock[32]; /* Linux struct flock is 32 bytes on aarch64 */
         if (guest_read_small(g, arg, lflock, sizeof(lflock)) < 0)
@@ -620,7 +620,7 @@ int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg)
         return 0;
     }
     case 1024: /* F_GETPIPE_SZ */
-        /* macOS does not support pipe size queries; return default 64KB */
+        /* macOS does not support pipe size queries; return default 64KiB */
         return 65536;
     case 1031: /* F_SETPIPE_SZ */
         /* macOS does not support pipe size setting; pretend success */
@@ -720,7 +720,7 @@ int64_t sys_getdents64(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
     /* Temp buffer for dirent serialization. Max dirent64 is 280 bytes
      * (19-byte header + NAME_MAX=255 + null + padding to 8). Using a
      * stack buffer avoids guest_ptr boundary issues: guest_write() handles
-     * 2MB block crossings that raw memcpy into guest_ptr() cannot.
+     * 2MiB block crossings that raw memcpy into guest_ptr() cannot.
      */
     uint8_t entry_buf[280];
 
@@ -751,7 +751,7 @@ int64_t sys_getdents64(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
         lde.d_type = de->d_type;
 
         /* Serialize entry into temp buffer, then copy to guest via
-         * guest_write() which handles 2MB block boundary crossings.
+         * guest_write() which handles 2MiB block boundary crossings.
          */
         memcpy(entry_buf, &lde, sizeof(lde));
         memcpy(entry_buf + 19, de->d_name, name_len + 1);

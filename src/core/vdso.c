@@ -23,8 +23,6 @@
 #include "core/elf.h"
 #include "debug/log.h"
 
-#define VDSO_SIZE 0x00001000ULL /* 4KB */
-
 /* ELF section header (not in core/elf.h). */
 
 typedef struct {
@@ -72,7 +70,7 @@ typedef struct {
  *   [3] __kernel_gettimeofday
  */
 
-/* Offsets within the 4KB page */
+/* Offsets within the 4KiB page */
 #define VDSO_OFF_EHDR 0x000
 #define VDSO_OFF_PHDR 0x040
 #define VDSO_OFF_PHDR1 0x078
@@ -100,7 +98,7 @@ typedef struct {
 /* 6 * 16 = 96, 0x1D8 + 96 = 0x238 */
 #define VDSO_OFF_SHDR 0x238
 
-/* 6 * 64 = 384, 0x238 + 384 = 0x3B8 (fits in 4KB) */
+/* 6 * 64 = 384, 0x238 + 384 = 0x3B8 (fits in 4KiB) */
 #define VDSO_NUM_SYMS 4
 #define HASH_NCHAIN (VDSO_NUM_SYMS + 1)
 #define HASH_NBUCKET 1

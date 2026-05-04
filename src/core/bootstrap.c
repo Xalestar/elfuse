@@ -1,4 +1,4 @@
-/* Guest bootstrap helpers for elfuse
+/* Guest bootstrap helpers
  *
  * Copyright 2026 elfuse contributors
  * SPDX-License-Identifier: Apache-2.0
@@ -30,7 +30,10 @@
 
 #include "debug/log.h"
 
-#define MAX_BOOT_REGIONS 32
+/* Worst case: 7 fixed regions (shim, shim-data, vDSO, brk, stack, mmap RX, mmap
+ * RW) plus up to ELF_MAX_SEGMENTS for both the executable and the interpreter.
+ */
+#define MAX_BOOT_REGIONS (8 + 2 * ELF_MAX_SEGMENTS)
 
 static bool append_boot_region(mem_region_t *regions,
                                int *nregions,
@@ -83,12 +86,12 @@ static void log_initial_page_tables(const guest_t *g, uint64_t ttbr0)
     }
 }
 
-static int load_interpreter(guest_t *g,
-                            const char *sysroot,
-                            guest_bootstrap_t *boot)
+static bool load_interpreter(guest_t *g,
+                             const char *sysroot,
+                             guest_bootstrap_t *boot)
 {
     if (boot->elf_info.interp_path[0] == '\0')
-        return 0;
+        return true;
 
     elf_resolve_interp(sysroot, boot->elf_info.interp_path,
                        boot->interp_resolved, sizeof(boot->interp_resolved));
@@ -96,20 +99,20 @@ static int load_interpreter(guest_t *g,
 
     if (elf_load(boot->interp_resolved, &boot->interp_info) < 0) {
         log_error("failed to load interpreter: %s", boot->interp_resolved);
-        return -1;
+        return false;
     }
 
     if (boot->interp_info.e_machine != EM_AARCH64) {
         log_error("interpreter has unsupported machine type %u: %s",
                   boot->interp_info.e_machine, boot->interp_resolved);
-        return -1;
+        return false;
     }
 
     boot->interp_base = g->interp_base;
     if (elf_map_segments(&boot->interp_info, boot->interp_resolved,
                          g->host_base, g->guest_size, boot->interp_base) < 0) {
         log_error("failed to map interpreter segments");
-        return -1;
+        return false;
     }
 
     log_debug(
@@ -117,20 +120,27 @@ static int load_interpreter(guest_t *g,
         (unsigned long long) boot->interp_base,
         (unsigned long long) (boot->interp_info.entry + boot->interp_base),
         boot->interp_info.num_segments);
-    return 0;
+    return true;
 }
 
-static int build_boot_regions(mem_region_t *regions,
-                              int *nregions,
-                              guest_t *g,
-                              const guest_bootstrap_t *boot,
-                              size_t shim_bin_len)
+static bool build_boot_regions(mem_region_t *regions,
+                               int *nregions,
+                               guest_t *g,
+                               const guest_bootstrap_t *boot,
+                               size_t shim_bin_len)
 {
+    /* The vDSO trampolines live in the same 2MiB block as the shim. They must
+     * appear in the region set so finalize_block_perms validates and grants RX
+     * to the vDSO page when splitting the block; otherwise vdso_build cannot
+     * write into it through guest_ptr.
+     */
     if (!append_boot_region(regions, nregions, SHIM_BASE,
                             SHIM_BASE + shim_bin_len, MEM_PERM_RX) ||
         !append_boot_region(regions, nregions, SHIM_DATA_BASE,
-                            SHIM_DATA_BASE + BLOCK_2MB, MEM_PERM_RW)) {
-        return -1;
+                            SHIM_DATA_BASE + BLOCK_2MIB, MEM_PERM_RW) ||
+        !append_boot_region(regions, nregions, VDSO_BASE, VDSO_BASE + VDSO_SIZE,
+                            MEM_PERM_RX)) {
+        return false;
     }
 
     for (int i = 0; i < boot->elf_info.num_segments; i++) {
@@ -140,7 +150,7 @@ static int build_boot_regions(mem_region_t *regions,
                 boot->elf_info.segments[i].gpa +
                     boot->elf_info.segments[i].memsz + boot->elf_load_base,
                 elf_pf_to_prot(boot->elf_info.segments[i].flags))) {
-            return -1;
+            return false;
         }
     }
 
@@ -151,7 +161,7 @@ static int build_boot_regions(mem_region_t *regions,
                 boot->interp_info.segments[i].gpa +
                     boot->interp_info.segments[i].memsz + boot->interp_base,
                 elf_pf_to_prot(boot->interp_info.segments[i].flags))) {
-            return -1;
+            return false;
         }
     }
 
@@ -163,12 +173,12 @@ static int build_boot_regions(mem_region_t *regions,
                             MMAP_RX_INITIAL_END, MEM_PERM_RX) ||
         !append_boot_region(regions, nregions, MMAP_BASE, MMAP_INITIAL_END,
                             MEM_PERM_RW)) {
-        return -1;
+        return false;
     }
 
     g->mmap_rx_end = MMAP_RX_INITIAL_END;
     g->mmap_end = MMAP_INITIAL_END;
-    return 0;
+    return true;
 }
 
 int guest_bootstrap_prepare(guest_t *g,
@@ -214,7 +224,7 @@ int guest_bootstrap_prepare(guest_t *g,
     }
     *guest_initialized = true;
 
-    log_debug("IPA size: %u bits (%lluGB primary)", g->ipa_bits,
+    log_debug("IPA size: %u bits (%llu GiB primary)", g->ipa_bits,
               (unsigned long long) (g->guest_size / (1024ULL * 1024 * 1024)));
 
     boot->elf_load_base = (boot->elf_info.e_type == ET_DYN) ? PIE_LOAD_BASE : 0;
@@ -229,15 +239,15 @@ int guest_bootstrap_prepare(guest_t *g,
         g->brk_base = BRK_BASE_DEFAULT;
     g->brk_current = g->brk_base;
 
-    g->stack_top = ALIGN_UP(g->brk_base, BLOCK_2MB) + STACK_SIZE;
+    g->stack_top = ALIGN_UP(g->brk_base, BLOCK_2MIB) + STACK_SIZE;
     if (g->stack_top < STACK_TOP_DEFAULT)
         g->stack_top = STACK_TOP_DEFAULT;
     g->stack_base = g->stack_top - STACK_SIZE;
 
-    if (load_interpreter(g, sysroot, boot) < 0)
+    if (!load_interpreter(g, sysroot, boot))
         return -1;
 
-    if (shim_bin_len > BLOCK_2MB) {
+    if (shim_bin_len > BLOCK_2MIB) {
         log_error("shim binary too large (%zu bytes)", shim_bin_len);
         return -1;
     }
@@ -252,7 +262,7 @@ int guest_bootstrap_prepare(guest_t *g,
                              boot->interp_base);
     sys_icache_invalidate((uint8_t *) g->host_base + SHIM_BASE, shim_bin_len);
 
-    if (build_boot_regions(regions, &nregions, g, boot, shim_bin_len) < 0) {
+    if (!build_boot_regions(regions, &nregions, g, boot, shim_bin_len)) {
         log_error("too many memory regions (%d >= %d)", nregions,
                   MAX_BOOT_REGIONS);
         return -1;
@@ -263,25 +273,12 @@ int guest_bootstrap_prepare(guest_t *g,
         log_error("failed to build page tables");
         return -1;
     }
-
-    for (int i = 1; i < nregions; i++) {
-        uint64_t prev_block = (regions[i - 1].gpa_end - 1) & ~(BLOCK_2MB - 1);
-        uint64_t curr_block = regions[i].gpa_start & ~(BLOCK_2MB - 1);
-        if (prev_block == curr_block &&
-            regions[i - 1].perms != regions[i].perms &&
-            guest_split_block(g, curr_block) == 0) {
-            guest_update_perms(g, regions[i - 1].gpa_start,
-                               regions[i - 1].gpa_end, regions[i - 1].perms);
-            guest_update_perms(g, regions[i].gpa_start, regions[i].gpa_end,
-                               regions[i].perms);
-        }
-    }
     g->need_tlbi = true;
 
     guest_region_add(g, SHIM_BASE, SHIM_BASE + shim_bin_len,
                      LINUX_PROT_READ | LINUX_PROT_EXEC, LINUX_MAP_PRIVATE, 0,
                      "[shim]");
-    guest_region_add(g, SHIM_DATA_BASE, SHIM_DATA_BASE + BLOCK_2MB,
+    guest_region_add(g, SHIM_DATA_BASE, SHIM_DATA_BASE + BLOCK_2MIB,
                      LINUX_PROT_READ | LINUX_PROT_WRITE, LINUX_MAP_PRIVATE, 0,
                      "[shim-data]");
 
@@ -386,7 +383,7 @@ int guest_bootstrap_create_vcpu(guest_t *g,
     uint64_t shim_ipa = guest_ipa(g, SHIM_BASE);
     uint64_t entry_ipa = guest_ipa(g, boot->entry_point);
     uint64_t sp_ipa = guest_ipa(g, boot->stack_pointer);
-    uint64_t el1_sp = guest_ipa(g, SHIM_DATA_BASE + BLOCK_2MB);
+    uint64_t el1_sp = guest_ipa(g, SHIM_DATA_BASE + BLOCK_2MIB);
     hv_vcpu_t vcpu;
     hv_vcpu_exit_t *vexit;
 

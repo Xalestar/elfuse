@@ -1020,7 +1020,7 @@ int64_t sys_clone(hv_vcpu_t vcpu,
      * Siblings may mmap/munmap/mprotect after resume, so the code needs a
      * stable copy for the IPC send. Heap-allocated because
      * GUEST_MAX_REGIONS * sizeof(guest_region_t) exceeds safe
-     * stack limits on worker threads (512KB default).
+     * stack limits on worker threads (512KiB default).
      */
     int nregions_snapshot = g->nregions;
     size_t snap_sz = (size_t) nregions_snapshot * sizeof(guest_region_t);

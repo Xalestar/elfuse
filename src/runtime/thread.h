@@ -9,9 +9,9 @@
  * threads are added via clone(CLONE_THREAD). A _Thread_local pointer provides
  * O(1) access to the current thread's entry from any syscall handler.
  *
- * SP_EL1 allocation: each thread gets a 4KB EL1 exception stack carved from the
- * shim data region (SHIM_DATA_BASE + 2MB). Thread 0 (main) gets the top, thread
- * N gets offset -(N * 4096).
+ * SP_EL1 allocation: each thread gets a 4KiB EL1 exception stack carved from
+ * the shim data region (SHIM_DATA_BASE + 2MiB). Thread 0 (main) gets the top,
+ * thread N gets offset -(N * 4096).
  */
 
 #pragma once
@@ -156,10 +156,10 @@ int thread_active_count(void);
 /* Fast path: return non-zero when exactly one guest thread is active. */
 int thread_is_single_active(void);
 
-/* Allocate a per-thread SP_EL1 value. Thread N gets the Nth 4KB slot counting
+/* Allocate a per-thread SP_EL1 value. Thread N gets the Nth 4KiB slot counting
  * down from the top of the shim data region. The IPA base (GUEST_IPA_BASE +
- * SHIM_DATA_BASE + 2MB) is the main thread's SP_EL1; each subsequent thread
- * subtracts 4KB. Returns the IPA, or 0 on failure.
+ * SHIM_DATA_BASE + 2MiB) is the main thread's SP_EL1; each subsequent thread
+ * subtracts 4KiB. Returns the IPA, or 0 on failure.
  */
 uint64_t thread_alloc_sp_el1(void);
 

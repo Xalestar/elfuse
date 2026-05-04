@@ -57,7 +57,7 @@ static void child_work(void)
 
 /* Tests */
 
-/* Stack for child thread (8KB, 16-byte aligned) */
+/* Stack for child thread (8KiB, 16-byte aligned) */
 static char child_stack_buf[8192] __attribute__((aligned(16)));
 
 /* Test 1: clone(CLONE_THREAD) creates a new thread that runs concurrently */

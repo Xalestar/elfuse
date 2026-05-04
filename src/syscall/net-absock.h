@@ -1,10 +1,10 @@
-#pragma once
-
-/* Abstract AF_UNIX emulation helpers for elfuse
+/* Abstract AF_UNIX emulation helpers
  *
  * Copyright 2026 elfuse contributors
  * SPDX-License-Identifier: Apache-2.0
  */
+
+#pragma once
 
 #include <stdint.h>
 #include <sys/socket.h>

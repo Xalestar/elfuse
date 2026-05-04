@@ -88,7 +88,7 @@ static void sysinfo_init_cached_host_state(void)
     size_t ms_len = sizeof(memsize);
     int mib_mem[2] = {CTL_HW, HW_MEMSIZE};
     if (sysctl(mib_mem, 2, &memsize, &ms_len, NULL, 0) == 0) {
-        const uint64_t vm_ram_cap = 4094595072ULL; /* Match Lima VZ 4GB VM */
+        const uint64_t vm_ram_cap = 4094595072ULL; /* Match Lima VZ 4GiB VM */
         cached_real_memsize = memsize;
         cached_totalram = (memsize > vm_ram_cap) ? vm_ram_cap : memsize;
     }
@@ -367,8 +367,8 @@ static linux_rlimit64_t translate_host_rlimit(int resource, struct rlimit rl)
     lim.rlim_cur = (rl.rlim_cur == RLIM_INFINITY) ? UINT64_MAX : rl.rlim_cur;
     lim.rlim_max = (rl.rlim_max == RLIM_INFINITY) ? UINT64_MAX : rl.rlim_max;
 
-    /* macOS returns ~8MB-16KB for the default stack; round to Linux's
-     * conventional 8MB to keep guest userspace behavior stable.
+    /* macOS returns ~8MiB-16KiB for the default stack; round to Linux's
+     * conventional 8MiB to keep guest userspace behavior stable.
      */
     if (resource == 3 /* RLIMIT_STACK */ && lim.rlim_cur > 0 &&
         lim.rlim_cur < 8388608) {

@@ -6,11 +6,11 @@
  *
  * Identity-mapped guest memory: GVA == GPA == offset into host_base.
  * The guest address space size is determined by the VM's configured IPA width
- * (capped at 40-bit = 1TB): 64GB for native aarch64 on M2 (36-bit), 1TB for M3+
- * (40-bit). Reserved via mmap(MAP_ANON); macOS demand-pages physical memory on
- * first touch, so only used pages consume RAM. The slab is mapped RWX to
+ * (capped at 40-bit = 1TiB): 64GiB for native aarch64 on M2 (36-bit), 1TiB for
+ * M3+ (40-bit). Reserved via mmap(MAP_ANON); macOS demand-pages physical memory
+ * on first touch, so only used pages consume RAM. The slab is mapped RWX to
  * Hypervisor.framework. The guest's own page tables (built here) enforce
- * per-region permissions using 2MB block descriptors, which are mandatory for
+ * per-region permissions using 2MiB block descriptors, which are mandatory for
  * transparent misaligned access. Page tables can be extended at runtime via
  * guest_extend_page_tables().
  *
@@ -21,12 +21,12 @@
  * created on demand when mprotect changes PROT_NONE to an accessible
  * permission.
  *
- * Page table format: AArch64 4KB granule, up to 4-level:
- *   L0 entry covers 512GB: multiple entries for >512GB address spaces
- *   L1 entry covers 1GB:  either block or table pointing to L2
- *   L2 entry covers 2MB:  block descriptors with final permissions
- *   L3 entry covers 4KB:  optional, created by guest_split_block() for
- *                           mixed permissions within a 2MB block (W^X)
+ * Page table format: AArch64 4KiB granule, up to 4-level:
+ *   L0 entry covers 512GiB: multiple entries for >512GiB address spaces
+ *   L1 entry covers 1GiB:   either block or table pointing to L2
+ *   L2 entry covers 2MiB:   block descriptors with final permissions
+ *   L3 entry covers 4KiB:   optional, created by guest_split_block() for mixed
+ *                           permissions within a 2MiB block (W^X)
  */
 
 #include <errno.h>
@@ -57,11 +57,11 @@ static void guest_region_clear(guest_t *g);
 #define PT_AP_RW_EL0 (1ULL << 6) /* AP[2:1]=01: RW at EL1, RW at EL0 */
 #define PT_AP_RO (3ULL << 6)     /* AP[2:1]=11: RO at EL1, RO at EL0 */
 
-/* PAGE_SIZE / ALIGN_2MB_* live in utils.h; BLOCK_2MB lives in core/guest.h. */
+/* PAGE_SIZE / ALIGN_2MB_* live in utils.h; BLOCK_2MIB lives in core/guest.h. */
 #define PAGE_SIZE GUEST_PAGE_SIZE
-#define BLOCK_1GB (1ULL * 1024 * 1024 * 1024)
+#define BLOCK_1GIB (1ULL * 1024 * 1024 * 1024)
 
-/* Mask to extract the physical address from a 2MB L2 block descriptor */
+/* Mask to extract the physical address from a 2MiB L2 block descriptor */
 #define L2_BLOCK_ADDR_MASK 0xFFFFFFE00000ULL
 
 /* Forward declaration (defined in the page table section below) */
@@ -77,7 +77,7 @@ static pthread_mutex_t pt_lock = PTHREAD_MUTEX_INITIALIZER; /* Lock order: 2 */
 /* Track whether the 80% warning has been emitted (avoid log spam) */
 static bool pt_pool_warned = false;
 
-/* Allocate a zeroed 4KB page from the page table pool.
+/* Allocate a zeroed 4KiB page from the page table pool.
  * Returns GPA of the page, or 0 on pool exhaustion.
  * Acquires pt_lock internally. Caller typically holds mmap_lock.
  */
@@ -136,8 +136,8 @@ int guest_init(guest_t *g, uint64_t size, uint32_t ipa_bits)
     g->mmap_rx_next = MMAP_RX_BASE;
 
     /* Query the maximum IPA size supported by the hardware/kernel. macOS 15+
-     * on Apple Silicon reports 40 bits (1TB). Older versions or fallback
-     * yields 36 bits (64GB).
+     * on Apple Silicon reports 40 bits (1TiB). Older versions or fallback
+     * yields 36 bits (64GiB).
      */
     uint32_t max_ipa = 0;
     hv_vm_config_get_max_ipa_size(&max_ipa);
@@ -157,7 +157,7 @@ int guest_init(guest_t *g, uint64_t size, uint32_t ipa_bits)
         vm_ipa = 36;
 
     /* Primary buffer size: use the VM's configured IPA width (capped at
-     * 40-bit = 1TB). macOS demand-pages the host reservation, so only touched
+     * 40-bit = 1TiB). macOS demand-pages the host reservation, so only touched
      * pages cost physical memory.
      */
     uint32_t buf_bits = (vm_ipa > 40) ? 40 : vm_ipa;
@@ -168,17 +168,17 @@ int guest_init(guest_t *g, uint64_t size, uint32_t ipa_bits)
     g->ipa_bits = vm_ipa;
 
     /* Compute dynamic layout limits from primary buffer size.
-     * interp_base: last 4GB (dynamic linker load address)
-     * mmap_limit:  last 8GB reserved (max mmap RW address)
-     * For 64GB:  interp=60GB, mmap_limit=56GB
-     * For 1TB:   interp=1020GB, mmap_limit=1016GB
+     * interp_base: last 4GiB (dynamic linker load address)
+     * mmap_limit:  last 8GiB reserved (max mmap RW address)
+     * For 64GiB:   interp=60GiB, mmap_limit=56GiB
+     * For 1TiB:    interp=1020GiB, mmap_limit=1016GiB
      */
     g->interp_base = g->guest_size - 0x100000000ULL;
     g->mmap_limit = g->guest_size - 0x200000000ULL;
 
     /* Reserve primary address space via mmap(MAP_ANON). macOS demand-pages
      * this: physical pages are allocated only on first touch, so reserving up
-     * to 1TB costs nothing until pages are actually used. Do NOT memset
+     * to 1TiB costs nothing until pages are actually used. Do NOT memset
      * because that would touch all pages and defeat demand paging.
      */
     g->host_base =
@@ -261,14 +261,14 @@ int guest_init(guest_t *g, uint64_t size, uint32_t ipa_bits)
     ret = hv_vm_map(g->host_base, GUEST_IPA_BASE, size,
                     HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC);
     if (ret != HV_SUCCESS && buf_bits > max_ipa) {
-        /* 1TB primary map failed; fall back to hardware-default buffer.
+        /* 1TiB primary map failed; fall back to hardware-default buffer.
          * This handles undocumented HVF limits on primary buffer size.
          * Close shm_fd since the fallback uses anonymous memory (the file is no
          * longer mapped to host_base, so CoW fork cannot work).
          */
         log_info(
-            "guest: hv_vm_map %lluGB failed (%d), "
-            "retrying with %u-bit (%lluGB)",
+            "guest: hv_vm_map %llu GiB failed (%d), "
+            "retrying with %u-bit (%llu GiB)",
             (unsigned long long) (size >> 30), (int) ret, max_ipa,
             1ULL << (max_ipa - 30));
         munmap(g->host_base, size);
@@ -372,7 +372,7 @@ int guest_init_from_shm(guest_t *g,
     }
 
     log_debug(
-        "guest: CoW fork: mapped %lluGB from shm "
+        "guest: CoW fork: mapped %llu GiB from shm "
         "(ipa=%u bits)",
         (unsigned long long) (size / (1024ULL * 1024 * 1024)), ipa_bits);
 
@@ -416,7 +416,7 @@ typedef struct {
 /* Per-thread GVA TLB cache.
  *
  * Single-entry translation cache: avoids 3-4 pointer chases through the page
- * table on repeated accesses to the same 2MB block (or 4KB page if L3-split).
+ * table on repeated accesses to the same 2MiB block (or 4KiB page if L3-split).
  * Validated by an atomic generation counter in guest_t that is bumped on every
  * page table modification.
  */
@@ -424,7 +424,7 @@ static _Thread_local struct {
     const guest_t *owner; /* Which guest_t this entry belongs to */
     uint64_t base_gva;    /* Block/page-aligned GVA */
     uint64_t base_gpa;    /* Corresponding GPA offset */
-    uint64_t size;        /* 2MB or 4KB (0 = invalid) */
+    uint64_t size;        /* 2MiB or 4KiB (0 = invalid) */
     int perms;            /* Cached permissions */
     uint64_t gen;         /* guest_t.pt_gen at population time */
 } gva_tlb;
@@ -452,7 +452,7 @@ static int gva_translate_perm(const guest_t *g,
     uint64_t base = g->ipa_base;
 
     const uint64_t *l0 = pt_at(g, g->ttbr0 - base);
-    unsigned l0_idx = (unsigned) (gva / (512ULL * BLOCK_1GB));
+    unsigned l0_idx = (unsigned) (gva / (512ULL * BLOCK_1GIB));
     if (l0_idx >= 512 || !(l0[l0_idx] & PT_VALID))
         return -1;
 
@@ -460,7 +460,7 @@ static int gva_translate_perm(const guest_t *g,
     if (l1_ipa < base || l1_ipa - base >= g->guest_size)
         return -1;
     const uint64_t *l1 = pt_at(g, l1_ipa - base);
-    unsigned l1_idx = (unsigned) ((gva / BLOCK_1GB) % 512);
+    unsigned l1_idx = (unsigned) ((gva / BLOCK_1GIB) % 512);
     if (!(l1[l1_idx] & PT_VALID))
         return -1;
 
@@ -468,12 +468,12 @@ static int gva_translate_perm(const guest_t *g,
     if (l2_ipa < base || l2_ipa - base >= g->guest_size)
         return -1;
     const uint64_t *l2 = pt_at(g, l2_ipa - base);
-    unsigned l2_idx = (unsigned) ((gva / BLOCK_2MB) % 512);
+    unsigned l2_idx = (unsigned) ((gva / BLOCK_2MIB) % 512);
     if (!(l2[l2_idx] & PT_VALID))
         return -1;
 
     if (l2[l2_idx] & PT_TABLE) {
-        /* L3 page descriptor: 4KB granularity. */
+        /* L3 page descriptor: 4KiB granularity. */
         uint64_t l3_ipa = l2[l2_idx] & 0xFFFFFFFFF000ULL;
         if (l3_ipa < base || l3_ipa - base >= g->guest_size)
             return -1;
@@ -496,7 +496,7 @@ static int gva_translate_perm(const guest_t *g,
         out->gpa = gpa;
         out->chunk = PAGE_SIZE - (gva & (PAGE_SIZE - 1));
 
-        /* Populate TLB cache for this 4KB page */
+        /* Populate TLB cache for this 4KiB page */
         gva_tlb.owner = g;
         gva_tlb.base_gva = gva & ~(PAGE_SIZE - 1);
         gva_tlb.base_gpa = page_ipa - base;
@@ -506,7 +506,7 @@ static int gva_translate_perm(const guest_t *g,
         return 0;
     }
 
-    /* L2 block descriptor: 2MB granularity. */
+    /* L2 block descriptor: 2MiB granularity. */
     int perms = desc_to_perms(l2[l2_idx]);
     if ((perms & required_perms) != required_perms)
         return -1;
@@ -514,18 +514,18 @@ static int gva_translate_perm(const guest_t *g,
     uint64_t block_ipa = l2[l2_idx] & L2_BLOCK_ADDR_MASK;
     if (block_ipa < base)
         return -1;
-    uint64_t gpa = (block_ipa - base) + (gva & (BLOCK_2MB - 1));
+    uint64_t gpa = (block_ipa - base) + (gva & (BLOCK_2MIB - 1));
     if (gpa >= g->guest_size)
         return -1;
 
     out->gpa = gpa;
-    out->chunk = BLOCK_2MB - (gva & (BLOCK_2MB - 1));
+    out->chunk = BLOCK_2MIB - (gva & (BLOCK_2MIB - 1));
 
-    /* Populate TLB cache for this 2MB block */
+    /* Populate TLB cache for this 2MiB block */
     gva_tlb.owner = g;
-    gva_tlb.base_gva = gva & ~(BLOCK_2MB - 1);
+    gva_tlb.base_gva = gva & ~(BLOCK_2MIB - 1);
     gva_tlb.base_gpa = block_ipa - base;
-    gva_tlb.size = BLOCK_2MB;
+    gva_tlb.size = BLOCK_2MIB;
     gva_tlb.perms = perms;
     gva_tlb.gen = gen;
     return 0;
@@ -588,7 +588,7 @@ static void *gva_resolve_perm(const guest_t *g,
 {
     /* Always walk page tables to enforce permissions.  The guest slab is
      * identity-mapped (GVA == GPA == offset), but L2 block descriptors carry
-     * permission bits and L3 page tables have per-4KB permissions after
+     * permission bits and L3 page tables have per-4KiB permissions after
      * guest_split_block.  Skipping the walk would bypass W^X enforcement for
      * all normal guest addresses.
      */
@@ -755,7 +755,7 @@ int guest_read_str_small(const guest_t *g, uint64_t gva, char *dst, size_t max)
 
 void guest_reset(guest_t *g)
 {
-    /* Zero only actually-used memory regions. With a potentially 1TB address
+    /* Zero only actually-used memory regions. With a potentially 1TiB address
      * space, memset of the entire range would fault in all demand-paged memory
      * for no benefit. PROT_NONE regions (e.g., a managed runtime's heap
      * reservation) were never written to, so they're already in the MAP_ANON
@@ -783,7 +783,7 @@ void guest_reset(guest_t *g)
      * callers; shim regions are added AFTER reset by the exec path)
      */
     memset((uint8_t *) g->host_base + SHIM_BASE, 0,
-           SHIM_DATA_BASE + BLOCK_2MB - SHIM_BASE);
+           SHIM_DATA_BASE + BLOCK_2MIB - SHIM_BASE);
 
     /* Reset allocation state */
     guest_pt_gen_bump(g);
@@ -826,10 +826,10 @@ int guest_get_used_regions(const guest_t *g,
         n++;
     }
 
-    /* Shim data/stack (full 2MB block) */
+    /* Shim data/stack (full 2MiB block) */
     if (n < max) {
         out[n].offset = SHIM_DATA_BASE;
-        out[n].size = BLOCK_2MB;
+        out[n].size = BLOCK_2MIB;
         n++;
     }
 
@@ -1263,7 +1263,7 @@ static void guest_region_clear(guest_t *g)
 
 /* Page table builder. */
 
-/* Build block descriptor for a 2MB block at the given GPA with perms. */
+/* Build block descriptor for a 2MiB block at the given GPA with perms. */
 static uint64_t make_block_desc(uint64_t gpa, int perms)
 {
     uint64_t desc = (gpa & L2_BLOCK_ADDR_MASK) /* PA bits */
@@ -1289,6 +1289,144 @@ static uint64_t make_block_desc(uint64_t gpa, int perms)
     return desc;
 }
 
+/* Convert mixed-permission and partially-covered 2MiB blocks into L3 4KiB
+ * pages.
+ *
+ * The block-emit loop in guest_build_page_tables uses 2MiB block descriptors
+ * and OR-merges permissions when multiple regions touch the same block. The
+ * merge is correct only when every region in the block agrees on perms AND the
+ * union of those regions covers the entire block; otherwise it leaves
+ * over-permissive PTEs (e.g. .text RX + .data RW + heap RW in one 2MiB block
+ * collapses to RWX) and grants access to gap pages that should fault.
+ *
+ * For each unique 2MiB block touched by the input regions, this pass either
+ * keeps the block descriptor in place (single-perm full coverage) or splits it
+ * into 512 L3 pages, invalidates the lot, and re-validates each region's pages
+ * with the correct perms. Pages with no region coverage stay invalid, matching
+ * Linux semantics for inter-segment gaps in small static binaries.
+ */
+static bool finalize_block_perms(guest_t *g, const mem_region_t *regions, int n)
+{
+    /* Walk every 2MiB block touched by any region. Blocks shared by multiple
+     * regions are processed multiple times; the underlying split / invalidate /
+     * re-validate sequence is idempotent (guest_split_block is a no-op once
+     * the L2 entry is a table descriptor; guest_invalidate_ptes + per-region
+     * guest_update_perms produce the same final L3 state on every pass), so
+     * dedup is an optimization the heap-region scale (~127 blocks for the
+     * default brk window) does not justify against a fixed-size visited set.
+     */
+    for (int r = 0; r < n; r++) {
+        uint64_t r_block_lo = ALIGN_2MIB_DOWN(regions[r].gpa_start);
+        uint64_t r_block_hi = ALIGN_2MIB_UP(regions[r].gpa_end);
+
+        for (uint64_t b = r_block_lo; b < r_block_hi; b += BLOCK_2MIB) {
+            /* Walk all regions touching this block. Track perm uniformity and
+             * collect them into idx[] sorted by start so coverage can be
+             * checked with a single sweep.
+             */
+            int idx[GUEST_MAX_REGIONS];
+            int nidx = 0;
+            int first_perm = -1;
+            bool same_perm = true;
+
+            for (int s = 0; s < n; s++) {
+                if (regions[s].gpa_end <= b ||
+                    regions[s].gpa_start >= b + BLOCK_2MIB)
+                    continue;
+                if (first_perm < 0)
+                    first_perm = regions[s].perms;
+                else if (regions[s].perms != first_perm)
+                    same_perm = false;
+
+                int pos = nidx;
+                while (pos > 0 &&
+                       regions[idx[pos - 1]].gpa_start > regions[s].gpa_start) {
+                    idx[pos] = idx[pos - 1];
+                    pos--;
+                }
+                idx[pos] = s;
+                nidx++;
+            }
+
+            /* Coverage sweep: regions are sorted by start, so the union covers
+             * the block iff each region begins at or before the running
+             * high-water mark.
+             */
+            uint64_t covered_until = b;
+            bool full_coverage = true;
+            for (int i = 0; i < nidx; i++) {
+                uint64_t cs = regions[idx[i]].gpa_start;
+                uint64_t ce = regions[idx[i]].gpa_end;
+                if (cs > covered_until) {
+                    full_coverage = false;
+                    break;
+                }
+                if (ce > covered_until)
+                    covered_until = ce;
+            }
+            if (covered_until < b + BLOCK_2MIB)
+                full_coverage = false;
+
+            /* Single perm covering the whole block: the existing 2MiB
+             * descriptor is already correct.
+             */
+            if (same_perm && full_coverage)
+                continue;
+
+            /* Split into L3 pages, invalidate the lot, then rebuild the block
+             * from per-page unions. This preserves the required permission
+             * union when adjacent ELF segments share a 4KiB page after
+             * page-granularity rounding.
+             */
+            if (guest_split_block(g, b) < 0)
+                return false;
+            if (guest_invalidate_ptes(g, b, b + BLOCK_2MIB) < 0)
+                return false;
+
+            int page_perms[BLOCK_2MIB / PAGE_SIZE] = {0};
+            for (int i = 0; i < nidx; i++) {
+                uint64_t s_start = regions[idx[i]].gpa_start;
+                uint64_t s_end = regions[idx[i]].gpa_end;
+                uint64_t apply_start = (s_start > b) ? s_start : b;
+                uint64_t apply_end =
+                    (s_end < b + BLOCK_2MIB) ? s_end : b + BLOCK_2MIB;
+                /* Page-align to 4KiB so partially covered pages are recreated
+                 * with the union of all overlapping segment permissions.
+                 */
+                apply_start = ALIGN_DOWN(apply_start, PAGE_SIZE);
+                apply_end = PAGE_ALIGN_UP(apply_end);
+                if (apply_end > b + BLOCK_2MIB)
+                    apply_end = b + BLOCK_2MIB;
+
+                for (uint64_t pa = apply_start; pa < apply_end;
+                     pa += PAGE_SIZE) {
+                    unsigned page_idx = (unsigned) ((pa - b) / PAGE_SIZE);
+                    page_perms[page_idx] |= regions[idx[i]].perms;
+                }
+            }
+
+            for (int i = 0; i < (int) ARRAY_SIZE(page_perms);) {
+                int perms = page_perms[i];
+                int run_start = i;
+
+                while (i < (int) ARRAY_SIZE(page_perms) &&
+                       page_perms[i] == perms)
+                    i++;
+                if (!perms)
+                    continue;
+
+                uint64_t run_gpa_start = b + (uint64_t) run_start * PAGE_SIZE;
+                uint64_t run_gpa_end = b + (uint64_t) i * PAGE_SIZE;
+                if (guest_update_perms(g, run_gpa_start, run_gpa_end, perms) <
+                    0)
+                    return false;
+            }
+        }
+    }
+
+    return true;
+}
+
 uint64_t guest_build_page_tables(guest_t *g, const mem_region_t *regions, int n)
 {
     uint64_t base = g->ipa_base;
@@ -1300,20 +1438,20 @@ uint64_t guest_build_page_tables(guest_t *g, const mem_region_t *regions, int n)
 
     uint64_t *l0 = pt_at(g, l0_gpa);
 
-    /* For each region, determine which 2MB blocks need mapping.
+    /* For each region, determine which 2MiB blocks need mapping.
      * Identity-mapped: VA == GPA, so L0/L1/L2 indices and the block
      * descriptor output address are both derived from gpa_start + ipa_base.
      */
     for (int r = 0; r < n; r++) {
-        uint64_t gpa_start = ALIGN_2MB_DOWN(regions[r].gpa_start);
-        uint64_t gpa_end = ALIGN_2MB_UP(regions[r].gpa_end);
+        uint64_t gpa_start = ALIGN_2MIB_DOWN(regions[r].gpa_start);
+        uint64_t gpa_end = ALIGN_2MIB_UP(regions[r].gpa_end);
         int perms = regions[r].perms;
 
-        for (uint64_t gpa = gpa_start; gpa < gpa_end; gpa += BLOCK_2MB) {
+        for (uint64_t gpa = gpa_start; gpa < gpa_end; gpa += BLOCK_2MIB) {
             uint64_t lookup_addr = base + gpa;
 
-            /* L0 index: which 512GB slot this VA falls in */
-            unsigned l0_idx = (unsigned) (lookup_addr / (512ULL * BLOCK_1GB));
+            /* L0 index: which 512GiB slot this VA falls in */
+            unsigned l0_idx = (unsigned) (lookup_addr / (512ULL * BLOCK_1GIB));
             if (l0_idx >= 512) {
                 log_error("guest: VA 0x%llx out of L0 range",
                           (unsigned long long) lookup_addr);
@@ -1330,9 +1468,9 @@ uint64_t guest_build_page_tables(guest_t *g, const mem_region_t *regions, int n)
             uint64_t l1_ipa = l0[l0_idx] & 0xFFFFFFFFF000ULL;
             uint64_t *l1 = pt_at(g, l1_ipa - base);
 
-            /* L1 index within the 512GB L0 entry (from VA) */
+            /* L1 index within the 512GiB L0 entry (from VA) */
             unsigned l1_idx =
-                (unsigned) ((lookup_addr % (512ULL * BLOCK_1GB)) / BLOCK_1GB);
+                (unsigned) ((lookup_addr % (512ULL * BLOCK_1GIB)) / BLOCK_1GIB);
             if (l1_idx >= 512) {
                 log_error("guest: VA 0x%llx out of L1 range",
                           (unsigned long long) lookup_addr);
@@ -1347,19 +1485,19 @@ uint64_t guest_build_page_tables(guest_t *g, const mem_region_t *regions, int n)
                 l1[l1_idx] = (base + l2_gpa) | PT_VALID | PT_TABLE;
             }
 
-            /* L2 table for this 1GB region (stored in host at gpa offset) */
+            /* L2 table for this 1GiB region (stored in host at gpa offset) */
             uint64_t l2_ipa = l1[l1_idx] & 0xFFFFFFFFF000ULL;
             uint64_t l2_gpa_off = l2_ipa - base;
             uint64_t *l2 = pt_at(g, l2_gpa_off);
 
-            /* L2 index: which 2MB block within the 1GB region (from VA) */
+            /* L2 index: which 2MiB block within the 1GiB region (from VA) */
             unsigned l2_idx =
-                (unsigned) ((lookup_addr % BLOCK_1GB) / BLOCK_2MB);
+                (unsigned) ((lookup_addr % BLOCK_1GIB) / BLOCK_2MIB);
 
             /* If block already mapped, merge permissions (most permissive).
              * Use a local variable for the merged perms. Do NOT modify the
              * outer perms variable, which would leak accumulated permissions
-             * to subsequent 2MB blocks in the same region.
+             * to subsequent 2MiB blocks in the same region.
              */
             int block_perms = perms;
             if (l2[l2_idx] & PT_BLOCK) {
@@ -1380,11 +1518,18 @@ uint64_t guest_build_page_tables(guest_t *g, const mem_region_t *regions, int n)
     /* Store TTBR0 for later use by guest_extend_page_tables */
     uint64_t ttbr0 = base + l0_gpa;
     g->ttbr0 = ttbr0;
+
+    /* Convert blocks shared by regions with mixed perms or partial coverage
+     * into L3 4KiB pages so each segment's permissions are honored exactly.
+     */
+    if (!finalize_block_perms(g, regions, n))
+        return 0;
+
     guest_pt_gen_bump(g);
     return ttbr0;
 }
 
-/* Extend page tables to cover [start, end) with 2MB block descriptors.
+/* Extend page tables to cover [start, end) with 2MiB block descriptors.
  * Walks the existing L0->L1 structure (from g->ttbr0) and allocates new
  * L2 tables as needed. This is safe to call while the vCPU is paused
  * (during HVC #5 handling). Sets g->need_tlbi so the shim flushes the
@@ -1401,14 +1546,14 @@ int guest_extend_page_tables(guest_t *g,
     uint64_t l0_gpa_off = g->ttbr0 - base;
     uint64_t *l0 = pt_at(g, l0_gpa_off);
 
-    /* Walk 2MB blocks in [start, end) */
-    uint64_t addr_start = ALIGN_2MB_DOWN(start), addr_end = ALIGN_2MB_UP(end);
+    /* Walk 2MiB blocks in [start, end) */
+    uint64_t addr_start = ALIGN_2MIB_DOWN(start), addr_end = ALIGN_2MIB_UP(end);
 
-    for (uint64_t addr = addr_start; addr < addr_end; addr += BLOCK_2MB) {
+    for (uint64_t addr = addr_start; addr < addr_end; addr += BLOCK_2MIB) {
         uint64_t ipa = base + addr;
 
-        /* L0 index: which 512GB slot (>512GB addresses need L0[1]+) */
-        unsigned l0_idx = (unsigned) (ipa / (512ULL * BLOCK_1GB));
+        /* L0 index: which 512GiB slot (>512GiB addresses need L0[1]+) */
+        unsigned l0_idx = (unsigned) (ipa / (512ULL * BLOCK_1GIB));
         if (l0_idx >= 512) {
             log_error("guest: IPA 0x%llx out of L0 range in extend",
                       (unsigned long long) ipa);
@@ -1426,7 +1571,8 @@ int guest_extend_page_tables(guest_t *g,
         uint64_t l1_ipa = l0[l0_idx] & 0xFFFFFFFFF000ULL;
         uint64_t *l1 = pt_at(g, l1_ipa - base);
 
-        unsigned l1_idx = (unsigned) ((ipa % (512ULL * BLOCK_1GB)) / BLOCK_1GB);
+        unsigned l1_idx =
+            (unsigned) ((ipa % (512ULL * BLOCK_1GIB)) / BLOCK_1GIB);
         if (l1_idx >= 512) {
             log_error("guest: IPA 0x%llx out of L1 range in extend",
                       (unsigned long long) ipa);
@@ -1445,7 +1591,7 @@ int guest_extend_page_tables(guest_t *g,
         uint64_t l2_ipa = l1[l1_idx] & 0xFFFFFFFFF000ULL;
         uint64_t *l2 = pt_at(g, l2_ipa - base);
 
-        unsigned l2_idx = (unsigned) ((ipa % BLOCK_1GB) / BLOCK_2MB);
+        unsigned l2_idx = (unsigned) ((ipa % BLOCK_1GIB) / BLOCK_2MIB);
 
         /* Only map if not already mapped */
         if (!(l2[l2_idx] & PT_BLOCK)) {
@@ -1465,7 +1611,7 @@ int guest_extend_page_tables(guest_t *g,
  */
 #define PT_L3_PAGE (3ULL)
 
-/* Build a 4KB L3 page descriptor with the given permissions.
+/* Build a 4KiB L3 page descriptor with the given permissions.
  * Layout matches block descriptors (AF, SH, NS, MAIR, AP, XN) except
  * bits[1:0]=11 instead of 01.
  */
@@ -1506,26 +1652,26 @@ static uint64_t *find_l2_entry(guest_t *g, uint64_t gpa_offset)
     uint64_t l0_gpa_off = g->ttbr0 - base;
     uint64_t *l0 = pt_at(g, l0_gpa_off);
 
-    /* L0 index from actual IPA (not base), correct for >512GB */
-    unsigned l0_idx = (unsigned) (ipa / (512ULL * BLOCK_1GB));
+    /* L0 index from actual IPA (not base), correct for >512GiB */
+    unsigned l0_idx = (unsigned) (ipa / (512ULL * BLOCK_1GIB));
     if (l0_idx >= 512 || !(l0[l0_idx] & PT_VALID))
         return NULL;
 
     uint64_t l1_ipa = l0[l0_idx] & 0xFFFFFFFFF000ULL;
     uint64_t *l1 = pt_at(g, l1_ipa - base);
 
-    unsigned l1_idx = (unsigned) ((ipa % (512ULL * BLOCK_1GB)) / BLOCK_1GB);
+    unsigned l1_idx = (unsigned) ((ipa % (512ULL * BLOCK_1GIB)) / BLOCK_1GIB);
     if (l1_idx >= 512 || !(l1[l1_idx] & PT_VALID))
         return NULL;
 
     uint64_t l2_ipa = l1[l1_idx] & 0xFFFFFFFFF000ULL;
     uint64_t *l2 = pt_at(g, l2_ipa - base);
 
-    unsigned l2_idx = (unsigned) ((ipa % BLOCK_1GB) / BLOCK_2MB);
+    unsigned l2_idx = (unsigned) ((ipa % BLOCK_1GIB) / BLOCK_2MIB);
     return &l2[l2_idx];
 }
 
-/* Split a 2MB L2 block descriptor into 512 × 4KB L3 page descriptors.
+/* Split a 2MiB L2 block descriptor into 512 × 4KiB L3 page descriptors.
  * The caller provides the L2 entry via find_l2_entry.
  * Extracts the output IPA from the existing descriptor.
  */
@@ -1549,7 +1695,7 @@ static int split_l2_block(guest_t *g, uint64_t *l2_entry)
         return -1;
     uint64_t *l3 = pt_at(g, l3_gpa);
 
-    /* Fill 512 L3 entries with 4KB page descriptors inheriting the
+    /* Fill 512 L3 entries with 4KiB page descriptors inheriting the
      * block's permissions.  Extract the output IPA from bits [47:21]
      * of the existing descriptor (not from the caller's address).
      */
@@ -1564,7 +1710,7 @@ static int split_l2_block(guest_t *g, uint64_t *l2_entry)
 
 int guest_split_block(guest_t *g, uint64_t block_gpa)
 {
-    uint64_t block_start = ALIGN_2MB_DOWN(block_gpa);
+    uint64_t block_start = ALIGN_2MIB_DOWN(block_gpa);
     uint64_t *l2_entry = find_l2_entry(g, block_start);
     return split_l2_block(g, l2_entry);
 }
@@ -1580,13 +1726,13 @@ int guest_invalidate_ptes(guest_t *g, uint64_t start, uint64_t end)
     for (uint64_t addr = start; addr < end;) {
         uint64_t *l2_entry = find_l2_entry(g, addr);
         if (!l2_entry) {
-            /* No L2 entry (already unmapped); skip this 2MB block */
-            addr = ALIGN_2MB_UP(addr + 1);
+            /* No L2 entry (already unmapped); skip this 2MiB block */
+            addr = ALIGN_2MIB_UP(addr + 1);
             continue;
         }
 
-        uint64_t block_start = ALIGN_2MB_DOWN(addr);
-        uint64_t block_end = block_start + BLOCK_2MB;
+        uint64_t block_start = ALIGN_2MIB_DOWN(addr);
+        uint64_t block_end = block_start + BLOCK_2MIB;
 
         /* Not mapped at all: skip */
         if (!(*l2_entry & 1)) {
@@ -1594,25 +1740,25 @@ int guest_invalidate_ptes(guest_t *g, uint64_t start, uint64_t end)
             continue;
         }
 
-        /* Check if this is a 2MB block or already an L3 table */
+        /* Check if this is a 2MiB block or already an L3 table */
         if ((*l2_entry & 3) == 1) {
-            /* 2MB block descriptor */
+            /* 2MiB block descriptor */
             if (start <= block_start && end >= block_end) {
-                /* Invalidating the entire 2MB block: clear the L2 entry */
+                /* Invalidating the entire 2MiB block: clear the L2 entry */
                 *l2_entry = 0;
                 g->need_tlbi = true;
                 addr = block_end;
                 continue;
             }
 
-            /* Partial invalidation within a 2MB block: split first,
+            /* Partial invalidation within a 2MiB block: split first,
              * then invalidate individual L3 pages below.
              */
             if (guest_split_block(g, block_start) < 0)
                 return -1;
         }
 
-        /* L3 table: invalidate individual 4KB page descriptors */
+        /* L3 table: invalidate individual 4KiB page descriptors */
         uint64_t l3_ipa = *l2_entry & 0xFFFFFFFFF000ULL;
         uint64_t *l3 = pt_at(g, l3_ipa - base);
 
@@ -1621,7 +1767,7 @@ int guest_invalidate_ptes(guest_t *g, uint64_t start, uint64_t end)
 
         for (uint64_t pa = page_start; pa < page_end; pa += PAGE_SIZE) {
             unsigned l3_idx =
-                (unsigned) (((base + pa) % BLOCK_2MB) / PAGE_SIZE);
+                (unsigned) (((base + pa) % BLOCK_2MIB) / PAGE_SIZE);
             l3[l3_idx] = 0; /* Invalid descriptor */
         }
 
@@ -1644,13 +1790,13 @@ int guest_update_perms(guest_t *g, uint64_t start, uint64_t end, int perms)
     for (uint64_t addr = start; addr < end;) {
         uint64_t *l2_entry = find_l2_entry(g, addr);
         if (!l2_entry) {
-            /* Skip unmapped 2MB blocks */
-            addr = ALIGN_2MB_UP(addr + 1);
+            /* Skip unmapped 2MiB blocks */
+            addr = ALIGN_2MIB_UP(addr + 1);
             continue;
         }
 
-        uint64_t block_start = ALIGN_2MB_DOWN(addr);
-        uint64_t block_end = block_start + BLOCK_2MB;
+        uint64_t block_start = ALIGN_2MIB_DOWN(addr);
+        uint64_t block_end = block_start + BLOCK_2MIB;
 
         /* Not mapped at all: skip */
         if (!(*l2_entry & 1)) {
@@ -1658,12 +1804,12 @@ int guest_update_perms(guest_t *g, uint64_t start, uint64_t end, int perms)
             continue;
         }
 
-        /* Check if this is a 2MB block or already an L3 table */
+        /* Check if this is a 2MiB block or already an L3 table */
         if ((*l2_entry & 3) == 1) {
-            /* 2MB block descriptor */
+            /* 2MiB block descriptor */
             int old_perms = desc_to_perms(*l2_entry);
 
-            /* If the whole 2MB block changes permissions, rewrite the block
+            /* If the whole 2MiB block changes permissions, rewrite the block
              * descriptor without splitting. Extract the output IPA from the
              * existing descriptor, correct for both identity and non-identity
              * mapped regions.
@@ -1678,7 +1824,7 @@ int guest_update_perms(guest_t *g, uint64_t start, uint64_t end, int perms)
                 continue;
             }
 
-            /* Partial update: split the 2MB block into L3 pages first, then
+            /* Partial update: split the 2MiB block into L3 pages first, then
              * fall through to update individual pages below.
              */
             if (old_perms != perms) {
@@ -1691,17 +1837,17 @@ int guest_update_perms(guest_t *g, uint64_t start, uint64_t end, int perms)
             }
         }
 
-        /* L3 table: update individual 4KB page descriptors */
+        /* L3 table: update individual 4KiB page descriptors */
         uint64_t l3_ipa = *l2_entry & 0xFFFFFFFFF000ULL;
         uint64_t *l3 = pt_at(g, l3_ipa - base);
 
-        /* Update pages within this 2MB block that fall in [start, end) */
+        /* Update pages within this 2MiB block that fall in [start, end) */
         uint64_t page_start = (addr > block_start) ? addr : block_start;
         uint64_t page_end = (end < block_end) ? end : block_end;
 
         for (uint64_t pa = page_start; pa < page_end; pa += PAGE_SIZE) {
             unsigned l3_idx =
-                (unsigned) (((base + pa) % BLOCK_2MB) / PAGE_SIZE);
+                (unsigned) (((base + pa) % BLOCK_2MIB) / PAGE_SIZE);
             /* Extract the existing output IPA from the L3 entry. For
              * non-identity mapped regions, pa is a VA not a GPA, so the builder
              * must use the IPA already stored in the descriptor (set by
@@ -1745,14 +1891,14 @@ int guest_materialize_lazy(guest_t *g, uint64_t fault_offset)
     if (!region)
         return -1; /* Not a noreserve region */
 
-    /* Materialize one 2MB block containing the fault address. This is
+    /* Materialize one 2MiB block containing the fault address. This is
      * the smallest granule that guest_extend_page_tables works with.
      * For the common case (sparse heap touch), materializing one block
      * at a time is the right trade-off: it avoids over-committing the
      * large reservation while keeping the fault rate manageable.
      */
-    uint64_t block_start = fault_offset & ~(BLOCK_2MB - 1);
-    uint64_t block_end = block_start + BLOCK_2MB;
+    uint64_t block_start = fault_offset & ~(BLOCK_2MIB - 1);
+    uint64_t block_end = block_start + BLOCK_2MIB;
 
     /* Clamp to guest size */
     if (block_end > g->guest_size)
@@ -1791,9 +1937,9 @@ int guest_materialize_lazy(guest_t *g, uint64_t fault_offset)
             return -1;
 
         /* If this block had no page-table entry before the lazy fault,
-         * guest_extend_page_tables() necessarily created a full 2MB block.
+         * guest_extend_page_tables() necessarily created a full 2MiB block.
          * Split it and remove pages outside this noreserve region so holes and
-         * guards in the same 2MB block remain faults. Existing split blocks
+         * guards in the same 2MiB block remain faults. Existing split blocks
          * already encode neighboring mappings, so leave them intact.
          */
         if (!had_mapping) {

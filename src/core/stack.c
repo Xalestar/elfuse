@@ -161,7 +161,7 @@ uint64_t build_linux_stack(guest_t *g,
     }
 
 /* Bounds-check: Linux returns E2BIG for oversized argument/environment.
- * ARG_MAX on Linux is typically 2MB; stack setup caps at reasonable stack
+ * ARG_MAX on Linux is typically 2MiB; stack setup caps at reasonable stack
  * limits.
  */
 #define MAX_ARGS 131072

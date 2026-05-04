@@ -61,13 +61,13 @@ static void test_prot_none(void)
 
 static void test_large_mmap(void)
 {
-    TEST("mmap 64MB anonymous");
+    TEST("mmap 64MiB anonymous");
 
     size_t sz = 64UL * 1024 * 1024;
     void *p = mmap(NULL, sz, PROT_READ | PROT_WRITE,
                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (p == MAP_FAILED) {
-        FAIL("mmap 64MB failed");
+        FAIL("mmap 64MiB failed");
         return;
     }
 
@@ -78,7 +78,7 @@ static void test_large_mmap(void)
     c[sz - 1] = 'C';
 
     EXPECT_TRUE(c[0] == 'A' && c[sz / 2] == 'B' && c[sz - 1] == 'C',
-                "data mismatch in 64MB region");
+                "data mismatch in 64MiB region");
 
     munmap(p, sz);
 }

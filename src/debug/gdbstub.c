@@ -50,7 +50,7 @@
 
 /* Constants. */
 
-#define GDB_PKT_BUF_SIZE ((size_t) 128 * 1024) /* Max packet size (128KB) */
+#define GDB_PKT_BUF_SIZE ((size_t) 128 * 1024) /* Max packet size (128KiB) */
 #define MAX_HW_BREAKPOINTS 16
 #define MAX_HW_WATCHPOINTS 16
 

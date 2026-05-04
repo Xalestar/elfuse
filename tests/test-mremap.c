@@ -234,7 +234,7 @@ static void test_same_size(void)
 
 static void test_large_realloc(void)
 {
-    TEST("mremap large (256KB->512KB)");
+    TEST("mremap large (256KiB->512KiB)");
     size_t old_sz = 256 * 1024, new_sz = 512 * 1024;
     void *p = mmap(NULL, old_sz, PROT_READ | PROT_WRITE,
                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);

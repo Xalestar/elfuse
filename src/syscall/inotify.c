@@ -650,7 +650,7 @@ int64_t inotify_read(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t count)
         pos += event_size;
     }
 
-    /* Copy event data to a local buffer (max 4KB) */
+    /* Copy event data to a local buffer (max 4KiB) */
     uint8_t local_buf[INOTIFY_BUFSIZE];
     if (copied > 0)
         memcpy(local_buf, inst->event_buf, copied);

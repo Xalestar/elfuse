@@ -369,7 +369,7 @@ int64_t sys_execve(hv_vcpu_t vcpu,
      * Cleanup acquires sfd_lock or inotify_lock, which must NOT be held under
      * fd_lock (lock ordering: fd_lock(3) < sfd_lock(5a) < inotify_lock(7)).
      *
-     * Two passes: count first, then heap-allocate. Avoids placing a ~100KB
+     * Two passes: count first, then heap-allocate. Avoids placing a ~100KiB
      * VLA on the stack (FD_TABLE_SIZE * sizeof(fd_entry_t+int)).
      */
     int cloexec_count = 0;
@@ -529,20 +529,25 @@ int64_t sys_execve(hv_vcpu_t vcpu,
     g->brk_current = brk_start;
 
     /* Keep exec stack placement consistent with initial process startup. */
-    uint64_t stack_top = ALIGN_UP(brk_start, BLOCK_2MB);
+    uint64_t stack_top = ALIGN_UP(brk_start, BLOCK_2MIB);
     stack_top += STACK_SIZE;
     if (stack_top < STACK_TOP_DEFAULT)
         stack_top = STACK_TOP_DEFAULT;
     g->stack_top = stack_top;
     g->stack_base = stack_top - STACK_SIZE;
 
-#define MAX_REGIONS 32
+    /* Worst case: 7 fixed regions (shim, shim-data, vDSO, brk, stack, mmap RX,
+     * mmap RW) plus up to ELF_MAX_SEGMENTS for both the executable and the
+     * interpreter. Sized comfortably to keep the bounds-check loops simple
+     * after the point of no return.
+     */
+#define MAX_REGIONS (8 + 2 * ELF_MAX_SEGMENTS)
     mem_region_t regions[MAX_REGIONS];
     int nregions = 0;
 
-    /* Fixed regions (shim, brk, stack, mmap areas): 6 entries.
-     * Bounds-check before each to prevent array overflow. After the point of no
-     * return, overflow is fatal (exit).
+    /* Fixed regions (shim, shim-data, vDSO, brk, stack, mmap RX, mmap RW): 7
+     * entries. Bounds-check before each to prevent array overflow. After the
+     * point of no return, overflow is fatal (exit).
      */
 
     /* Keep the shim executable-only; HVF faults on merged RWX mappings. */
@@ -555,14 +560,29 @@ int64_t sys_execve(hv_vcpu_t vcpu,
     /* EL1 exception handlers use this block for stack and scratch state. */
     if (nregions >= MAX_REGIONS)
         goto too_many_regions;
-    regions[nregions++] = (mem_region_t) {.gpa_start = SHIM_DATA_BASE,
-                                          .gpa_end = SHIM_DATA_BASE + BLOCK_2MB,
-                                          .perms = MEM_PERM_RW};
+    regions[nregions++] =
+        (mem_region_t) {.gpa_start = SHIM_DATA_BASE,
+                        .gpa_end = SHIM_DATA_BASE + BLOCK_2MIB,
+                        .perms = MEM_PERM_RW};
 
-    /* Translate ELF p_flags into guest page permissions. */
+    /* The vDSO sits in the same 2MiB block as the shim. The page-table builder
+     * splits the block into 4KiB L3 pages when its regions don't fully cover
+     * it, so the vDSO must appear here to keep the trampoline page valid and
+     * RX after rebuild.
+     */
+    if (nregions >= MAX_REGIONS)
+        goto too_many_regions;
+    regions[nregions++] = (mem_region_t) {.gpa_start = VDSO_BASE,
+                                          .gpa_end = VDSO_BASE + VDSO_SIZE,
+                                          .perms = MEM_PERM_RX};
+
+    /* Translate ELF p_flags into guest page permissions. Silent drops would
+     * leave the loaded segment unmapped, so treat overflow as fatal (we are
+     * already past the point of no return).
+     */
     for (int i = 0; i < elf_info.num_segments; i++) {
         if (nregions >= MAX_REGIONS)
-            break;
+            goto too_many_regions;
         regions[nregions++] = (mem_region_t) {
             .gpa_start = elf_info.segments[i].gpa + elf_load_base,
             .gpa_end = elf_info.segments[i].gpa + elf_info.segments[i].memsz +
@@ -571,11 +591,11 @@ int64_t sys_execve(hv_vcpu_t vcpu,
     }
 
     /* Interpreter segments use the same permission translation, shifted by
-     * interp_base.
+     * interp_base. Same fatal-overflow rule as the executable's segments.
      */
     for (int i = 0; i < interp_info.num_segments; i++) {
         if (nregions >= MAX_REGIONS)
-            break;
+            goto too_many_regions;
         regions[nregions++] = (mem_region_t) {
             .gpa_start = interp_info.segments[i].gpa + interp_base,
             .gpa_end = interp_info.segments[i].gpa +
@@ -598,7 +618,7 @@ int64_t sys_execve(hv_vcpu_t vcpu,
                                           .perms = MEM_PERM_RW};
 
     /* PROT_EXEC mmap allocations start in a separate RX area to preserve W^X
-     * with 2MB page-table blocks.
+     * with 2MiB page-table blocks.
      */
     if (nregions >= MAX_REGIONS)
         goto too_many_regions;
@@ -629,7 +649,7 @@ int64_t sys_execve(hv_vcpu_t vcpu,
     guest_region_add(g, SHIM_BASE, SHIM_BASE + shim_size,
                      LINUX_PROT_READ | LINUX_PROT_EXEC, LINUX_MAP_PRIVATE, 0,
                      "[shim]");
-    guest_region_add(g, SHIM_DATA_BASE, SHIM_DATA_BASE + BLOCK_2MB,
+    guest_region_add(g, SHIM_DATA_BASE, SHIM_DATA_BASE + BLOCK_2MIB,
                      LINUX_PROT_READ | LINUX_PROT_WRITE, LINUX_MAP_PRIVATE, 0,
                      "[shim-data]");
     for (int i = 0; i < elf_info.num_segments; i++) {

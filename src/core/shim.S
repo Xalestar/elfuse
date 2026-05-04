@@ -169,7 +169,7 @@ _start:
     eret
 
 /* Exception Vector Table
- * Must be 2KB (0x800) aligned. Each entry is 128 bytes (0x80).
+ * Must be 2KiB (0x800) aligned. Each entry is 128 bytes (0x80).
  *
  * bad_exception vectors: mov x5, #offset + b bad_exception
  *   X5 carries the vector offset for host-side debugging.

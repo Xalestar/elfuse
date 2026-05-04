@@ -55,9 +55,9 @@
 #define PT_AP_RO (3ULL << 6)     /* RO at EL0 */
 
 #define PAGE_SIZE_4K 4096ULL
-#define BLOCK_2MB (2ULL * 1024 * 1024)
+#define BLOCK_2MIB (2ULL * 1024 * 1024)
 
-/* Memory layout (16MB total, much smaller than elfuse's 32GB) */
+/* Memory layout (16MiB total, much smaller than elfuse's 32GiB) */
 
 #define GUEST_SIZE (16ULL * 1024 * 1024)
 
@@ -70,18 +70,18 @@
 #define STACK_A_BASE 0x00A00000ULL   /* EL0 stack A (RW) */
 #define STACK_B_BASE 0x00C00000ULL   /* EL0 stack B (RW) */
 
-/* vCPU-A and vCPU-B SP_EL1 (top of respective 512KB regions within shim data)
+/* vCPU-A and vCPU-B SP_EL1 (top of respective 512KiB regions within shim data)
  */
-#define SP_EL1_A (SHIM_DATA_BASE + BLOCK_2MB)     /* 0x400000 */
-#define SP_EL1_B (SHIM_DATA_BASE + BLOCK_2MB / 2) /* 0x300000 */
+#define SP_EL1_A (SHIM_DATA_BASE + BLOCK_2MIB)     /* 0x400000 */
+#define SP_EL1_B (SHIM_DATA_BASE + BLOCK_2MIB / 2) /* 0x300000 */
 
 /* vCPU-A and vCPU-B EL0 code offsets within GUEST_CODE region */
 #define CODE_A_OFF 0x0000ULL
-#define CODE_B_OFF 0x1000ULL /* 4KB apart */
+#define CODE_B_OFF 0x1000ULL /* 4KiB apart */
 
-/* EL0 stack tops (top of each 2MB region) */
-#define SP_EL0_A (STACK_A_BASE + BLOCK_2MB) /* 0xC00000 */
-#define SP_EL0_B (STACK_B_BASE + BLOCK_2MB) /* 0xE00000 */
+/* EL0 stack tops (top of each 2MiB region) */
+#define SP_EL0_A (STACK_A_BASE + BLOCK_2MIB) /* 0xC00000 */
+#define SP_EL0_B (STACK_B_BASE + BLOCK_2MIB) /* 0xE00000 */
 
 /* System register values (from main.c) */
 
@@ -134,7 +134,7 @@ static uint64_t pt_alloc(vm_state_t *vm)
     return off;
 }
 
-/* Build a 2MB block descriptor at a given GPA with RX or RW perms. */
+/* Build a 2MiB block descriptor at a given GPA with RX or RW perms. */
 static uint64_t make_block(uint64_t gpa, int perm)
 {
     uint64_t desc = (gpa & 0xFFFFFFFFE00000ULL) | PT_AF | PT_SH_ISH | PT_NS |
@@ -162,10 +162,10 @@ static uint64_t build_page_tables(vm_state_t *vm, int include_tlbi_region)
     uint64_t *l0 = (uint64_t *) ((uint8_t *) vm->host_base + l0_off);
     uint64_t *l1 = (uint64_t *) ((uint8_t *) vm->host_base + l1_off);
 
-    /* L0[0] -> L1 table (all the current addresses are < 512GB) */
+    /* L0[0] -> L1 table (all the current addresses are < 512GiB) */
     l0[0] = l1_off | PT_VALID | PT_TABLE;
 
-    /* L1[0] -> L2 table (all the current addresses are < 1GB) */
+    /* L1[0] -> L2 table (all the current addresses are < 1GiB) */
     uint64_t l2_off = pt_alloc(vm);
     if (!l2_off)
         return 0;
@@ -173,7 +173,7 @@ static uint64_t build_page_tables(vm_state_t *vm, int include_tlbi_region)
 
     uint64_t *l2 = (uint64_t *) ((uint8_t *) vm->host_base + l2_off);
 
-    /* Map 2MB blocks. L2 index = addr / 2MB. */
+    /* Map 2MiB blocks. L2 index = addr / 2MiB. */
     /* Shim code (RX) at 0x100000 -> L2[0] (shares 0x0-0x1FFFFF) */
     l2[0] = make_block(0x000000, PERM_RX);
 
@@ -199,8 +199,8 @@ static uint64_t build_page_tables(vm_state_t *vm, int include_tlbi_region)
 
     /* Stack B spills into 0xE00000 (SP=0xE00000 grows down into 0xC00000
      * block), already covered by L2[6] since SP_EL0_B = 0xE00000 is top of
-     * 0xC00000 block. Actually 0xE00000 = 7 * 2MB, that's a separate block. Map
-     * it too:
+     * 0xC00000 block. Actually 0xE00000 = 7 * 2MiB, that's a separate block.
+     * Map it too:
      */
     l2[7] = make_block(0xE00000, PERM_RW);
 
@@ -475,7 +475,7 @@ static int vm_create(vm_state_t *vm)
     vm->pt_next = PT_POOL_BASE;
 
     /* Query max IPA size and configure VM (matches guest.c pattern).
-     * The test uses only 16MB, so any IPA size works; this is for
+     * The test uses only 16MiB, so any IPA size works; this is for
      * API consistency with elfuse's production code path.
      */
     uint32_t max_ipa = 0;

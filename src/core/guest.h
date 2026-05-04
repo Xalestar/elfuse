@@ -6,8 +6,8 @@
  *
  * Provides identity-mapped guest physical memory (GVA == GPA == offset into
  * host buffer). Buffer size is determined by the VM's configured IPA width:
- *   - Native aarch64 on M2 (36-bit IPA): 64GB
- *   - Native aarch64 on M3+ (40-bit IPA): 1TB
+ *   - Native aarch64 on M2 (36-bit IPA): 64GiB
+ *   - Native aarch64 on M3+ (40-bit IPA): 1TiB
  *
  * Reserved via mmap(MAP_ANON); macOS demand-pages physical memory on first
  * touch, so unused pages cost nothing. The slab is mapped RWX to
@@ -27,49 +27,49 @@
 /* Memory layout constants.
  *
  * Guest memory size is determined dynamically from the VM's IPA width
- * (36-bit = 64GB on M2, 40-bit = 1TB on M3+). See guest.c for the
+ * (36-bit = 64GiB on M2, 40-bit = 1TiB on M3+). See guest.c for the
  * runtime probe that selects the correct size.
  */
 
 #define PT_POOL_BASE 0x00010000ULL     /* Page table pool start */
-#define PT_POOL_END 0x00100000ULL      /* Page table pool end (960KB) */
-#define SHIM_BASE 0x00100000ULL        /* Shim code (2MB block, RX) */
-#define SHIM_DATA_BASE 0x00200000ULL   /* Shim stack/data (2MB block, RW) */
+#define PT_POOL_END 0x00100000ULL      /* Page table pool end (960KiB) */
+#define SHIM_BASE 0x00100000ULL        /* Shim code (2MiB block, RX) */
+#define SHIM_DATA_BASE 0x00200000ULL   /* Shim stack/data (2MiB block, RW) */
 #define ELF_DEFAULT_BASE 0x00400000ULL /* Typical ELF load base */
-#define PIE_LOAD_BASE 0x00400000ULL    /* PIE (ET_DYN) executable base (4MB) */
-#define BRK_BASE_DEFAULT 0x01000000ULL /* Default brk start (16MB) */
+#define PIE_LOAD_BASE 0x00400000ULL    /* PIE (ET_DYN) executable base (4MiB) */
+#define BRK_BASE_DEFAULT 0x01000000ULL /* Default brk start (16MiB) */
 
-/* 8MB stack (four 2MB blocks); unused HVF backing pages consume no RAM. */
+/* 8MiB stack (four 2MiB blocks); unused HVF backing pages consume no RAM. */
 #define STACK_SIZE 0x00800000ULL
 
-/* Used when brk_start is below 128MB; otherwise placed above brk. */
+/* Used when brk_start is below 128MiB; otherwise placed above brk. */
 #define STACK_TOP_DEFAULT 0x08000000ULL
-#define STACK_GUARD_SIZE 0x00001000ULL /* 4KB guard page at bottom of stack */
+#define STACK_GUARD_SIZE 0x00001000ULL /* 4KiB guard at stack bottom */
 
-/* mmap RX region for PROT_EXEC; placed below 8GB to leave the high mmap
+/* mmap RX region for PROT_EXEC; placed below 8GiB to leave the high mmap
  * region clear for runtimes that demand a specific minimum heap address.
  */
 #define MMAP_RX_BASE 0x10000000ULL
 
-/* Initial pre-mapped mmap RX end. Only covers the first 2MB block;
+/* Initial pre-mapped mmap RX end. Only covers the first 2MiB block;
  * additional pages are mapped lazily by guest_extend_page_tables()
  * when sys_mmap needs more PROT_EXEC space. Reduces startup time
  * and memory pressure for small binaries that never call mmap.
  */
-#define MMAP_RX_INITIAL_END (MMAP_RX_BASE + 0x200000ULL) /* +2MB */
+#define MMAP_RX_INITIAL_END (MMAP_RX_BASE + 0x200000ULL) /* +2MiB */
 
-/* mmap RW region starts at 8GB to match real Linux address layouts. */
+/* mmap RW region starts at 8GiB to match real Linux address layouts. */
 #define MMAP_BASE 0x200000000ULL
 
-/* Initial pre-mapped mmap RW end. Only covers the first 2MB block;
+/* Initial pre-mapped mmap RW end. Only covers the first 2MiB block;
  * additional pages are mapped lazily by guest_extend_page_tables().
  */
-#define MMAP_INITIAL_END (MMAP_BASE + 0x200000ULL) /* +2MB */
+#define MMAP_INITIAL_END (MMAP_BASE + 0x200000ULL) /* +2MiB */
 
 /* mmap_limit and interp_base are computed dynamically from guest_size
  * in main.c and stored in guest_t.
  */
-#define BLOCK_2MB (2ULL * 1024 * 1024)
+#define BLOCK_2MIB (2ULL * 1024 * 1024)
 
 /* IPA base: guest memory is mapped at this IPA in the hypervisor.
  * All guest physical addresses = GUEST_IPA_BASE + offset.
@@ -91,8 +91,8 @@
  * Identity-mapped: VA == GPA.
  */
 typedef struct {
-    uint64_t gpa_start; /* Output IPA/GPA (2MB aligned) */
-    uint64_t gpa_end;   /* Output IPA/GPA end (exclusive, 2MB aligned) */
+    uint64_t gpa_start; /* Output IPA/GPA (2MiB aligned) */
+    uint64_t gpa_end;   /* Output IPA/GPA end (exclusive, 2MiB aligned) */
     int perms;          /* MEM_PERM_* flags */
 } mem_region_t;
 
@@ -261,14 +261,14 @@ int guest_read_str(const guest_t *g, uint64_t gva, char *dst, size_t max);
 int guest_read_str_small(const guest_t *g, uint64_t gva, char *dst, size_t max);
 
 /* Build L0->L1->L2 page tables from an array of memory regions.
- * Uses 2MB block descriptors. Returns the TTBR0 value (GPA of L0 table),
+ * Uses 2MiB block descriptors. Returns the TTBR0 value (GPA of L0 table),
  * or 0 on failure.
  */
 uint64_t guest_build_page_tables(guest_t *g,
                                  const mem_region_t *regions,
                                  int n);
 
-/* Extend page tables to cover a new address range [start, end) with 2MB
+/* Extend page tables to cover a new address range [start, end) with 2MiB
  * block descriptors. Reuses the existing L0->L1 table structure and
  * allocates new L2 tables as needed. Sets g->need_tlbi = true.
  * Returns 0 on success, -1 on failure.
@@ -278,8 +278,8 @@ int guest_extend_page_tables(guest_t *g,
                              uint64_t end,
                              int perms);
 
-/* Split a 2MB block descriptor into 512 x 4KB L3 page descriptors.
- * block_gpa must be within a currently-mapped 2MB block. The block's
+/* Split a 2MiB block descriptor into 512 x 4KiB L3 page descriptors.
+ * block_gpa must be within a currently-mapped 2MiB block. The block's
  * permissions are inherited by all 512 page entries. If the block is
  * already split (L2 entry is a table descriptor), this is a no-op.
  * Sets g->need_tlbi = true. Returns 0 on success, -1 on failure.
@@ -290,16 +290,16 @@ int guest_split_block(guest_t *g, uint64_t block_gpa);
  * Sets L2 block descriptors and L3 page descriptors to 0 (invalid),
  * causing translation faults on access. Used when mprotect sets
  * PROT_NONE; the correct behavior is for the guest to fault.
- * If a 2MB block is only partially invalidated, the block is split
+ * If a 2MiB block is only partially invalidated, the block is split
  * into L3 pages first (preserving the non-invalidated pages).
  * Sets g->need_tlbi = true. Returns 0 on success, -1 on failure.
  */
 int guest_invalidate_ptes(guest_t *g, uint64_t start, uint64_t end);
 
 /* Update page table permissions for the range [start, end).
- * If a 2MB block needs mixed permissions (only part of it is being
- * updated), the block is automatically split into 4KB L3 pages first.
- * If the entire 2MB block is being updated, the block descriptor is
+ * If a 2MiB block needs mixed permissions (only part of it is being
+ * updated), the block is automatically split into 4KiB L3 pages first.
+ * If the entire 2MiB block is being updated, the block descriptor is
  * modified in place without splitting.
  * perms is a MEM_PERM_R/W/X combination. Sets g->need_tlbi = true.
  * Returns 0 on success, -1 on failure.
@@ -377,7 +377,7 @@ void guest_region_set_prot(guest_t *g, uint64_t start, uint64_t end, int prot);
 
 /* Try to materialize a lazy (MAP_NORESERVE) page at the given offset.
  * Called from the data/instruction abort handler when the faulting address
- * falls within a noreserve region. Creates page table entries for one 2MB
+ * falls within a noreserve region. Creates page table entries for one 2MiB
  * block containing the fault address, zeros the memory, and clears the
  * noreserve flag for the materialized sub-range.
  * Returns 0 on success (caller should TLBI and retry), -1 if the offset is not

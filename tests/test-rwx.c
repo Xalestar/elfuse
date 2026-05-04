@@ -9,8 +9,8 @@
  * page table entries work at stage-1 when SCTLR_EL1.WXN=0.
  *
  * Tests:
- *   1. RWX 2MB block: L2 block descriptor with AP=RW_EL0, UXN=0, PXN=0
- *   2. RWX 4KB page:  L3 page descriptor with the same RWX permissions
+ *   1. RWX 2MiB block: L2 block descriptor with AP=RW_EL0, UXN=0, PXN=0
+ *   2. RWX 4KiB page:  L3 page descriptor with the same RWX permissions
  *   3. Baseline RX:   Confirm execution works on a normal RX page
  *   4. Baseline RW:   Confirm writes work on a normal RW page
  *
@@ -65,9 +65,9 @@
 #define PT_AP_RO (3ULL << 6)     /* AP[2:1]=11 -> RO at EL0 */
 
 #define PAGE_SIZE_4K 4096ULL
-#define BLOCK_2MB (2ULL * 1024 * 1024)
+#define BLOCK_2MIB (2ULL * 1024 * 1024)
 
-/* Memory layout (16MB total) */
+/* Memory layout (16MiB total) */
 
 #define GUEST_SIZE (16ULL * 1024 * 1024)
 
@@ -75,20 +75,20 @@
 #define SHIM_BASE 0x00100000ULL      /* Shim code (RX) */
 #define SHIM_DATA_BASE 0x00200000ULL /* Shim data / EL1 stack (RW) */
 #define GUEST_CODE 0x00400000ULL     /* EL0 test code (RX) */
-#define RWX_BLOCK 0x00600000ULL      /* 2MB block for RWX test (test 1) */
+#define RWX_BLOCK 0x00600000ULL      /* 2MiB block for RWX test (test 1) */
 #define RWX_PAGE_BLOCK \
-    0x00800000ULL /* 2MB region containing RWX 4KB page (test 2) */
+    0x00800000ULL /* 2MiB region containing RWX 4KiB page (test 2) */
 #define GUEST_DATA 0x00A00000ULL /* RW data (test 4 baseline) */
 #define STACK_BASE 0x00C00000ULL /* EL0 stack (RW) */
 
-/* Within RWX_PAGE_BLOCK, the RWX 4KB page is at offset 0 */
+/* Within RWX_PAGE_BLOCK, the RWX 4KiB page is at offset 0 */
 #define RWX_PAGE_ADDR RWX_PAGE_BLOCK
 
 /* EL0 stack top and SP_EL1 */
-#define SP_EL0 (STACK_BASE + BLOCK_2MB)
-#define SP_EL1 (SHIM_DATA_BASE + BLOCK_2MB)
+#define SP_EL0 (STACK_BASE + BLOCK_2MIB)
+#define SP_EL1 (SHIM_DATA_BASE + BLOCK_2MIB)
 
-/* Code offsets within GUEST_CODE (4KB apart for different tests) */
+/* Code offsets within GUEST_CODE (4KiB apart for different tests) */
 #define CODE_TEST1 0x0000ULL /* Test 1: RWX block write+exec */
 #define CODE_TEST2 0x1000ULL /* Test 2: RWX page write+exec */
 #define CODE_TEST3 0x2000ULL /* Test 3: baseline RX exec */
@@ -142,27 +142,27 @@ static uint64_t pt_alloc(vm_state_t *vm)
 
 /* Descriptor builders */
 
-/* Common base attributes for a 2MB block or 4KB page */
+/* Common base attributes for a 2MiB block or 4KiB page */
 static uint64_t common_attrs(void)
 {
     return PT_AF | PT_SH_ISH | PT_NS | PT_ATTR1;
 }
 
-/* 2MB block: RX (executable, read-only at EL0) */
+/* 2MiB block: RX (executable, read-only at EL0) */
 static uint64_t make_block_rx(uint64_t gpa)
 {
     return (gpa & 0xFFFFFFFFE00000ULL) | common_attrs() | PT_BLOCK | PT_AP_RO;
     /* UXN=0, PXN=0 -> executable */
 }
 
-/* 2MB block: RW (writable, not executable) */
+/* 2MiB block: RW (writable, not executable) */
 static uint64_t make_block_rw(uint64_t gpa)
 {
     return (gpa & 0xFFFFFFFFE00000ULL) | common_attrs() | PT_BLOCK |
            PT_AP_RW_EL0 | PT_UXN | PT_PXN;
 }
 
-/* 2MB block: RWX (writable AND executable at EL0, the test subject) */
+/* 2MiB block: RWX (writable AND executable at EL0, the test subject) */
 static uint64_t make_block_rwx(uint64_t gpa)
 {
     return (gpa & 0xFFFFFFFFE00000ULL) | common_attrs() | PT_BLOCK |
@@ -170,7 +170,7 @@ static uint64_t make_block_rwx(uint64_t gpa)
     /* UXN=0, PXN=0 -> executable; AP=01 -> writable at EL0 */
 }
 
-/* 4KB L3 page: RWX (writable AND executable at EL0) */
+/* 4KiB L3 page: RWX (writable AND executable at EL0) */
 static uint64_t make_page_rwx(uint64_t gpa)
 {
     return (gpa & 0xFFFFFFFFF000ULL) | common_attrs() | PT_VALID | PT_PAGE |
@@ -178,7 +178,7 @@ static uint64_t make_page_rwx(uint64_t gpa)
     /* UXN=0, PXN=0 -> executable; AP=01 -> writable at EL0 */
 }
 
-/* 4KB L3 page: RW (not executable) */
+/* 4KiB L3 page: RW (not executable) */
 static uint64_t make_page_rw(uint64_t gpa)
 {
     return (gpa & 0xFFFFFFFFF000ULL) | common_attrs() | PT_VALID | PT_PAGE |
@@ -230,7 +230,7 @@ static uint64_t build_page_tables(vm_state_t *vm)
     l2[3] = make_block_rwx(0x600000);
 
     /* L2[4]: Table descriptor -> L3 page table for Test 2.
-     * the code splits this 2MB block into 512 x 4KB pages. The first page
+     * the code splits this 2MiB block into 512 x 4KiB pages. The first page
      * at 0x800000 is RWX, the rest are RW (non-executable).
      */
     {
@@ -519,9 +519,9 @@ static void print_bad_exception(const vcpu_exit_t *ex)
     }
 }
 
-/* TEST 1: RWX 2MB Block
+/* TEST 1: RWX 2MiB Block
  *
- * Stage-1 page table has a 2MB block at 0x600000 with:
+ * Stage-1 page table has a 2MiB block at 0x600000 with:
  *   AP[2:1]=01 (RW at EL0), UXN=0, PXN=0 (executable)
  * This is a true RWX mapping.
  *
@@ -678,10 +678,10 @@ static int test1_rwx_block(void)
     return result;
 }
 
-/* TEST 2: RWX 4KB Page (L3 descriptor)
+/* TEST 2: RWX 4KiB Page (L3 descriptor)
  *
- * Same as test 1, but using a 4KB L3 page descriptor at 0x800000
- * instead of a 2MB L2 block descriptor. Tests whether the
+ * Same as test 1, but using a 4KiB L3 page descriptor at 0x800000
+ * instead of a 2MiB L2 block descriptor. Tests whether the
  * granularity matters for W^X enforcement.
  */
 
@@ -753,13 +753,13 @@ static int test2_rwx_page(void)
                (unsigned long long) ex.x0, (unsigned long long) ex.x1,
                ex.x1 == 0 ? "exec fault -> flip to RX"
                           : "write fault -> flip to RW");
-        printf("    " YELLOW "HVF enforces W^X at stage-2 (4KB page)" RESET
+        printf("    " YELLOW "HVF enforces W^X at stage-2 (4KiB page)" RESET
                "\n");
         result = -1;
 
     } else if (ex.reason == HVF_EXIT_HVC5 && ex.x0 == 42) {
         printf("\n    " GREEN "RWX works!" RESET
-               " Written code executed (4KB page, x0=%llu)\n",
+               " Written code executed (4KiB page, x0=%llu)\n",
                (unsigned long long) ex.x0);
         result = 0;
 
@@ -769,11 +769,11 @@ static int test2_rwx_page(void)
         uint32_t ec = (uint32_t) (ex.esr >> 26) & 0x3F;
         if (ec == 0x20)
             printf("    " YELLOW
-                   "Instruction abort: W^X blocks execution (4KB page)" RESET
+                   "Instruction abort: W^X blocks execution (4KiB page)" RESET
                    "\n");
         else if (ec == 0x24)
-            printf("    " YELLOW "Data abort: W^X blocks write (4KB page)" RESET
-                   "\n");
+            printf("    " YELLOW
+                   "Data abort: W^X blocks write (4KiB page)" RESET "\n");
         result = -1;
 
     } else {
@@ -952,8 +952,8 @@ int main(void)
     } tests[] = {
         {"Baseline: RX execution", test3_baseline_rx},
         {"Baseline: RW write", test4_baseline_rw},
-        {"RWX 2MB block (write+exec)", test1_rwx_block},
-        {"RWX 4KB page  (write+exec)", test2_rwx_page},
+        {"RWX 2MiB block (write+exec)", test1_rwx_block},
+        {"RWX 4KiB page  (write+exec)", test2_rwx_page},
     };
     int ntests = (int) ARRAY_SIZE(tests);
 

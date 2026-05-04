@@ -201,8 +201,8 @@ static int mremap_extend_range(guest_t *g,
     }
 
     int page_perms = prot_to_perms(prot);
-    uint64_t ext_start = ALIGN_DOWN(off, BLOCK_2MB);
-    uint64_t ext_end = ALIGN_UP(off + size, BLOCK_2MB);
+    uint64_t ext_start = ALIGN_DOWN(off, BLOCK_2MIB);
+    uint64_t ext_end = ALIGN_UP(off + size, BLOCK_2MIB);
     if (ext_end > g->guest_size)
         ext_end = g->guest_size;
     if (guest_extend_page_tables(g, ext_start, ext_end, page_perms) < 0)
@@ -237,11 +237,11 @@ int64_t sys_brk(guest_t *g, uint64_t addr)
      * The brk region is initially mapped up to MMAP_RX_BASE; if it grows
      * past that, the mmap allocator needs to extend dynamically.
      */
-    uint64_t brk_pt_end = ALIGN_UP(g->brk_current, BLOCK_2MB);
+    uint64_t brk_pt_end = ALIGN_UP(g->brk_current, BLOCK_2MIB);
     if (brk_pt_end < MMAP_RX_BASE)
         brk_pt_end = MMAP_RX_BASE;
     if (new_off > brk_pt_end) {
-        uint64_t new_end = ALIGN_UP(new_off, BLOCK_2MB);
+        uint64_t new_end = ALIGN_UP(new_off, BLOCK_2MIB);
         if (guest_extend_page_tables(g, brk_pt_end, new_end, MEM_PERM_RW) < 0)
             return (int64_t) ipa_brk;
     }
@@ -426,8 +426,8 @@ int64_t sys_mmap(guest_t *g,
              */
             int page_perms = prot_to_perms(prot);
 
-            uint64_t ext_start = ALIGN_DOWN(result_off, BLOCK_2MB);
-            uint64_t ext_end = ALIGN_UP(result_off + length, BLOCK_2MB);
+            uint64_t ext_start = ALIGN_DOWN(result_off, BLOCK_2MIB);
+            uint64_t ext_end = ALIGN_UP(result_off + length, BLOCK_2MIB);
             if (ext_end > g->guest_size)
                 ext_end = g->guest_size;
 
@@ -446,7 +446,7 @@ int64_t sys_mmap(guest_t *g,
 
             /* Fine-tune permissions for the exact range. Handles L3
              * splitting when MAP_FIXED overlays different permissions
-             * onto an existing 2MB block (e.g., .data RW over .text RX).
+             * onto an existing 2MiB block (e.g., .data RW over .text RX).
              */
             guest_update_perms(g, result_off, result_off + length, page_perms);
 
@@ -503,8 +503,8 @@ int64_t sys_mmap(guest_t *g,
     if (!is_fixed) {
         if (needs_exec && !(prot & LINUX_PROT_WRITE)) {
             /* PROT_EXEC without PROT_WRITE: allocate from the RX mmap region.
-             * Apple HVF enforces W^X on 2MB block page table entries, so
-             * executable mappings must be in separate 2MB blocks from writable
+             * Apple HVF enforces W^X on 2MiB block page table entries, so
+             * executable mappings must be in separate 2MiB blocks from writable
              * ones. The RX region at MMAP_RX_BASE is pre-mapped with execute
              * permission.
              */
@@ -512,7 +512,7 @@ int64_t sys_mmap(guest_t *g,
             if (result_off == UINT64_MAX) {
                 log_debug(
                     "mmap: RX address space exhausted "
-                    "(len=0x%llx, limit=0x%llx, %u-bit IPA / %lluGB)",
+                    "(len=0x%llx, limit=0x%llx, %u-bit IPA / %llu GiB)",
                     (unsigned long long) length,
                     (unsigned long long) g->mmap_limit, g->ipa_bits,
                     (unsigned long long) (g->guest_size >> 30));
@@ -526,7 +526,7 @@ int64_t sys_mmap(guest_t *g,
             /* RW (or PROT_NONE, or PROT_READ): allocate from main mmap region.
              * Honor the address hint if provided and within bounds. Some
              * managed-runtime allocators need the heap at a specific high
-             * address range (e.g., ~264GB for a megablock-style map) and
+             * address range (e.g., ~264GiB for a megablock-style map) and
              * spin-retry if they get a low address instead. On real Linux,
              * mmap tries the hint first and falls back to any suitable address.
              */
@@ -543,7 +543,7 @@ int64_t sys_mmap(guest_t *g,
             if (result_off == UINT64_MAX) {
                 log_debug(
                     "mmap: RW address space exhausted "
-                    "(len=0x%llx, limit=0x%llx, %u-bit IPA / %lluGB)",
+                    "(len=0x%llx, limit=0x%llx, %u-bit IPA / %llu GiB)",
                     (unsigned long long) length,
                     (unsigned long long) g->mmap_limit, g->ipa_bits,
                     (unsigned long long) (g->guest_size >> 30));
@@ -590,8 +590,8 @@ int64_t sys_mmap(guest_t *g,
          * creating entries for PROT_NONE gaps between allocations.
          */
         if (needs_exec && !(prot & LINUX_PROT_WRITE)) {
-            uint64_t ext_start = ALIGN_DOWN(result_off, BLOCK_2MB);
-            uint64_t ext_end = ALIGN_UP(result_off + length, BLOCK_2MB);
+            uint64_t ext_start = ALIGN_DOWN(result_off, BLOCK_2MIB);
+            uint64_t ext_end = ALIGN_UP(result_off + length, BLOCK_2MIB);
             if (ext_end > g->mmap_limit)
                 ext_end = g->mmap_limit;
             if (guest_extend_page_tables(g, ext_start, ext_end, MEM_PERM_RX) <
@@ -608,8 +608,8 @@ int64_t sys_mmap(guest_t *g,
             if (ext_end > g->mmap_rx_end)
                 g->mmap_rx_end = ext_end;
         } else {
-            uint64_t ext_start = ALIGN_DOWN(result_off, BLOCK_2MB);
-            uint64_t ext_end = ALIGN_UP(result_off + length, BLOCK_2MB);
+            uint64_t ext_start = ALIGN_DOWN(result_off, BLOCK_2MIB);
+            uint64_t ext_end = ALIGN_UP(result_off + length, BLOCK_2MIB);
             if (ext_end > g->mmap_limit)
                 ext_end = g->mmap_limit;
             /* Preserve execute permission for RWX requests. Stage-2
@@ -1133,7 +1133,7 @@ int64_t sys_munmap(guest_t *g, uint64_t addr, uint64_t length)
             if (unmap_off < ELF_DEFAULT_BASE && end > PT_POOL_BASE)
                 return -LINUX_EINVAL;
 
-            /* Invalidate PTEs first. This may need to split a 2MB block
+            /* Invalidate PTEs first. This may need to split a 2MiB block
              * which can fail if the page table pool is exhausted. Failing
              * before region removal keeps metadata consistent.
              */

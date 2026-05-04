@@ -97,7 +97,7 @@ static void test_mmap_churn(void)
     TEST("mmap/munmap churn (256 cycles)");
 
 #define CHURN_CYCLES 256
-#define CHURN_SIZE (64 * 1024) /* 64KB each */
+#define CHURN_SIZE (64 * 1024) /* 64KiB each */
     bool ok = true;
 
     for (int i = 0; i < CHURN_CYCLES; i++) {
@@ -275,7 +275,7 @@ static void test_mprotect_cycling(void)
 
 static void test_large_mmap(void)
 {
-    TEST("large mmap (16MB)");
+    TEST("large mmap (16MiB)");
 
     size_t sz = 16 * 1024 * 1024;
     void *p = mmap(NULL, sz, PROT_READ | PROT_WRITE,
@@ -285,7 +285,7 @@ static void test_large_mmap(void)
         return;
     }
 
-    /* Touch every page (4KB stride) */
+    /* Touch every page (4KiB stride) */
     volatile char *vp = (volatile char *) p;
     for (size_t off = 0; off < sz; off += 4096) {
         vp[off] = (char) (off >> 12);

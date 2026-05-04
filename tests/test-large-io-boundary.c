@@ -4,7 +4,7 @@
  * Copyright 2025 Moritz Angermann, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  *
- * Tests: read/write buffers crossing 2MB L2 blocks and split L3 tables.
+ * Tests: read/write buffers crossing 2MiB L2 blocks and split L3 tables.
  */
 
 #include <fcntl.h>
@@ -19,7 +19,7 @@
 
 int passes = 0, fails = 0;
 
-#define BLOCK_2MB (2UL * 1024 * 1024)
+#define BLOCK_2MIB (2UL * 1024 * 1024)
 #define MAP_SIZE (6UL * 1024 * 1024)
 #define IO_OFFSET 12345UL
 #define IO_SIZE (3UL * 1024 * 1024)
@@ -27,7 +27,7 @@ int passes = 0, fails = 0;
 static unsigned char *next_2mb_boundary(unsigned char *p)
 {
     uintptr_t addr = (uintptr_t) p;
-    addr = (addr + BLOCK_2MB - 1) & ~(uintptr_t) (BLOCK_2MB - 1);
+    addr = (addr + BLOCK_2MIB - 1) & ~(uintptr_t) (BLOCK_2MIB - 1);
     return (unsigned char *) addr;
 }
 
@@ -53,7 +53,7 @@ static int verify_pattern(const unsigned char *buf, size_t len)
     return 0;
 }
 
-/* Verify a repeating 4KB seed pattern across a large buffer.
+/* Verify a repeating 4KiB seed pattern across a large buffer.
  * The seed is: seed[i] = (i * 131 + 17) for i in [0, 4096).
  */
 static int verify_repeating_seed(const unsigned char *buf, size_t len)
@@ -68,7 +68,7 @@ static int verify_repeating_seed(const unsigned char *buf, size_t len)
 
 static void test_large_write(void)
 {
-    TEST("write crosses 2MB boundary");
+    TEST("write crosses 2MiB boundary");
 
     unsigned char *map = mmap(NULL, MAP_SIZE, PROT_READ | PROT_WRITE,
                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -97,7 +97,7 @@ static void test_large_write(void)
         ok = 0;
 
     /* Read back the entire write and verify all bytes, including those
-     * spanning the 2MB page table boundary.
+     * spanning the 2MiB page table boundary.
      */
     unsigned char *readback = mmap(NULL, IO_SIZE, PROT_READ | PROT_WRITE,
                                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -129,12 +129,12 @@ static void test_large_read_from_split_block(void)
         return;
     }
 
-    /* Force the first 2MB block to remain split into L3 pages while ending
+    /* Force the first 2MiB block to remain split into L3 pages while ending
      * with RW permissions, then read across the L3-to-L2 boundary.
      */
     unsigned char *block = next_2mb_boundary(map);
     unsigned char *buf = block + IO_OFFSET;
-    void *page = block + BLOCK_2MB / 2;
+    void *page = block + BLOCK_2MIB / 2;
     if (mprotect(page, 4096, PROT_READ) != 0 ||
         mprotect(page, 4096, PROT_READ | PROT_WRITE) != 0) {
         munmap(map, MAP_SIZE);
@@ -170,7 +170,7 @@ static void test_large_read_from_split_block(void)
         ssize_t ret = read(fd, buf, IO_SIZE);
         ok = (ret == (ssize_t) IO_SIZE);
     }
-    /* Verify the entire read buffer, including the 2MB boundary
+    /* Verify the entire read buffer, including the 2MiB boundary
      * crossing where L3-to-L2 page table transitions happen.
      */
     if (ok && verify_repeating_seed(buf, IO_SIZE) != 0)

@@ -14,14 +14,15 @@
 
 #include "core/guest.h"
 
-/* Guest address where the vDSO is placed (one 4KB page, below PT pool) */
+/* Guest address where the vDSO is placed (one 4KiB page, below PT pool) */
 #define VDSO_BASE 0x0000F000ULL
-#define VDSO_OFF_TEXT 0x0B0 /* Offset of .text (trampoline code) */
+#define VDSO_SIZE 0x00001000ULL /* 4KiB */
+#define VDSO_OFF_TEXT 0x0B0     /* Offset of .text (trampoline code) */
 
 /* Build a minimal vDSO ELF image at VDSO_BASE in guest memory.
- * The image contains a valid ELF header, one LOAD program header,
- * SHT_DYNSYM and SHT_STRTAB sections, and a __kernel_rt_sigreturn
- * symbol pointing to a small trampoline (mov x8, #139; svc #0).
+ * The image contains a valid ELF header, one LOAD program header, SHT_DYNSYM
+ * and SHT_STRTAB sections, and a __kernel_rt_sigreturn symbol pointing to
+ * a small trampoline (mov x8, #139; svc #0).
  * Returns the GVA of the ELF header (== VDSO_BASE), or 0 on failure.
  */
 uint64_t vdso_build(guest_t *g);

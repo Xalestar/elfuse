@@ -170,7 +170,7 @@ static void test_mmap_isolation(void)
 
 static void test_large_cow(void)
 {
-    TEST("fork: 1MB COW integrity");
+    TEST("fork: 1MiB COW integrity");
 
     int pipefd[2];
     if (pipe(pipefd) != 0) {
@@ -182,7 +182,7 @@ static void test_large_cow(void)
     char *buf = mmap(NULL, sz, PROT_READ | PROT_WRITE,
                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (buf == MAP_FAILED) {
-        FAIL("mmap 1MB");
+        FAIL("mmap 1MiB");
         return;
     }
 
@@ -229,7 +229,7 @@ static void test_large_cow(void)
     int status;
     waitpid(pid, &status, 0);
 
-    EXPECT_TRUE(parent_ok && child_ok, "1MB COW integrity failed");
+    EXPECT_TRUE(parent_ok && child_ok, "1MiB COW integrity failed");
     munmap(buf, sz);
 }
 

@@ -212,7 +212,7 @@ static void test_advisory_hints(void)
 
 static void test_dontneed_large(void)
 {
-    TEST("MADV_DONTNEED 1MB range");
+    TEST("MADV_DONTNEED 1MiB range");
     size_t sz = 1024 * 1024;
     void *p = mmap(NULL, sz, PROT_READ | PROT_WRITE,
                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -239,7 +239,7 @@ static void test_dontneed_large(void)
         }
     }
 
-    EXPECT_TRUE(ok, "1MB range not zeroed");
+    EXPECT_TRUE(ok, "1MiB range not zeroed");
 
     munmap(p, sz);
 }
