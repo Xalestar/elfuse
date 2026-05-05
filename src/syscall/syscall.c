@@ -702,7 +702,14 @@ static int64_t sc_rt_tgsigqueueinfo(guest_t *g,
         return -LINUX_ESRCH;
     linux_siginfo_t info;
     memset(&info, 0, sizeof(info));
-    if (uinfo_gva && guest_read_small(g, uinfo_gva, &info, sizeof(info)) == 0) {
+    if (uinfo_gva && guest_read_small(g, uinfo_gva, &info, sizeof(info)) < 0) {
+        log_debug(
+            "rt_tgsigqueueinfo(tgid=%d, tid=%d, sig=%d, "
+            "uinfo=0x%llx [unreadable])",
+            tgid, tid, sig, (unsigned long long) uinfo_gva);
+        return -LINUX_EFAULT;
+    }
+    if (uinfo_gva) {
         bool is_fault =
             (sig == LINUX_SIGTRAP || sig == LINUX_SIGSEGV ||
              sig == LINUX_SIGBUS || sig == LINUX_SIGFPE || sig == LINUX_SIGILL);
@@ -717,23 +724,56 @@ static int64_t sc_rt_tgsigqueueinfo(guest_t *g,
         } else
             log_debug("rt_tgsigqueueinfo(tgid=%d, tid=%d, sig=%d, si_code=%d)",
                       tgid, tid, sig, info.si_code);
-    } else
-        log_debug(
-            "rt_tgsigqueueinfo(tgid=%d, tid=%d, sig=%d, "
-            "uinfo=0x%llx [unreadable])",
-            tgid, tid, sig, (unsigned long long) uinfo_gva);
-    /* RT signals: extract sigval from the queued-signal payload fields. */
-    if (sig >= LINUX_SIGRTMIN && uinfo_gva) {
+    }
+    /* Queued signals carry sigval in si_value for both standard and RT
+     * signals; standard signals still coalesce to one pending instance.
+     */
+    if (uinfo_gva) {
         int32_t si_int = 0;
         memcpy(&si_int, &info.si_value, sizeof(si_int));
         uint64_t si_ptr = 0;
         memcpy(&si_ptr, &info.si_value, sizeof(si_ptr));
-        signal_queue_rt(sig, info.si_code, info.si_pid, (uint32_t) info.si_uid,
-                        si_int, si_ptr);
+        signal_queue_info(sig, info.si_code, info.si_pid,
+                          (uint32_t) info.si_uid, si_int, si_ptr);
     } else {
         signal_queue(sig);
     }
     return 0;
+}
+
+/* rt_sigqueueinfo(pid, sig, info) -- POSIX sigqueue() in glibc/musl uses this.
+ *
+ * The first argument is documented as a process identifier, but real Linux
+ * is permissive: kill_pid_info() looks pid up in the task table and routes
+ * the signal through PIDTYPE_TGID, so a thread id that resolves to a task
+ * succeeds and the signal lands in that task's thread-group pending set.
+ * Foreign pids that match no task return -ESRCH.
+ *
+ * elfuse mirrors this by forwarding to sc_rt_tgsigqueueinfo with
+ * tgid==tid==pid: the downstream thread_find() lookup accepts any guest
+ * thread's tid (collapsing to the single guest tgid), the
+ * proc_get_pid() fallback accepts the main thread's tid, and unknown
+ * pids fall through to -ESRCH. signal_queue_info() then queues
+ * process-wide so the routing semantics match Linux even though the
+ * lookup goes through the per-thread table.
+ *
+ * Earlier review feedback flagged "incorrectly accepting thread ids"
+ * and recommended a strict pid==tgid gate; that gate was tried and
+ * rejected because the qemu/Linux reference accepts the same tids.
+ */
+static int64_t sc_rt_sigqueueinfo(guest_t *g,
+                                  uint64_t x0,
+                                  uint64_t x1,
+                                  uint64_t x2,
+                                  uint64_t x3,
+                                  uint64_t x4,
+                                  uint64_t x5,
+                                  bool verbose)
+{
+    (void) x3;
+    (void) x4;
+    (void) x5;
+    return sc_rt_tgsigqueueinfo(g, x0, x0, x1, x2, 0, 0, verbose);
 }
 
 static int64_t sc_rt_sigreturn(guest_t *g,
@@ -788,8 +828,8 @@ static int64_t sc_prctl(guest_t *g,
     case LINUX_PR_GET_DUMPABLE:
         return 1;
     case LINUX_PR_SET_CHILD_SUBREAPER:
-        /* Accept silently. elfuse's process model already reaps all
-         * children within the VM; the flag has no additional effect.
+        /* Accept silently. elfuse's process model already reaps all children
+         * within the VM; the flag has no additional effect.
          */
         return 0;
     case LINUX_PR_GET_CHILD_SUBREAPER: {
@@ -809,8 +849,8 @@ static int64_t sc_prctl(guest_t *g,
         return (x1 <= LINUX_CAP_LAST_CAP) ? 1 : -LINUX_EINVAL;
     case LINUX_PR_SET_VMA:
         /* PR_SET_VMA with PR_SET_VMA_ANON_NAME: accept and ignore.
-         * Android and memory profiling tools use this to name anonymous
-         * mmap regions. The name is purely advisory.
+         * Android and memory profiling tools use this to name anonymous mmap
+         * regions. The name is purely advisory.
          */
         if ((int) x1 == LINUX_PR_SET_VMA_ANON_NAME)
             return 0;
@@ -1168,8 +1208,8 @@ static int64_t sc_openat2(guest_t *g,
         return -LINUX_EAGAIN;
 
     /* For RESOLVE_NO_SYMLINKS, RESOLVE_NO_MAGICLINKS, RESOLVE_BENEATH,
-     * RESOLVE_IN_ROOT: read the guest path and enforce constraints
-     * before opening.
+     * RESOLVE_IN_ROOT: read the guest path and enforce constraints before
+     * opening.
      */
     if (resolve & (RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS |
                    RESOLVE_BENEATH | RESOLVE_IN_ROOT)) {
@@ -1285,8 +1325,8 @@ static int64_t sc_execveat(guest_t *g,
     hv_vcpu_t vcpu = current_thread->vcpu;
     int dirfd = (int) x0, flags = (int) x4;
 
-    /* Resolve the target path before taking mmap_lock (path resolution
-     * may call fd_to_host / openat which do not need mmap_lock).
+    /* Resolve the target path before taking mmap_lock (path resolution may call
+     * fd_to_host / openat which do not need mmap_lock).
      */
     uint64_t path_gva = x1;
     char resolved[LINUX_PATH_MAX];
@@ -1534,9 +1574,9 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, bool verbose)
                 goto slow_path;
 
             /* Pre-filter: only fast-path fd types that map 1:1 to host
-             * read/write. This read is racy but benign; if the type
-             * changed, fd_to_host_dup will either fail or the slow path
-             * handles it correctly on fallthrough.
+             * read/write. This read is racy but benign; if the type changed,
+             * fd_to_host_dup will either fail or the slow path handles it
+             * correctly on fallthrough.
              */
             int tp = fd_table[fd].type;
             if (tp != FD_REGULAR && tp != FD_STDIO && tp != FD_PIPE &&

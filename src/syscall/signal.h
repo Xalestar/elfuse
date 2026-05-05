@@ -184,8 +184,13 @@ typedef struct {
     bool saved_blocked_valid;              /* True if saved_blocked is set */
     linux_stack_t altstack; /* Alternate signal stack (sigaltstack) */
     bool on_altstack;       /* True if currently delivering on altstack */
+    /* Standard signal metadata: Linux coalesces signals 1-31, but preserves one
+     * siginfo payload for the pending instance.
+     */
+    bool std_info_valid[LINUX_SIGRTMIN - 1];
+    signal_rt_info_t std_info[LINUX_SIGRTMIN - 1];
     /* RT signal queue: count of pending instances per signal.
-     * Standard signals (1-31) use only the pending bitmask (coalesced).
+     * Standard signals (1-31) use the pending bitmask plus std_info[].
      * RT signals (32-64) are queued: each instance is tracked separately.
      */
     int rt_queue[RT_SIGNAL_COUNT];
@@ -193,7 +198,7 @@ typedef struct {
     signal_rt_info_t rt_info[RT_SIGNAL_COUNT][RT_SIGQUEUE_MAX];
 } signal_state_t;
 
-/* API. */
+/* API */
 
 /* Initialize signal state: all SIG_DFL, nothing pending/blocked. */
 void signal_init(void);
@@ -214,6 +219,16 @@ void signal_queue_rt(int signum,
                      uint32_t si_uid,
                      int32_t si_int,
                      uint64_t si_ptr);
+
+/* Queue a signal with explicit siginfo metadata. Standard signals preserve
+ * one payload while coalesced; RT signals enqueue every instance.
+ */
+void signal_queue_info(int signum,
+                       int32_t si_code,
+                       int32_t si_pid,
+                       uint32_t si_uid,
+                       int32_t si_int,
+                       uint64_t si_ptr);
 
 /* Set fault info for the next signal delivery. When set, signal_deliver()
  * populates si_code, si_addr, fault_address, and ESR context from these

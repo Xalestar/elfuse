@@ -885,15 +885,31 @@ int64_t sys_signalfd4(guest_t *g,
     return gfd;
 }
 
-/* Read from signalfd: consume pending signals matching the mask.
- * Each signal produces one signalfd_siginfo (128 bytes).
- * Returns number of bytes read, or -EAGAIN if nothing pending.
+/* Read from signalfd: consume pending signals matching the signalfd's mask.
+ *
+ * Each signal produces one signalfd_siginfo (128 bytes). RT signals (32-64)
+ * are queued: each sigqueue/rt_tgsigqueueinfo enqueues a distinct instance with
+ * its own si_int/si_ptr payload, and signalfd_read returns them in FIFO order
+ * without coalescing (Linux behavior).
+ *
+ * Per-thread signal mask is intentionally not consulted: signalfd is the
+ * standard mechanism for reading signals that were blocked from synchronous
+ * delivery via sigprocmask(). The signalfd's own mask (set at create time or
+ * via signalfd(fd, &mask, ...)) is the only filter applied.
+ *
+ * ssi_int/ssi_ptr are populated from queued metadata when present.
+ * Standard signals (1-31) still coalesce to one pending instance, but Linux
+ * preserves one siginfo payload for that instance.
+ *
+ * Returns the number of bytes read (multiple of sizeof(signalfd_siginfo)), or
+ * -EAGAIN if nothing pending and the fd is non-blocking.
  */
 int64_t signalfd_read(int guest_fd,
                       guest_t *g,
                       uint64_t buf_gva,
                       uint64_t count)
 {
+retry:
     /* Capture slot state under sfd_lock, then release BEFORE calling
      * signal_get_state() which acquires sig_lock(4). Holding sfd_lock(5a)
      * while taking sig_lock(4) would violate lock ordering.
@@ -963,10 +979,21 @@ int64_t signalfd_read(int guest_fd,
         if (deliverable == 0)
             goto no_pending;
     }
-    total = signal_peek_signalfd(mask, pending, max_signals);
-    if (total == 0)
+    size_t peeked = signal_peek_signalfd(mask, pending, max_signals);
+    if (peeked == 0)
         goto no_pending;
-    for (size_t i = 0; i < total; i++) {
+
+    /* Write-then-take. Writing first means that on a guest_write_small EFAULT
+     * the rt-queue is still intact and signals are not lost: no re-queue dance,
+     * no RT_SIGQUEUE_MAX overflow window, no extra signalfd_notify writes that
+     * would desync the pipe-byte count from the actual pending-signal count.
+     * Take only the prefix the writer landed; if a concurrent consumer advanced
+     * the rt-queue head between peek and take, take returns less than the
+     * written count and the bridge restarts the read loop via the retry label
+     * below.
+     */
+    size_t written = 0;
+    for (size_t i = 0; i < peeked; i++) {
         linux_signalfd_siginfo_t info;
         memset(&info, 0, sizeof(info));
         info.ssi_signo = (uint32_t) pending[i].signum;
@@ -978,12 +1005,34 @@ int64_t signalfd_read(int guest_fd,
 
         uint64_t off = i * sizeof(linux_signalfd_siginfo_t);
         if (guest_write_small(g, buf_gva + off, &info, sizeof(info)) < 0) {
-            if (pending != pending_stack)
-                free(pending);
-            return -LINUX_EFAULT;
+            if (written == 0) {
+                /* No bytes transferred: surface EFAULT, leave the queue
+                 * untouched so the signal is not lost. Matches the elfuse
+                 * promise locked in by tests/test-tier-b's
+                 * test_signalfd_efault_preserves_pending.
+                 */
+                if (pending != pending_stack)
+                    free(pending);
+                return -LINUX_EFAULT;
+            }
+
+            /* Partial success: stop writing and let take consume only the
+             * delivered prefix. The unwritten entries stay in the rt-queue
+             * naturally because the take call has not run yet.
+             */
+            break;
         }
+        written++;
     }
-    total = signal_take_signalfd_exact(pending, total);
+
+    total = signal_take_signalfd_exact(pending, written);
+    if (total == 0) {
+        if (written == 0)
+            goto no_pending;
+        if (pending != pending_stack)
+            free(pending);
+        goto retry;
+    }
 
     /* Drain pipe: consume exactly one byte per signal read. If the code drains
      * ALL bytes, the code would lose notifications for signals that arrived
@@ -998,7 +1047,7 @@ int64_t signalfd_read(int guest_fd,
 
     if (pending != pending_stack)
         free(pending);
-    return (int64_t) (total * sizeof(linux_signalfd_siginfo_t));
+    return (int64_t) total * (int64_t) sizeof(linux_signalfd_siginfo_t);
 
 no_pending:
     if (pending != pending_stack)

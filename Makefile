@@ -147,6 +147,12 @@ $(BUILD_DIR)/test-pthread: tests/test-pthread.c | $(BUILD_DIR)
 	@echo "  CROSS   $< (with -lpthread)"
 	$(Q)$(CROSS_COMPILE)gcc -D_GNU_SOURCE -static -O2 -o $@ $< -lpthread
 
+# test-signalfd-hardening needs -lpthread for the worker-thread tid
+# regression case in test_rt_sigqueueinfo_rejects_thread_tid.
+$(BUILD_DIR)/test-signalfd-hardening: tests/test-signalfd-hardening.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc -D_GNU_SOURCE -static -O2 -o $@ $< -lpthread
+
 endif
 
 include mk/tests.mk

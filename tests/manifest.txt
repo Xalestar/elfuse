@@ -49,6 +49,7 @@ test-poll                      # diff=skip
 [section] I/O subsystem tests
 test-eventfd
 test-signalfd
+test-signalfd-hardening
 test-epoll
 test-epoll-edge
 test-timerfd

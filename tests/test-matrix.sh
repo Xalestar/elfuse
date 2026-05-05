@@ -346,6 +346,8 @@ run_unit_tests()
     printf "\nI/O subsystem\n"
     test_check "$runner" "test-eventfd" "0 failed" "$bindir/test-eventfd"
     test_check "$runner" "test-signalfd" "0 failed" "$bindir/test-signalfd"
+    test_check "$runner" "test-signalfd-hardening" "0 failed" \
+        "$bindir/test-signalfd-hardening"
     test_check "$runner" "test-epoll" "0 failed" "$bindir/test-epoll"
     test_check "$runner" "test-epoll-edge" "0 failed" "$bindir/test-epoll-edge"
     test_check "$runner" "test-timerfd" "0 failed" "$bindir/test-timerfd"

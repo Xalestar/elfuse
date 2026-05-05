@@ -111,6 +111,7 @@ SYS_rt_sigaction sc_rt_sigaction 1
 SYS_rt_sigprocmask sc_rt_sigprocmask 1
 SYS_rt_sigpending sc_rt_sigpending 0
 SYS_rt_sigreturn sc_rt_sigreturn 1
+SYS_rt_sigqueueinfo sc_rt_sigqueueinfo 1
 SYS_rt_tgsigqueueinfo sc_rt_tgsigqueueinfo 1
 
 # Time and timers

@@ -97,6 +97,7 @@
 #define SYS_rt_sigaction 134
 #define SYS_rt_sigprocmask 135
 #define SYS_rt_sigpending 136
+#define SYS_rt_sigqueueinfo 138
 #define SYS_rt_sigreturn 139
 #define SYS_setpriority 140
 #define SYS_getpriority 141

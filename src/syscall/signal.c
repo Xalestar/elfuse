@@ -4,12 +4,12 @@
  * Copyright 2025 Moritz Angermann, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  *
- * Implements Linux-compatible signal delivery for aarch64 guests. When a
- * signal is queued (e.g., SIGPIPE from write() to broken pipe), signal
- * emulation builds an rt_sigframe on the guest stack matching the kernel's
- * setup_rt_frame() layout, then redirects the vCPU to the guest's signal
- * handler. The guest handler eventually calls rt_sigreturn (SYS 139), which
- * restores the saved register state from the frame.
+ * Implements Linux-compatible signal delivery for aarch64 guests. When a signal
+ * is queued (e.g., SIGPIPE from write() to broken pipe), signal emulation
+ * builds an rt_sigframe on the guest stack matching the kernel's setup_rt_frame
+ * layout, then redirects the vCPU to the guest's signal handler. The guest
+ * handler eventually calls rt_sigreturn (SYS 139), which restores the saved
+ * register state from the frame.
  *
  * Reference: Linux arch/arm64/kernel/signal.c
  */
@@ -161,10 +161,9 @@ static inline int sig_uncatchable(int signum)
     return signum == LINUX_SIGKILL || signum == LINUX_SIGSTOP;
 }
 
-static void signal_rt_enqueue_locked(int signum, const signal_rt_info_t *info)
+static signal_rt_info_t signal_default_info(int signum)
 {
-    int idx = signum - LINUX_SIGRTMIN;
-    signal_rt_info_t fallback = {
+    return (signal_rt_info_t) {
         .signum = signum,
         .si_code = LINUX_SI_USER,
         .si_pid = (int32_t) proc_get_pid(),
@@ -172,6 +171,33 @@ static void signal_rt_enqueue_locked(int signum, const signal_rt_info_t *info)
         .si_int = 0,
         .si_ptr = 0,
     };
+}
+
+static void signal_standard_enqueue_locked(int signum,
+                                           const signal_rt_info_t *info)
+{
+    int idx = signum - 1;
+    uint64_t bit = sig_bit(signum);
+
+    if (!(sig_state.pending & bit)) {
+        sig_state.std_info[idx] = info ? *info : signal_default_info(signum);
+        sig_state.std_info_valid[idx] = info != NULL;
+    }
+    sig_state.pending |= bit;
+}
+
+static signal_rt_info_t signal_standard_peek_locked(int signum)
+{
+    int idx = signum - 1;
+    if (sig_state.std_info_valid[idx])
+        return sig_state.std_info[idx];
+    return signal_default_info(signum);
+}
+
+static void signal_rt_enqueue_locked(int signum, const signal_rt_info_t *info)
+{
+    int idx = signum - LINUX_SIGRTMIN;
+    signal_rt_info_t fallback = signal_default_info(signum);
     const signal_rt_info_t *entry = info ? info : &fallback;
 
     sig_state.pending |= sig_bit(signum);
@@ -279,9 +305,10 @@ void signal_queue(int signum)
     if (signum < 1 || signum > LINUX_NSIG)
         return;
     pthread_mutex_lock(&sig_lock);
-    sig_state.pending |= sig_bit(signum);
     if (signum >= LINUX_SIGRTMIN)
         signal_rt_enqueue_locked(signum, NULL);
+    else
+        signal_standard_enqueue_locked(signum, NULL);
     /* Publish hint before releasing lock so vCPU hot path sees it. */
     atomic_store_explicit(&sig_pending_hint, sig_state.pending,
                           memory_order_release);
@@ -317,7 +344,17 @@ void signal_queue_rt(int signum,
                      int32_t si_int,
                      uint64_t si_ptr)
 {
-    if (signum < LINUX_SIGRTMIN || signum > LINUX_NSIG)
+    signal_queue_info(signum, si_code, si_pid, si_uid, si_int, si_ptr);
+}
+
+void signal_queue_info(int signum,
+                       int32_t si_code,
+                       int32_t si_pid,
+                       uint32_t si_uid,
+                       int32_t si_int,
+                       uint64_t si_ptr)
+{
+    if (signum < 1 || signum > LINUX_NSIG)
         return;
     pthread_mutex_lock(&sig_lock);
     signal_rt_info_t info = {
@@ -328,7 +365,10 @@ void signal_queue_rt(int signum,
         .si_int = si_int,
         .si_ptr = si_ptr,
     };
-    signal_rt_enqueue_locked(signum, &info);
+    if (signum >= LINUX_SIGRTMIN)
+        signal_rt_enqueue_locked(signum, &info);
+    else
+        signal_standard_enqueue_locked(signum, &info);
     atomic_store_explicit(&sig_pending_hint, sig_state.pending,
                           memory_order_release);
     pthread_mutex_unlock(&sig_lock);
@@ -416,7 +456,12 @@ static size_t signal_collect_signalfd(uint64_t mask,
 
     pthread_mutex_lock(&sig_lock);
     uint64_t deliverable = sig_state.pending & mask;
-    for (int signum = 1; signum < LINUX_NSIG && total < max; signum++) {
+    /* signum runs 1..LINUX_NSIG inclusive (64 is the highest valid RT signal
+     * on aarch64 Linux). Bare-musl applications can target SIGRTMAX directly,
+     * so the inclusive bound matters even though glibc reserves the top of the
+     * RT range for itself.
+     */
+    for (int signum = 1; signum <= LINUX_NSIG && total < max; signum++) {
         uint64_t bit = BIT64(signum - 1);
         if (!(deliverable & bit))
             continue;
@@ -446,14 +491,9 @@ static size_t signal_collect_signalfd(uint64_t mask,
                 total++;
             }
         } else {
-            signal_rt_info_t info = {
-                .signum = signum,
-                .si_code = LINUX_SI_USER,
-                .si_pid = (int32_t) proc_get_pid(),
-                .si_uid = proc_get_uid(),
-                .si_int = 0,
-                .si_ptr = 0,
-            };
+            signal_rt_info_t info = signal_standard_peek_locked(signum);
+            if (consume)
+                sig_state.std_info_valid[signum - 1] = false;
             if (consume)
                 sig_state.pending &= ~bit;
             if (out)
@@ -482,7 +522,7 @@ size_t signal_take_signalfd_exact(const signal_rt_info_t *expected, size_t max)
     pthread_mutex_lock(&sig_lock);
     for (; total < max; total++) {
         int signum = expected[total].signum;
-        if (signum <= 0 || signum >= LINUX_NSIG)
+        if (signum <= 0 || signum > LINUX_NSIG)
             break;
 
         uint64_t bit = sig_bit(signum);
@@ -508,6 +548,15 @@ size_t signal_take_signalfd_exact(const signal_rt_info_t *expected, size_t max)
             continue;
         }
 
+        signal_rt_info_t current = signal_standard_peek_locked(signum);
+        const signal_rt_info_t *want = &expected[total];
+        if (current.signum != want->signum ||
+            current.si_code != want->si_code ||
+            current.si_pid != want->si_pid || current.si_uid != want->si_uid ||
+            current.si_int != want->si_int || current.si_ptr != want->si_ptr)
+            break;
+
+        sig_state.std_info_valid[signum - 1] = false;
         sig_state.pending &= ~bit;
     }
     atomic_store_explicit(&sig_pending_hint, sig_state.pending,
@@ -1107,14 +1156,7 @@ int signal_deliver(hv_vcpu_t vcpu, guest_t *g, int *exit_code)
 
     /* Find lowest pending unblocked signal */
     int signum = bit_ctz64(deliverable) + 1;
-    signal_rt_info_t rt_info = {
-        .signum = signum,
-        .si_code = LINUX_SI_USER,
-        .si_pid = (int32_t) proc_get_pid(),
-        .si_uid = proc_get_uid(),
-        .si_int = 0,
-        .si_ptr = 0,
-    };
+    signal_rt_info_t rt_info = signal_default_info(signum);
 
     /* Dequeue: for RT signals, decrement count and only clear the
      * pending bit when the queue is empty. Standard signals are
@@ -1123,6 +1165,8 @@ int signal_deliver(hv_vcpu_t vcpu, guest_t *g, int *exit_code)
     if (signum >= LINUX_SIGRTMIN) {
         signal_rt_dequeue_locked(signum, &rt_info);
     } else {
+        rt_info = signal_standard_peek_locked(signum);
+        sig_state.std_info_valid[signum - 1] = false;
         sig_state.pending &= ~sig_bit(signum);
     }
 
@@ -1210,8 +1254,7 @@ int signal_deliver(hv_vcpu_t vcpu, guest_t *g, int *exit_code)
         frame.info.si_code = rt_info.si_code;
         frame.info.si_pid = rt_info.si_pid;
         frame.info.si_uid = (int32_t) rt_info.si_uid;
-        if (signum >= LINUX_SIGRTMIN)
-            frame.info.si_value = rt_info.si_ptr;
+        frame.info.si_value = rt_info.si_ptr;
     }
 
     /* ucontext: embed a per-delivery cookie in uc_flags for SROP
