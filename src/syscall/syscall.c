@@ -1583,7 +1583,12 @@ int syscall_dispatch(hv_vcpu_t vcpu, guest_t *g, int *exit_code, bool verbose)
             if (tp != FD_REGULAR && tp != FD_STDIO && tp != FD_PIPE &&
                 tp != FD_SOCKET)
                 goto slow_path;
-            if (nr == SYS_write && fd_table[fd].proc_path[0] != '\0')
+            /* Proc-backed fds may need synthetic read/write handling (for
+             * example, oom_* rereads recompute content on each read and proc
+             * dirfds steer relative *at() resolution). Keep them on the slow
+             * path so the proc interceptors run.
+             */
+            if (fd_table[fd].proc_path[0] != '\0')
                 goto slow_path;
 
             host_fd_ref_t host_ref;

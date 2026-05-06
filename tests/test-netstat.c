@@ -18,6 +18,8 @@
 #include <sys/un.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <dirent.h>
+#include <sys/stat.h>
 
 static int read_proc_file(const char *path, char *buf, size_t bufsz)
 {
@@ -40,6 +42,35 @@ int main(void)
 {
     int pass = 0, fail = 0;
     char buf[8192];
+
+    /* 0. Verify /proc/net exists as a directory with expected children. */
+    struct stat st;
+    if (stat("/proc/net", &st) == 0 && S_ISDIR(st.st_mode)) {
+        DIR *dir = opendir("/proc/net");
+        if (dir) {
+            int found_tcp = 0, found_udp = 0, found_unix = 0;
+            struct dirent *de;
+            while ((de = readdir(dir))) {
+                found_tcp |= !strcmp(de->d_name, "tcp");
+                found_udp |= !strcmp(de->d_name, "udp");
+                found_unix |= !strcmp(de->d_name, "unix");
+            }
+            closedir(dir);
+            if (found_tcp && found_udp && found_unix) {
+                printf("PASS: /proc/net enumerates synthetic socket tables\n");
+                pass++;
+            } else {
+                printf("FAIL: /proc/net missing expected entries\n");
+                fail++;
+            }
+        } else {
+            printf("FAIL: cannot open /proc/net: %s\n", strerror(errno));
+            fail++;
+        }
+    } else {
+        printf("FAIL: /proc/net is not a directory: %s\n", strerror(errno));
+        fail++;
+    }
 
     /* 1. TCP listener on 127.0.0.1:7777 */
     int tcp_fd = socket(AF_INET, SOCK_STREAM, 0);

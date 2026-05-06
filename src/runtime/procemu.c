@@ -19,6 +19,7 @@
  */
 #define MAPS_NAME_COLUMN 73
 
+#include <stdarg.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -47,17 +48,18 @@
 #include "runtime/thread.h"
 
 #include "syscall/abi.h"
+#include "syscall/fd.h"
 #include "syscall/internal.h"
 #include "syscall/proc.h"
 #include "syscall/sys.h"
 
 /* Return the shared /dev/shm emulation directory, creating it on first call.
- * Linux POSIX shm names live in one namespace, so this must not be keyed by
- * the host process id.
+ * Linux POSIX shm names live in one namespace, so this must not be keyed by the
+ * host process id.
  *
- * Uses a mutex for thread-safe lazy initialization while still allowing
- * retries after transient failures. The mkdir+lstat sequence has an inherent
- * TOCTOU window, but the lstat ownership check limits the impact to directories
+ * Uses a mutex for thread-safe lazy initialization while still allowing retries
+ * after transient failures. The mkdir+lstat sequence has an inherent TOCTOU
+ * window, but the lstat ownership check limits the impact to directories
  * already owned by this UID.
  */
 static char shm_dir[128];
@@ -74,7 +76,272 @@ static pthread_mutex_t shm_dir_lock = PTHREAD_MUTEX_INITIALIZER;
 static char proc_tmpdir[128];
 static bool proc_tmpdir_ok;
 static pthread_mutex_t proc_tmpdir_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* OOM range constants from Linux include/uapi/linux/oom.h. */
+#define LINUX_OOM_SCORE_ADJ_MIN (-1000)
+#define LINUX_OOM_SCORE_ADJ_MAX 1000
+#define LINUX_OOM_DISABLE (-17)
+#define LINUX_OOM_ADJUST_MAX 15
+
+/* Process-wide stub for the OOM score adjustment. The legacy oom_adj interface,
+ * the modern oom_score_adj interface, and the read-only oom_score node all
+ * derive their displayed values from this single state.
+ */
 static _Atomic int oom_score_adj_value = 0;
+
+/* Serializes backing-fd rewrites so concurrent writers do not race the
+ * truncate+pwrite sequence that publishes the new value to a same-fd reader.
+ * The atomic store happens last so a failed rewrite leaves the global state
+ * unchanged.
+ */
+static pthread_mutex_t oom_write_lock = PTHREAD_MUTEX_INITIALIZER;
+
+enum {
+    OOM_PATH_NONE = 0,
+    OOM_PATH_SCORE_ADJ, /* /proc/self/oom_score_adj: writable, [-1000, 1000] */
+    OOM_PATH_ADJ,       /* /proc/self/oom_adj: legacy, writable, [-17, 15] */
+    OOM_PATH_SCORE,     /* /proc/self/oom_score: read-only computed score */
+};
+
+static int proc_oom_path_kind(const char *path)
+{
+    if (!strcmp(path, "/proc/self/oom_score_adj"))
+        return OOM_PATH_SCORE_ADJ;
+    if (!strcmp(path, "/proc/self/oom_adj"))
+        return OOM_PATH_ADJ;
+    if (!strcmp(path, "/proc/self/oom_score"))
+        return OOM_PATH_SCORE;
+    return OOM_PATH_NONE;
+}
+
+/* Linux fs/proc/base.c oom_adj_write: a write to oom_adj is scaled into the
+ * [-1000, 1000] oom_score_adj domain. The kernel special-cases both boundary
+ * values so the "disable" and "max" semantics survive the lossy multiply that
+ * would otherwise round 15*1000/17 to 882 and lose the "kill me first" intent.
+ */
+static int oom_adj_to_score_adj(int v)
+{
+    if (v == LINUX_OOM_DISABLE)
+        return LINUX_OOM_SCORE_ADJ_MIN;
+    if (v == LINUX_OOM_ADJUST_MAX)
+        return LINUX_OOM_SCORE_ADJ_MAX;
+    return v * LINUX_OOM_SCORE_ADJ_MAX / -LINUX_OOM_DISABLE;
+}
+
+/* Inverse of oom_adj_to_score_adj for legacy oom_adj reads. Clamp to the legacy
+ * [-17, 15] range so values outside the representable space (e.g. a guest that
+ * wrote -1000 to oom_score_adj) do not surprise readers.
+ */
+static int oom_score_adj_to_adj(int v)
+{
+    int s = v * -LINUX_OOM_DISABLE / LINUX_OOM_SCORE_ADJ_MAX;
+    if (s < LINUX_OOM_DISABLE)
+        s = LINUX_OOM_DISABLE;
+    if (s > LINUX_OOM_ADJUST_MAX)
+        s = LINUX_OOM_ADJUST_MAX;
+    return s;
+}
+
+static int proc_oom_format_value(int kind, char *buf, size_t bufsz)
+{
+    int score_adj = atomic_load(&oom_score_adj_value);
+    int val = 0;
+    if (kind == OOM_PATH_SCORE_ADJ)
+        val = score_adj;
+    else if (kind == OOM_PATH_ADJ)
+        val = oom_score_adj_to_adj(score_adj);
+    return snprintf(buf, bufsz, "%d\n", val);
+}
+
+static int proc_oom_copy_slice(char *dst,
+                               size_t count,
+                               int64_t offset,
+                               const char *src,
+                               size_t src_len,
+                               ssize_t *read_out)
+{
+    if (offset < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    if ((uint64_t) offset >= src_len) {
+        *read_out = 0;
+        return 1;
+    }
+
+    size_t avail = src_len - (size_t) offset;
+    size_t n = count < avail ? count : avail;
+    memcpy(dst, src + offset, n);
+    *read_out = (ssize_t) n;
+    return 1;
+}
+
+typedef struct {
+    int fd;
+    int kind;
+} proc_oom_live_fd_t;
+
+/* OOM proc nodes are opened on per-open temp files so lseek/pread semantics
+ * work naturally. After any successful write, republish the current formatted
+ * value into every still-open OOM fd so a later seek+read on another fd does
+ * not observe the stale snapshot that was materialized at open time.
+ */
+static void proc_oom_refresh_live_fds_locked(void)
+{
+    proc_oom_live_fd_t live[FD_TABLE_SIZE];
+    int nlive = 0;
+
+    pthread_mutex_lock(&fd_lock);
+    for (int i = 0; i < FD_TABLE_SIZE; i++) {
+        int kind = proc_oom_path_kind(fd_table[i].proc_path);
+        if (kind == OOM_PATH_NONE || fd_table[i].type == FD_CLOSED)
+            continue;
+
+        int dup_fd = dup(fd_table[i].host_fd);
+        if (dup_fd < 0)
+            continue;
+
+        live[nlive].fd = dup_fd;
+        live[nlive].kind = kind;
+        nlive++;
+    }
+    pthread_mutex_unlock(&fd_lock);
+
+    for (int i = 0; i < nlive; i++) {
+        char text[32];
+        int len = proc_oom_format_value(live[i].kind, text, sizeof(text));
+        if (len > 0 && (size_t) len < sizeof(text)) {
+            /* Rewrite the backing temp file as defense in depth for any code
+             * path that might bypass proc_intercept_read and fall through to
+             * host read(). The dup'd fd shares the open file description with
+             * the guest's fd, so a paired lseek to "restore" the offset would
+             * clobber a concurrent reader's position; skip the offset dance and
+             * let proc_intercept_read (which always pulls from the atomic) be
+             * the source of truth for offset-aware reads.
+             */
+            if (ftruncate(live[i].fd, 0) == 0)
+                pwrite(live[i].fd, text, (size_t) len, 0);
+        }
+        close(live[i].fd);
+    }
+}
+
+static int proc_open_dir_fd(const char *path, int linux_flags);
+static int proc_lazy_mkdtemp(char *buf, size_t buf_size, const char *template);
+static int append_proc_net_row(char *buf,
+                               size_t bufsz,
+                               int off,
+                               bool want_tcp,
+                               int sl,
+                               const char laddr[33],
+                               uint16_t lport,
+                               const char raddr[33],
+                               uint16_t rport,
+                               int st);
+static void format_proc_net_addr(char out[33],
+                                 const struct in_sockinfo *ini,
+                                 int local,
+                                 int v6);
+
+/* Per-open scratch dirs for /proc/self/fd and /proc/self/fdinfo.
+ *
+ * The previous design shared one host directory across every open, which meant
+ * a second open could unlink/recreate entries while the first opener was
+ * mid-getdents on its dirfd. Each open now allocates its own mkdtemp dir, so
+ * concurrent enumerations cannot mutate one another.
+ *
+ * The tracker keeps the paths so an atexit hook can rmdir them at process exit.
+ * The capacity is a soft cap: callers that exceed it leak the dir to /tmp
+ * (cleared on host reboot or by tmp janitors).
+ */
+#define PROC_SCRATCH_DIRS_MAX 128
+static char proc_scratch_dirs[PROC_SCRATCH_DIRS_MAX][80];
+static int proc_scratch_dirs_count;
+static pthread_mutex_t proc_scratch_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_once_t proc_scratch_atexit_once = PTHREAD_ONCE_INIT;
+
+static void proc_scratch_remove_one(const char *dir)
+{
+    DIR *d = opendir(dir);
+    if (d) {
+        struct dirent *ent;
+        char path[160];
+        while ((ent = readdir(d))) {
+            if (ent->d_name[0] == '.' &&
+                (ent->d_name[1] == '\0' ||
+                 (ent->d_name[1] == '.' && ent->d_name[2] == '\0')))
+                continue;
+            int n = snprintf(path, sizeof(path), "%s/%s", dir, ent->d_name);
+            if (n > 0 && (size_t) n < sizeof(path))
+                unlink(path);
+        }
+        closedir(d);
+    }
+    rmdir(dir);
+}
+
+static void proc_scratch_cleanup_atexit(void)
+{
+    pthread_mutex_lock(&proc_scratch_lock);
+    for (int i = 0; i < proc_scratch_dirs_count; i++)
+        proc_scratch_remove_one(proc_scratch_dirs[i]);
+    proc_scratch_dirs_count = 0;
+    pthread_mutex_unlock(&proc_scratch_lock);
+}
+
+static void proc_scratch_register_atexit(void)
+{
+    atexit(proc_scratch_cleanup_atexit);
+}
+
+/* Open a per-call scratch directory populated with one empty file per live
+ * guest fd. Returns a host dirfd on success, -1 on failure with errno set.
+ *
+ * The dirfd is the standard backing for getdents on this synthetic listing.
+ * Two concurrent openers get two independent dirs, so neither mutates the
+ * other's enumeration.
+ */
+static int proc_open_fd_scratch(const char *prefix, int linux_flags)
+{
+    char dir[80];
+    int n = snprintf(dir, sizeof(dir), "/tmp/%s-XXXXXX", prefix);
+    if (n < 0 || (size_t) n >= sizeof(dir)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    if (!mkdtemp(dir))
+        return -1;
+
+    for (int i = 0; i < FD_TABLE_SIZE; i++) {
+        fd_entry_t snap;
+        if (!fd_snapshot(i, &snap))
+            continue;
+        char entry[160];
+        int en = snprintf(entry, sizeof(entry), "%s/%d", dir, i);
+        if (en <= 0 || (size_t) en >= sizeof(entry))
+            continue;
+        int tfd = open(entry, O_CREAT | O_WRONLY, 0444);
+        if (tfd >= 0)
+            close(tfd);
+    }
+
+    pthread_once(&proc_scratch_atexit_once, proc_scratch_register_atexit);
+
+    pthread_mutex_lock(&proc_scratch_lock);
+    if (proc_scratch_dirs_count < PROC_SCRATCH_DIRS_MAX) {
+        str_copy_trunc(proc_scratch_dirs[proc_scratch_dirs_count++], dir,
+                       sizeof(proc_scratch_dirs[0]));
+    }
+    pthread_mutex_unlock(&proc_scratch_lock);
+
+    int fd = proc_open_dir_fd(dir, linux_flags);
+    if (fd < 0) {
+        int saved = errno;
+        proc_scratch_remove_one(dir);
+        errno = saved;
+    }
+    return fd;
+}
 
 /* atexit cleanup: remove snapshot files and the temp directory tree. */
 static void proc_tmpdir_cleanup(void)
@@ -190,12 +457,12 @@ static int proc_synthetic_fd(const void *data, size_t len)
     return fd;
 }
 
-/* Lazy mkdtemp into a caller-provided buffer. Returns 0 on success (buf
- * holds the path), or -1 on failure (buf[0] reset to '\0').
+/* Lazy mkdtemp into a caller-provided buffer. Returns 0 on success (buf holds
+ * the path), or -1 on failure (buf[0] reset to '\0').
  *
- * Caller must hold the lock that protects buf, since the helper runs the
- * "is buf empty?" check and mkdtemp non-atomically. The created directory
- * is reused across calls until process exit.
+ * Caller must hold the lock that protects buf, since the helper runs the "is
+ * buf empty?" check and mkdtemp non-atomically. The created directory is reused
+ * across calls until process exit.
  */
 static int proc_lazy_mkdtemp(char *buf, size_t buf_size, const char *template)
 {
@@ -220,6 +487,356 @@ static int proc_synthetic_fd_str(const char *buf, int snprintf_ret, size_t cap)
     if ((size_t) snprintf_ret >= cap)
         snprintf_ret = (int) (cap - 1);
     return proc_synthetic_fd(buf, (size_t) snprintf_ret);
+}
+
+/* Format a string into a stack buffer and return the synthetic fd in one
+ * step. Collapses the recurring three-line pattern:
+ *     char buf[N];
+ *     int len = snprintf(buf, sizeof(buf), fmt, ...);
+ *     return proc_synthetic_fd_str(buf, len, sizeof(buf));
+ * 4096-byte cap is the largest formatted /proc payload elfuse emits via this
+ * helper (the few handlers that exceed it -- /proc/self/maps, /proc/net/tcp
+ * -- build their output incrementally and call proc_synthetic_fd directly).
+ */
+__attribute__((format(printf, 1, 2))) static int proc_emit_fmt(const char *fmt,
+                                                               ...)
+{
+    char buf[4096];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    return proc_synthetic_fd_str(buf, n, sizeof(buf));
+}
+
+/* Emit a fixed string literal as a synthetic fd. Used for the handlers that
+ * return identical content every time (mountinfo, filesystems, /proc/sys
+ * constants); avoids allocating a stack buffer when there is nothing to format.
+ */
+static int proc_emit_literal(const char *s)
+{
+    return proc_synthetic_fd(s, strlen(s));
+}
+
+/* Return the basename of the loaded ELF binary, falling back to "elfuse" when
+ * the path is unavailable. Matches the comm-name semantic Linux uses for
+ * /proc/<pid>/comm and the second field of /proc/<pid>/stat. Storage is owned
+ * by proc_get_elf_path() (stable for process lifetime) or the literal fallback;
+ * caller must not free.
+ */
+static const char *proc_comm_name(void)
+{
+    const char *exe = proc_get_elf_path();
+    if (!exe)
+        return "elfuse";
+    const char *slash = strrchr(exe, '/');
+    return slash ? slash + 1 : exe;
+}
+
+/* Parse the numeric tail of a /proc/.../<N> or /dev/fd/<N> path.
+ * prefix_len is the length of the leading literal that the caller already
+ * matched with strncmp. Returns the parsed fd on success, or -1 with errno set
+ * to errno_on_invalid for any malformed input or out-of-range index.
+ */
+static int proc_parse_fd_index(const char *path,
+                               size_t prefix_len,
+                               int errno_on_invalid)
+{
+    char *endp;
+    long n = strtol(path + prefix_len, &endp, 10);
+    if (endp == path + prefix_len || *endp != '\0' || n < 0 ||
+        n >= FD_TABLE_SIZE) {
+        errno = errno_on_invalid;
+        return -1;
+    }
+    return (int) n;
+}
+
+/* Resolve a /dev/shm/<suffix> guest path to a host path inside the per-UID shm
+ * dir. Rejects empty, traversing, or compound suffixes with EACCES; reports
+ * ENAMETOOLONG when the host path overflows. The same validation runs in
+ * proc_intercept_open and proc_intercept_stat, so the helper is one source of
+ * truth for the security gate.
+ */
+static int dev_shm_resolve_path(const char *guest_suffix,
+                                char *host_path,
+                                size_t host_path_sz)
+{
+    const char *shm = shm_dir_path();
+    if (!shm)
+        return -1;
+    if (strstr(guest_suffix, "..") || strchr(guest_suffix, '/') ||
+        guest_suffix[0] == '\0') {
+        errno = EACCES;
+        return -1;
+    }
+    int n = snprintf(host_path, host_path_sz, "%s/%s", shm, guest_suffix);
+    if (n < 0 || (size_t) n >= host_path_sz) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    return 0;
+}
+
+/* Populate *st for a synthetic /proc directory entry. */
+static void stat_fill_proc_dir(struct stat *st, mode_t mode, nlink_t nlink)
+{
+    memset(st, 0, sizeof(*st));
+    st->st_mode = S_IFDIR | mode;
+    st->st_nlink = nlink;
+}
+
+/* Resolve a /dev/fd/<N> or /proc/self/fd/<N> path to a fresh dup() of the
+ * underlying host fd. prefix_len is the length of the matched literal (8 for
+ * "/dev/fd/", 14 for "/proc/self/fd/"). Returns the dup or -1 with errno=EBADF
+ * for malformed indices or closed slots.
+ *
+ * fd_to_host_dup duplicates the host fd atomically under fd_lock so a
+ * concurrent close+reopen on another vCPU cannot redirect the dup to an
+ * unrelated host object that took the freed slot.
+ */
+static int dev_fd_dup(const char *path, size_t prefix_len)
+{
+    int n = proc_parse_fd_index(path, prefix_len, EBADF);
+    if (n < 0)
+        return -1;
+    int dup_fd = fd_to_host_dup(n);
+    if (dup_fd < 0) {
+        errno = EBADF;
+        return -1;
+    }
+    return dup_fd;
+}
+
+/* If path matches /proc/<our_pid>[/...], rewrite into alias as /proc/self[...]
+ * Used by both proc_intercept_open and proc_intercept_stat so the explicit-pid
+ * form aliases through the same /proc/self handlers (Linux treats them
+ * equivalent for the calling process). The trailing-character constraint
+ * admits the bare /proc/<pid> directory and /proc/<pid>/X files alike.
+ *
+ * Returns 1 when alias was rewritten (caller should recurse on alias), 0 when
+ * path is not a self-alias (caller continues with other handlers), or -1 with
+ * errno=ENAMETOOLONG when the rewrite would overflow alias_sz (matches Linux
+ * semantics for paths > PATH_MAX rather than letting the intercept fall through
+ * to a host syscall that would silently fail).
+ */
+static int proc_alias_self(const char *path, char *alias, size_t alias_sz)
+{
+    if (strncmp(path, "/proc/", 6) != 0)
+        return 0;
+    char *endp;
+    long pid = strtol(path + 6, &endp, 10);
+    if (endp == path + 6 || pid != (long) proc_get_pid())
+        return 0;
+    if (*endp != '\0' && *endp != '/')
+        return 0;
+    int n = snprintf(alias, alias_sz, "/proc/self%s", endp);
+    if (n < 0 || (size_t) n >= alias_sz) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    return 1;
+}
+
+/* Populate *st for a synthetic /proc regular-file entry. Linux reports
+ * st_size = 0 for proc nodes; mirroring that forces readers to drain to EOF
+ * instead of pre-sizing buffers from a stale value.
+ */
+static void stat_fill_proc_file(struct stat *st, mode_t mode)
+{
+    memset(st, 0, sizeof(*st));
+    st->st_mode = S_IFREG | mode;
+    st->st_nlink = 1;
+    st->st_size = 0;
+    st->st_blksize = 4096;
+    st->st_blocks = 0;
+}
+
+/* Visitor signature for proc_net_for_each_socket below. Returning false stops
+ * the iteration (used when the caller's output buffer is full).
+ *   sinfo: kernel socket info for the current fd
+ *   pid:   pid that owns the fd (self or a fork child)
+ *   fd_index: index within that pid's fdinfo list (used by /proc/net/unix
+ *             to synthesize a fake-but-stable inode number)
+ *
+ * /proc/net/tcp's "sl" column must be dense, counting only emitted rows (not
+ * inspected sockets), so the iterator deliberately omits a global serial
+ * counter. Visitors that need one track it inside their own ctx and increment
+ * it only after a successful emit.
+ */
+typedef bool (*proc_net_socket_visitor)(const struct socket_fdinfo *sinfo,
+                                        pid_t pid,
+                                        int fd_index,
+                                        void *ctx);
+
+/* Walk every socket fd across self plus active fork children, invoking visit
+ * once per socket. Centralizes the proc_pidinfo + proc_pidfdinfo scaffolding
+ * shared by /proc/net/{tcp,udp,raw}{,6} and /proc/net/unix.
+ */
+static void proc_net_for_each_socket(proc_net_socket_visitor visit, void *ctx)
+{
+    pid_t pids[PROC_TABLE_SIZE + 1];
+    pids[0] = getpid();
+    int npids = 1 + proc_get_child_pids(pids + 1, PROC_TABLE_SIZE);
+
+    for (int p = 0; p < npids; p++) {
+        struct proc_fdinfo fdinfo[512];
+        int fdsz =
+            proc_pidinfo(pids[p], PROC_PIDLISTFDS, 0, fdinfo, sizeof(fdinfo));
+        if (fdsz <= 0)
+            continue;
+        int nfds = fdsz / (int) PROC_PIDLISTFD_SIZE;
+        for (int fi = 0; fi < nfds; fi++) {
+            if (fdinfo[fi].proc_fdtype != PROX_FDTYPE_SOCKET)
+                continue;
+            struct socket_fdinfo sinfo;
+            int sz =
+                proc_pidfdinfo(pids[p], fdinfo[fi].proc_fd,
+                               PROC_PIDFDSOCKETINFO, &sinfo, sizeof(sinfo));
+            if (sz < (int) sizeof(sinfo))
+                continue;
+            if (!visit(&sinfo, pids[p], fi, ctx))
+                return;
+        }
+    }
+}
+
+/* Visitor context + callback for /proc/net/{tcp,udp,raw}{,6}.
+ * sl counts only emitted rows so the "sl" column stays dense even when the
+ * iterator visits other-family sockets that the visitor filters out.
+ */
+struct proc_net_inet_ctx {
+    char *buf;
+    size_t bufsz;
+    int off;
+    int sl;
+    int want_af;
+    int want_stype;
+    bool want_tcp;
+    bool want_v6;
+};
+
+/* Map macOS TSI_S_* socket states (returned in tcp_connection_info.state)
+ * to the 1-based hex values Linux /proc/net/tcp uses (ESTABLISHED=01,
+ * LISTEN=0A, etc.). Indexed by macOS state ordinal.
+ */
+static int proc_net_tcp_state_linux(int kstate)
+{
+    static const int state_map[] = {
+        0x07, /* 0: CLOSED */
+        0x0A, /* 1: LISTEN */
+        0x02, /* 2: SYN_SENT */
+        0x03, /* 3: SYN_RECEIVED */
+        0x01, /* 4: ESTABLISHED */
+        0x08, /* 5: CLOSE_WAIT */
+        0x04, /* 6: FIN_WAIT_1 */
+        0x06, /* 7: CLOSING */
+        0x09, /* 8: LAST_ACK */
+        0x05, /* 9: FIN_WAIT_2 */
+        0x0B, /* 10: TIME_WAIT */
+    };
+    return RANGE_CHECK(kstate, 0, 11) ? state_map[kstate] : 0x07;
+}
+
+static bool proc_net_inet_visit(const struct socket_fdinfo *sinfo,
+                                pid_t pid,
+                                int fd_index,
+                                void *ctx_v)
+{
+    (void) pid;
+    (void) fd_index;
+    struct proc_net_inet_ctx *c = ctx_v;
+    if (c->off >= (int) c->bufsz - 256)
+        return false;
+    if (sinfo->psi.soi_family != c->want_af ||
+        sinfo->psi.soi_type != c->want_stype)
+        return true;
+
+    const struct in_sockinfo *ini =
+        c->want_tcp ? &sinfo->psi.soi_proto.pri_tcp.tcpsi_ini
+                    : &sinfo->psi.soi_proto.pri_in;
+    char laddr[33], raddr[33];
+    format_proc_net_addr(laddr, ini, 1, c->want_v6);
+    format_proc_net_addr(raddr, ini, 0, c->want_v6);
+    int st =
+        c->want_tcp
+            ? proc_net_tcp_state_linux(sinfo->psi.soi_proto.pri_tcp.tcpsi_state)
+            : 0x07;
+    c->off = append_proc_net_row(c->buf, c->bufsz, c->off, c->want_tcp, c->sl,
+                                 laddr, ntohs(ini->insi_lport), raddr,
+                                 ntohs(ini->insi_fport), st);
+    c->sl++;
+    return true;
+}
+
+/* Visitor context + callback for /proc/net/unix. */
+struct proc_net_unix_ctx {
+    char *buf;
+    size_t bufsz;
+    int off;
+};
+
+/* Lock-protected handle to a persistent /tmp directory used to back synthetic
+ * /proc subdirectories whose contents must repopulate per open (e.g.
+ * /proc/self/task with its dynamic TID set). The static buffer + lazy mkdtemp
+ * pattern is shared by multiple handlers so the helper keeps one source of
+ * truth for the locking and creation order.
+ */
+typedef struct {
+    char path[128];
+    pthread_mutex_t lock;
+    const char *template;
+} proc_persistent_dir_t;
+
+#define PROC_PERSISTENT_DIR(prefix) \
+    {.path = {0}, .lock = PTHREAD_MUTEX_INITIALIZER, .template = prefix}
+
+/* Acquire the persistent dir's lock and ensure the dir exists. Caller owns the
+ * lock until proc_persistent_dir_release(). Returns the directory path or NULL
+ * on failure (lock released, errno set).
+ */
+static const char *proc_persistent_dir_acquire(proc_persistent_dir_t *d)
+{
+    pthread_mutex_lock(&d->lock);
+    if (proc_lazy_mkdtemp(d->path, sizeof(d->path), d->template) < 0) {
+        pthread_mutex_unlock(&d->lock);
+        return NULL;
+    }
+    return d->path;
+}
+
+static void proc_persistent_dir_release(proc_persistent_dir_t *d)
+{
+    pthread_mutex_unlock(&d->lock);
+}
+
+static bool proc_net_unix_visit(const struct socket_fdinfo *sinfo,
+                                pid_t pid,
+                                int fd_index,
+                                void *ctx_v)
+{
+    (void) pid;
+    struct proc_net_unix_ctx *c = ctx_v;
+    /* A unix row is up to 56 bytes of fixed format plus a sun_path of
+     * up to 108 bytes plus the trailing newline -- ~165 bytes worst
+     * case. The 128-byte margin previously inherited from the inline
+     * loop could leave a half-formatted row at the buffer tail; 256
+     * matches the inet visitor and covers the longest possible path.
+     */
+    if (c->off >= (int) c->bufsz - 256)
+        return false;
+    if (sinfo->psi.soi_family != AF_UNIX)
+        return true;
+    int stype = sinfo->psi.soi_type;
+    int lt = (stype == SOCK_STREAM)      ? 1
+             : (stype == SOCK_DGRAM)     ? 2
+             : (stype == SOCK_SEQPACKET) ? 5
+                                         : 1;
+    const char *spath = sinfo->psi.soi_proto.pri_un.unsi_addr.ua_sun.sun_path;
+    c->off += snprintf(c->buf + c->off, c->bufsz - (size_t) c->off,
+                       "%016X: %08X %08X %08X %04X %02X %5d %s\n", 0, 3, 0, 0,
+                       lt, 3, 10000 + fd_index, spath[0] ? spath : "");
+    return true;
 }
 
 static int append_proc_net_row(char *buf,
@@ -299,17 +916,6 @@ static int proc_open_numbered_dir(const char *dir, int64_t id, int linux_flags)
     return proc_open_dir_fd(path, linux_flags);
 }
 
-static int proc_is_oom_writable(const char *path)
-{
-    return !strcmp(path, "/proc/self/oom_score_adj") ||
-           !strcmp(path, "/proc/self/oom_adj");
-}
-
-static int proc_is_oom_path(const char *path)
-{
-    return proc_is_oom_writable(path) || !strcmp(path, "/proc/self/oom_score");
-}
-
 static int copy_fd_to_path(int src_fd, const char *path)
 {
     int out = open(path, O_CREAT | O_TRUNC | O_WRONLY, 0444);
@@ -364,6 +970,17 @@ static void populate_proc_snapshot(const guest_t *g,
         return;
     copy_fd_to_path(fd, path);
     close(fd);
+}
+
+static void populate_proc_placeholder(const char *dir, const char *name)
+{
+    char path[LINUX_PATH_MAX];
+    if (snprintf(path, sizeof(path), "%s/%s", dir, name) >= (int) sizeof(path))
+        return;
+
+    int fd = open(path, O_CREAT | O_TRUNC | O_WRONLY, 0444);
+    if (fd >= 0)
+        close(fd);
 }
 
 static void format_proc_net_addr(char out[33],
@@ -427,6 +1044,16 @@ static const char *ensure_proc_tmpdir(const guest_t *g)
     snprintf(taskdir, sizeof(taskdir), "%s/task", piddir);
     mkdir(taskdir, 0755);
 
+    char netdir[128];
+    snprintf(netdir, sizeof(netdir), "%s/net", proc_tmpdir);
+    if (mkdir(netdir, 0755) == 0 || errno == EEXIST) {
+        static const char *net_files[] = {
+            "tcp", "tcp6", "udp", "udp6", "raw", "raw6", "unix", NULL,
+        };
+        for (const char **name = net_files; *name; name++)
+            populate_proc_placeholder(netdir, *name);
+    }
+
     char exepath[128];
     snprintf(exepath, sizeof(exepath), "%s/exe", piddir);
     const char *exe = proc_get_elf_path();
@@ -453,21 +1080,6 @@ static void proc_task_collect_cb(thread_entry_t *t, void *arg)
     proc_task_collect_ctx_t *c = arg;
     if (c->ntids < MAX_THREADS)
         c->tids[c->ntids++] = t->guest_tid;
-}
-
-static char fddir[128];
-static pthread_mutex_t fddir_lock = PTHREAD_MUTEX_INITIALIZER;
-
-static void cleanup_fddir(void)
-{
-    if (fddir[0] != '\0') {
-        for (int i = 0; i < FD_TABLE_SIZE; i++) {
-            char entry[192];
-            snprintf(entry, sizeof(entry), "%s/%d", fddir, i);
-            unlink(entry);
-        }
-        rmdir(fddir);
-    }
 }
 
 int proc_intercept_open(const guest_t *g,
@@ -504,8 +1116,7 @@ int proc_intercept_open(const guest_t *g,
          */
         int oflags = host_accmode | (translate_open_flags(linux_flags) &
                                      (O_NONBLOCK | O_CLOEXEC));
-        int fd = open(host_dev, oflags);
-        return fd >= 0 ? fd : -1;
+        return open(host_dev, oflags);
     }
 
     /* /dev/shm -> tmpfs-backed host temp directory.
@@ -513,32 +1124,19 @@ int proc_intercept_open(const guest_t *g,
      * Redirect to one shared host namespace so named shm works across elfuse
      * processes and fork children.
      */
-    if (!strcmp(path, "/dev/shm") || !strncmp(path, "/dev/shm/", 9)) {
+    if (!strcmp(path, "/dev/shm")) {
         const char *shm = shm_dir_path();
-        if (!shm)
-            return -1;
-        if (!strcmp(path, "/dev/shm"))
-            return proc_open_dir_fd(shm, linux_flags);
-        /* /dev/shm/name -> /tmp/elfuse-shm-UID/name
-         * Reject any path component traversal: "..", "/", or leading "/"
-         */
-        const char *suffix = path + 9;
-        if (strstr(suffix, "..") || strchr(suffix, '/') || suffix[0] == '\0') {
-            errno = EACCES;
-            return -1;
-        }
+        return shm ? proc_open_dir_fd(shm, linux_flags) : -1;
+    }
+    if (!strncmp(path, "/dev/shm/", 9)) {
         char host_path[512];
-        int n = snprintf(host_path, sizeof(host_path), "%s/%s", shm, suffix);
-        if (n < 0 || (size_t) n >= sizeof(host_path)) {
-            errno = ENAMETOOLONG;
+        if (dev_shm_resolve_path(path + 9, host_path, sizeof(host_path)) < 0)
             return -1;
-        }
         int oflags = translate_open_flags(linux_flags);
         /* O_NOFOLLOW: do not follow symlinks created by the guest inside the
          * shm directory (prevents symlink-based escape).
          */
-        int fd = open(host_path, oflags | O_NOFOLLOW, mode);
-        return fd >= 0 ? fd : -1;
+        return open(host_path, oflags | O_NOFOLLOW, mode);
     }
 
     /* /dev/stdin -> dup(0), /dev/stdout -> dup(1), /dev/stderr -> dup(2) */
@@ -550,21 +1148,8 @@ int proc_intercept_open(const guest_t *g,
         return dup(STDERR_FILENO);
 
     /* /dev/fd/N -> dup(N) */
-    if (!strncmp(path, "/dev/fd/", 8)) {
-        char *endptr;
-        long n = strtol(path + 8, &endptr, 10);
-        if (endptr == path + 8 || *endptr != '\0' || n < 0 ||
-            n >= FD_TABLE_SIZE) {
-            errno = EBADF;
-            return -1;
-        }
-        int host_fd = fd_to_host((int) n);
-        if (host_fd < 0) {
-            errno = EBADF;
-            return -1;
-        }
-        return dup(host_fd);
-    }
+    if (!strncmp(path, "/dev/fd/", 8))
+        return dev_fd_dup(path, 8);
 
     /* /proc -> synthetic directory with PID entries for busybox ps, top, etc.
      * Creates a temp dir once (cached for the process lifetime) with entries
@@ -576,8 +1161,7 @@ int proc_intercept_open(const guest_t *g,
         const char *dir = ensure_proc_tmpdir(g);
         if (!dir)
             return -1;
-        int fd = proc_open_dir_fd(dir, linux_flags);
-        return fd >= 0 ? fd : -1;
+        return proc_open_dir_fd(dir, linux_flags);
     }
 
     /* /proc/self -> directory fd for the PID subdirectory */
@@ -585,87 +1169,53 @@ int proc_intercept_open(const guest_t *g,
         const char *dir = ensure_proc_tmpdir(g);
         if (!dir)
             return -1;
-        int fd = proc_open_numbered_dir(dir, proc_get_pid(), linux_flags);
-        return fd >= 0 ? fd : -1;
+        return proc_open_numbered_dir(dir, proc_get_pid(), linux_flags);
     }
 
     /* /proc/self/fd -> directory listing of guest-visible file descriptors.
-     * Use a persistent temp directory because macOS getdents-backed callers
-     * need real directory entries for fchdir/readdir to work.
+     * Each open gets its own scratch dir so concurrent enumerations cannot
+     * mutate one another (see proc_open_fd_scratch).
      */
     if (!strcmp(path, "/proc/self/fd") || !strcmp(path, "/proc/self/fd/")) {
-        pthread_mutex_lock(&fddir_lock);
-        if (fddir[0] == '\0') {
-            if (proc_lazy_mkdtemp(fddir, sizeof(fddir),
-                                  "/tmp/elfuse-fd-XXXXXX") < 0) {
-                pthread_mutex_unlock(&fddir_lock);
-                return -1;
-            }
-            atexit(cleanup_fddir);
-        }
-
-        for (int i = 0; i < FD_TABLE_SIZE; i++) {
-            char entry[192];
-            snprintf(entry, sizeof(entry), "%s/%d", fddir, i);
-            fd_entry_t snap;
-            if (fd_snapshot(i, &snap)) {
-                int tfd = open(entry, O_CREAT | O_WRONLY, 0444);
-                if (tfd >= 0)
-                    close(tfd);
-            } else {
-                unlink(entry);
-            }
-        }
-
-        int fd = proc_open_dir_fd(fddir, linux_flags);
-        pthread_mutex_unlock(&fddir_lock);
-        return fd >= 0 ? fd : -1;
+        return proc_open_fd_scratch("elfuse-fd", linux_flags);
     }
 
-    /* /proc/<pid>/stat -> redirect to /proc/self/stat for the current PID */
-    if (!strncmp(path, "/proc/", 6)) {
-        char *endp;
-        long pid = strtol(path + 6, &endp, 10);
-        if (endp != path + 6 && pid == (long) proc_get_pid()) {
-            /* Rewrite /proc/<our_pid>/X to /proc/self/X and recurse */
-            if (!strncmp(endp, "/stat", 5) && endp[5] == '\0')
-                return proc_intercept_open(g, "/proc/self/stat", linux_flags,
-                                           mode);
-            if (!strncmp(endp, "/status", 7) && endp[7] == '\0')
-                return proc_intercept_open(g, "/proc/self/status", linux_flags,
-                                           mode);
-            if (!strncmp(endp, "/cmdline", 8) && endp[8] == '\0')
-                return proc_intercept_open(g, "/proc/self/cmdline", linux_flags,
-                                           mode);
-            if (!strncmp(endp, "/exe", 4) && endp[4] == '\0')
-                return proc_intercept_open(g, "/proc/self/exe", linux_flags,
-                                           mode);
-            if (!strncmp(endp, "/environ", 8) && endp[8] == '\0')
-                return proc_intercept_open(g, "/proc/self/environ", linux_flags,
-                                           mode);
-            if (!strncmp(endp, "/auxv", 5) && endp[5] == '\0')
-                return proc_intercept_open(g, "/proc/self/auxv", linux_flags,
-                                           mode);
-            if (!strncmp(endp, "/task", 5) &&
-                (endp[5] == '\0' || endp[5] == '/')) {
-                char redir[128];
-                snprintf(redir, sizeof(redir), "/proc/self/task%s", endp + 5);
-                return proc_intercept_open(g, redir, linux_flags, mode);
-            }
-            if (!strncmp(endp, "/fd", 3) &&
-                (endp[3] == '\0' || endp[3] == '/')) {
-                char redir[128];
-                snprintf(redir, sizeof(redir), "/proc/self/fd%s", endp + 3);
-                return proc_intercept_open(g, redir, linux_flags, mode);
-            }
-            if (!strcmp(endp, "") || !strcmp(endp, "/")) {
-                const char *dir = ensure_proc_tmpdir(g);
-                if (!dir)
-                    return -1;
-                int fd =
-                    proc_open_numbered_dir(dir, proc_get_pid(), linux_flags);
-                return fd >= 0 ? fd : -1;
-            }
+    if (!strcmp(path, "/proc/net") || !strcmp(path, "/proc/net/")) {
+        const char *dir = ensure_proc_tmpdir(g);
+        if (!dir)
+            return -1;
+        char netdir[LINUX_PATH_MAX];
+        if (snprintf(netdir, sizeof(netdir), "%s/net", dir) >=
+            (int) sizeof(netdir)) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        return proc_open_dir_fd(netdir, linux_flags);
+    }
+
+    /* /proc/<our_pid>[/...] -> /proc/self[...]. Returns -1 on
+     * ENAMETOOLONG so the guest sees the same error a real Linux kernel
+     * would produce instead of falling through to a host syscall.
+     */
+    {
+        char alias[LINUX_PATH_MAX];
+        int aliased = proc_alias_self(path, alias, sizeof(alias));
+        if (aliased < 0)
+            return -1;
+        if (aliased > 0)
+            return proc_intercept_open(g, alias, linux_flags, mode);
+    }
+
+    int oom_kind = proc_oom_path_kind(path);
+    if (oom_kind == OOM_PATH_SCORE) {
+        /* Mirror the non-root Linux open contract for the 0444 proc node:
+         * reject writable opens immediately instead of letting the write path
+         * fail later against a synthetic temp file.
+         */
+        int oom_accmode = translate_open_flags(linux_flags) & O_ACCMODE;
+        if (oom_accmode != O_RDONLY) {
+            errno = EACCES;
+            return -1;
         }
     }
 
@@ -679,8 +1229,7 @@ int proc_intercept_open(const guest_t *g,
             errno = ENOENT;
             return -1;
         }
-        int fd = open(exe, O_RDONLY);
-        return fd >= 0 ? fd : -1;
+        return open(exe, O_RDONLY);
     }
 
     /* /proc/cpuinfo -> synthetic file with CPU count.
@@ -734,20 +1283,10 @@ int proc_intercept_open(const guest_t *g,
         }
         vm_rss_kb /= 1024;
 
-        /* Extract basename from ELF path for the Name field (Linux uses the
-         * comm name, which is basename truncated to 15 chars)
-         */
-        const char *exe = proc_get_elf_path();
-        const char *name = "elfuse";
-        if (exe) {
-            const char *slash = strrchr(exe, '/');
-            name = slash ? slash + 1 : exe;
-        }
-
+        /* Linux uses the comm name (basename truncated to 15 chars). */
+        const char *name = proc_comm_name();
         int threads = thread_active_count();
-        char buf[2048];
-        int len = snprintf(
-            buf, sizeof(buf),
+        return proc_emit_fmt(
             "Name:\t%.15s\n"
             "State:\tR (running)\n"
             "Tgid:\t%lld\n"
@@ -764,7 +1303,6 @@ int proc_intercept_open(const guest_t *g,
             GUEST_UID, GUEST_GID, GUEST_GID, GUEST_GID, GUEST_GID,
             (unsigned long long) vm_size_kb, (unsigned long long) vm_size_kb,
             (unsigned long long) vm_rss_kb, threads);
-        return proc_synthetic_fd_str(buf, len, sizeof(buf));
     }
 
     /* /proc/self/limits -> resource limits from prlimit64 cache */
@@ -812,31 +1350,25 @@ int proc_intercept_open(const guest_t *g,
      * dirs returns empty. Uses a static path cleaned up at exit.
      */
     if (!strcmp(path, "/proc/self/task") || !strcmp(path, "/proc/self/task/")) {
-        static char taskdir[128];
-        static pthread_mutex_t taskdir_lock = PTHREAD_MUTEX_INITIALIZER;
-
-        pthread_mutex_lock(&taskdir_lock);
-        if (proc_lazy_mkdtemp(taskdir, sizeof(taskdir),
-                              "/tmp/elfuse-task-XXXXXX") < 0) {
-            pthread_mutex_unlock(&taskdir_lock);
+        static proc_persistent_dir_t taskdir =
+            PROC_PERSISTENT_DIR("/tmp/elfuse-task-XXXXXX");
+        const char *dir = proc_persistent_dir_acquire(&taskdir);
+        if (!dir)
             return -1;
-        }
 
         int64_t tids[MAX_THREADS];
         proc_task_collect_ctx_t ctx = {tids, 0};
         thread_for_each(proc_task_collect_cb, &ctx);
-
         for (int i = 0; i < ctx.ntids; i++) {
             char tidpath[128];
-            snprintf(tidpath, sizeof(tidpath), "%s/%lld", taskdir,
+            snprintf(tidpath, sizeof(tidpath), "%s/%lld", dir,
                      (long long) tids[i]);
             mkdir(tidpath, 0755);
         }
 
-        int fd = proc_open_dir_fd(taskdir, linux_flags);
-        pthread_mutex_unlock(&taskdir_lock);
-
-        return fd >= 0 ? fd : -1;
+        int fd = proc_open_dir_fd(dir, linux_flags);
+        proc_persistent_dir_release(&taskdir);
+        return fd;
     }
 
     /* /proc/self/task/<tid>/stat -> per-thread stat line */
@@ -853,75 +1385,51 @@ int proc_intercept_open(const guest_t *g,
         }
 
         if (!strcmp(endp, "/stat")) {
-            const char *exe = proc_get_elf_path();
-            const char *name = "elfuse";
-            if (exe) {
-                const char *slash = strrchr(exe, '/');
-                name = slash ? slash + 1 : exe;
-            }
-            char buf[512];
-            int len =
-                snprintf(buf, sizeof(buf),
-                         "%ld (%.15s) R %lld %lld %lld 0 0 0 0 0 0 0 0 0 0 0 "
-                         "20 0 %d 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 "
-                         "0 0 0 0 0 0 0 0\n",
-                         tid, name, (long long) proc_get_ppid(),
-                         (long long) proc_get_pid(), /* pgid */
-                         (long long) proc_get_sid(), thread_active_count());
-            return proc_synthetic_fd_str(buf, len, sizeof(buf));
+            return proc_emit_fmt(
+                "%ld (%.15s) R %lld %lld %lld 0 0 0 0 0 0 0 0 0 0 0 "
+                "20 0 %d 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 "
+                "0 0 0 0 0 0 0 0\n",
+                tid, proc_comm_name(), (long long) proc_get_ppid(),
+                (long long) proc_get_pid(), /* pgid */
+                (long long) proc_get_sid(), thread_active_count());
         }
 
         if (!strcmp(endp, "/status")) {
-            const char *exe = proc_get_elf_path();
-            const char *name = "elfuse";
-            if (exe) {
-                const char *slash = strrchr(exe, '/');
-                name = slash ? slash + 1 : exe;
-            }
-            char buf[1024];
-            int len =
-                snprintf(buf, sizeof(buf),
-                         "Name:\t%.15s\n"
-                         "State:\tR (running)\n"
-                         "Tgid:\t%lld\n"
-                         "Pid:\t%ld\n"
-                         "PPid:\t%lld\n"
-                         "Uid:\t%d\t%d\t%d\t%d\n"
-                         "Gid:\t%d\t%d\t%d\t%d\n"
-                         "Threads:\t%d\n",
-                         name, (long long) proc_get_pid(), tid,
-                         (long long) proc_get_ppid(), GUEST_UID, GUEST_UID,
-                         GUEST_UID, GUEST_UID, GUEST_GID, GUEST_GID, GUEST_GID,
-                         GUEST_GID, thread_active_count());
-            return proc_synthetic_fd_str(buf, len, sizeof(buf));
+            return proc_emit_fmt(
+                "Name:\t%.15s\n"
+                "State:\tR (running)\n"
+                "Tgid:\t%lld\n"
+                "Pid:\t%ld\n"
+                "PPid:\t%lld\n"
+                "Uid:\t%d\t%d\t%d\t%d\n"
+                "Gid:\t%d\t%d\t%d\t%d\n"
+                "Threads:\t%d\n",
+                proc_comm_name(), (long long) proc_get_pid(), tid,
+                (long long) proc_get_ppid(), GUEST_UID, GUEST_UID, GUEST_UID,
+                GUEST_UID, GUEST_GID, GUEST_GID, GUEST_GID, GUEST_GID,
+                thread_active_count());
         }
 
-        /* /proc/self/task/<tid> directory itself */
+        /* /proc/self/task/<tid> directory itself: synthesize a dir with
+         * stat/status placeholder entries. Persistent so getdents sees
+         * the entries on macOS (which cannot enumerate unlinked dirs).
+         */
         if (*endp == '\0' || !strcmp(endp, "/")) {
-            /* Return a synthetic directory with stat/status placeholder
-             * entries. Uses a persistent temp dir (not cleaned until process
-             * exit) so getdents sees entries on macOS.
-             */
-            static char tiddir_base[128];
-            static pthread_mutex_t tiddir_lock = PTHREAD_MUTEX_INITIALIZER;
-
-            pthread_mutex_lock(&tiddir_lock);
-            if (proc_lazy_mkdtemp(tiddir_base, sizeof(tiddir_base),
-                                  "/tmp/elfuse-tid-XXXXXX") < 0) {
-                pthread_mutex_unlock(&tiddir_lock);
+            static proc_persistent_dir_t tiddir =
+                PROC_PERSISTENT_DIR("/tmp/elfuse-tid-XXXXXX");
+            const char *dir = proc_persistent_dir_acquire(&tiddir);
+            if (!dir)
                 return -1;
-            }
 
             char p[160];
-            snprintf(p, sizeof(p), "%s/stat", tiddir_base);
+            snprintf(p, sizeof(p), "%s/stat", dir);
             close(open(p, O_CREAT | O_WRONLY, 0444));
-            snprintf(p, sizeof(p), "%s/status", tiddir_base);
+            snprintf(p, sizeof(p), "%s/status", dir);
             close(open(p, O_CREAT | O_WRONLY, 0444));
 
-            int fd = proc_open_dir_fd(tiddir_base, linux_flags);
-            pthread_mutex_unlock(&tiddir_lock);
-
-            return fd >= 0 ? fd : -1;
+            int fd = proc_open_dir_fd(dir, linux_flags);
+            proc_persistent_dir_release(&tiddir);
+            return fd;
         }
 
         return -2; /* unknown /proc/self/task/<tid>/XXX */
@@ -1045,9 +1553,7 @@ int proc_intercept_open(const guest_t *g,
         gettimeofday(&now, NULL);
         double uptime = (double) (now.tv_sec - boottime.tv_sec) +
                         (double) (now.tv_usec - boottime.tv_usec) / 1e6;
-        char buf[128];
-        int len = snprintf(buf, sizeof(buf), "%.2f 0.00\n", uptime);
-        return proc_synthetic_fd_str(buf, len, sizeof(buf));
+        return proc_emit_fmt("%.2f 0.00\n", uptime);
     }
 
     /* /proc/loadavg -> synthetic load averages.
@@ -1056,11 +1562,9 @@ int proc_intercept_open(const guest_t *g,
     if (!strcmp(path, "/proc/loadavg")) {
         double loadavg[3] = {0};
         getloadavg(loadavg, 3);
-        char buf[128];
-        int len =
-            snprintf(buf, sizeof(buf), "%.2f %.2f %.2f 1/1 %lld\n", loadavg[0],
-                     loadavg[1], loadavg[2], (long long) proc_get_pid());
-        return proc_synthetic_fd_str(buf, len, sizeof(buf));
+        return proc_emit_fmt("%.2f %.2f %.2f 1/1 %lld\n", loadavg[0],
+                             loadavg[1], loadavg[2],
+                             (long long) proc_get_pid());
     }
 
     /* /var/run/utmp, /run/utmp -> synthetic utmp with current user.
@@ -1097,171 +1601,70 @@ int proc_intercept_open(const guest_t *g,
         !strcmp(path, "/proc/net/raw") || !strcmp(path, "/proc/net/raw6")) {
         bool want_tcp = !!strstr(path, "tcp"), want_udp = !!strstr(path, "udp");
         bool want_v6 = (path[strlen(path) - 1] == '6');
-        int want_af = want_v6 ? AF_INET6 : AF_INET;
-        int want_stype = want_tcp   ? SOCK_STREAM
-                         : want_udp ? SOCK_DGRAM
-                                    : SOCK_RAW;
-        const char *header_fmt =
+        struct proc_net_inet_ctx ctx = {
+            .buf = NULL, /* set below */
+            .bufsz = 16384,
+            .off = 0,
+            .sl = 0,
+            .want_af = want_v6 ? AF_INET6 : AF_INET,
+            .want_stype = want_tcp   ? SOCK_STREAM
+                          : want_udp ? SOCK_DGRAM
+                                     : SOCK_RAW,
+            .want_tcp = want_tcp,
+            .want_v6 = want_v6,
+        };
+        char buf[16384];
+        ctx.buf = buf;
+        ctx.off = snprintf(
+            buf, sizeof(buf), "%s",
             want_tcp ? "  sl  local_address rem_address   st tx_queue "
                        "rx_queue tr tm->when retrnsmt   uid  timeout inode\n"
                      : "  sl  local_address rem_address   st tx_queue "
                        "rx_queue tr tm->when retrnsmt   uid  timeout inode"
-                       " ref pointer drops\n";
-        char buf[16384];
-        int off = snprintf(buf, sizeof(buf), "%s", header_fmt);
-
-        /* Collect PIDs to scan: self + active children */
-        pid_t pids[PROC_TABLE_SIZE + 1];
-        pids[0] = getpid();
-        int npids = 1 + proc_get_child_pids(pids + 1, PROC_TABLE_SIZE);
-
-        int sl = 0;
-        for (int p = 0; p < npids && off < (int) sizeof(buf) - 256; p++) {
-            struct proc_fdinfo fdinfo[512];
-            int fdsz = proc_pidinfo(pids[p], PROC_PIDLISTFDS, 0, fdinfo,
-                                    sizeof(fdinfo));
-            if (fdsz <= 0)
-                continue;
-            int nfds = fdsz / (int) PROC_PIDLISTFD_SIZE;
-
-            for (int fi = 0; fi < nfds && off < (int) sizeof(buf) - 256; fi++) {
-                if (fdinfo[fi].proc_fdtype != PROX_FDTYPE_SOCKET)
-                    continue;
-
-                struct socket_fdinfo sinfo;
-                int sz =
-                    proc_pidfdinfo(pids[p], fdinfo[fi].proc_fd,
-                                   PROC_PIDFDSOCKETINFO, &sinfo, sizeof(sinfo));
-                if (sz < (int) sizeof(sinfo))
-                    continue;
-
-                int saf = sinfo.psi.soi_family, stype = sinfo.psi.soi_type;
-                if (saf != want_af || stype != want_stype)
-                    continue;
-
-                uint16_t lport = 0, rport = 0;
-                char laddr[33], raddr[33];
-                const struct in_sockinfo *ini =
-                    want_tcp ? &sinfo.psi.soi_proto.pri_tcp.tcpsi_ini
-                             : &sinfo.psi.soi_proto.pri_in;
-
-                format_proc_net_addr(laddr, ini, 1, want_v6);
-                lport = ntohs(ini->insi_lport);
-                format_proc_net_addr(raddr, ini, 0, want_v6);
-                rport = ntohs(ini->insi_fport);
-
-                /* TCP state from the kernel's tcp_connection_info */
-                int st = 0x07; /* TCP_CLOSE default */
-                if (want_tcp) {
-                    int kstate = sinfo.psi.soi_proto.pri_tcp.tcpsi_state;
-                    /* macOS TSI_S_* matches Linux TCP state encoding:
-                     * 0=CLOSED, 1=LISTEN, 2=SYN_SENT, etc. But Linux
-                     * /proc/net uses 1-based: 01=ESTABLISHED, 0A=LISTEN
-                     */
-                    static const int state_map[] = {
-                        0x07, /* 0: CLOSED */
-                        0x0A, /* 1: LISTEN */
-                        0x02, /* 2: SYN_SENT */
-                        0x03, /* 3: SYN_RECEIVED */
-                        0x01, /* 4: ESTABLISHED */
-                        0x08, /* 5: CLOSE_WAIT */
-                        0x04, /* 6: FIN_WAIT_1 */
-                        0x06, /* 7: CLOSING */
-                        0x09, /* 8: LAST_ACK */
-                        0x05, /* 9: FIN_WAIT_2 */
-                        0x0B, /* 10: TIME_WAIT */
-                    };
-                    if (RANGE_CHECK(kstate, 0, 11))
-                        st = state_map[kstate];
-                }
-
-                off = append_proc_net_row(buf, sizeof(buf), off, want_tcp, sl,
-                                          laddr, lport, raddr, rport, st);
-                sl++;
-            }
-        }
-        return proc_synthetic_fd_str(buf, off, sizeof(buf));
+                       " ref pointer drops\n");
+        proc_net_for_each_socket(proc_net_inet_visit, &ctx);
+        return proc_synthetic_fd_str(buf, ctx.off, sizeof(buf));
     }
     if (!strcmp(path, "/proc/net/unix")) {
         char buf[8192];
-        int off = snprintf(buf, sizeof(buf),
-                           "Num       RefCount Protocol Flags    Type St "
-                           "Inode Path\n");
-
-        pid_t pids[PROC_TABLE_SIZE + 1];
-        pids[0] = getpid();
-        int npids = 1 + proc_get_child_pids(pids + 1, PROC_TABLE_SIZE);
-
-        for (int p = 0; p < npids && off < (int) sizeof(buf) - 128; p++) {
-            struct proc_fdinfo fdinfo[512];
-            int fdsz = proc_pidinfo(pids[p], PROC_PIDLISTFDS, 0, fdinfo,
-                                    sizeof(fdinfo));
-            if (fdsz <= 0)
-                continue;
-            int nfds = fdsz / (int) PROC_PIDLISTFD_SIZE;
-
-            for (int fi = 0; fi < nfds && off < (int) sizeof(buf) - 128; fi++) {
-                if (fdinfo[fi].proc_fdtype != PROX_FDTYPE_SOCKET)
-                    continue;
-                struct socket_fdinfo sinfo;
-                int sz =
-                    proc_pidfdinfo(pids[p], fdinfo[fi].proc_fd,
-                                   PROC_PIDFDSOCKETINFO, &sinfo, sizeof(sinfo));
-                if (sz < (int) sizeof(sinfo))
-                    continue;
-                if (sinfo.psi.soi_family != AF_UNIX)
-                    continue;
-                int stype = sinfo.psi.soi_type;
-                int lt = (stype == SOCK_STREAM)      ? 1
-                         : (stype == SOCK_DGRAM)     ? 2
-                         : (stype == SOCK_SEQPACKET) ? 5
-                                                     : 1;
-                /* Unix socket path from soi_proto.pri_un.unsi_addr */
-                const char *spath =
-                    sinfo.psi.soi_proto.pri_un.unsi_addr.ua_sun.sun_path;
-                off +=
-                    snprintf(buf + off, sizeof(buf) - off,
-                             "%016X: %08X %08X %08X %04X %02X %5d %s\n", 0, 3,
-                             0, 0, lt, 3, 10000 + fi, spath[0] ? spath : "");
-            }
-        }
-        return proc_synthetic_fd_str(buf, off, sizeof(buf));
+        struct proc_net_unix_ctx ctx = {
+            .buf = buf,
+            .bufsz = sizeof(buf),
+            .off = snprintf(buf, sizeof(buf),
+                            "Num       RefCount Protocol Flags    Type St "
+                            "Inode Path\n"),
+        };
+        proc_net_for_each_socket(proc_net_unix_visit, &ctx);
+        return proc_synthetic_fd_str(buf, ctx.off, sizeof(buf));
     }
 
     /* /proc/sys/vm/mmap_min_addr -> synthetic mmap minimum address. */
-    if (!strcmp(path, "/proc/sys/vm/mmap_min_addr")) {
-        const char *data = "32768\n";
-        return proc_synthetic_fd(data, strlen(data));
-    }
+    if (!strcmp(path, "/proc/sys/vm/mmap_min_addr"))
+        return proc_emit_literal("32768\n");
 
     /* /proc/sys/kernel/randomize_va_space -> ASLR enabled (full). */
-    if (!strcmp(path, "/proc/sys/kernel/randomize_va_space")) {
-        const char *data = "2\n";
-        return proc_synthetic_fd(data, strlen(data));
-    }
+    if (!strcmp(path, "/proc/sys/kernel/randomize_va_space"))
+        return proc_emit_literal("2\n");
 
     /* /proc/version -> synthetic kernel version string */
     if (!strcmp(path, "/proc/version")) {
-        char buf[256];
-        int len = snprintf(buf, sizeof(buf),
-                           "Linux version 6.17.0-20-generic "
-                           "(buildd@bos03-arm64-051) "
-                           "(aarch64-linux-gnu-gcc (Ubuntu 15.2.0-4ubuntu4) "
-                           "15.2.0, GNU ld (GNU Binutils for Ubuntu) 2.45) "
-                           "#20-Ubuntu SMP PREEMPT_DYNAMIC\n");
-        return proc_synthetic_fd_str(buf, len, sizeof(buf));
+        return proc_emit_literal(
+            "Linux version 6.17.0-20-generic "
+            "(buildd@bos03-arm64-051) "
+            "(aarch64-linux-gnu-gcc (Ubuntu 15.2.0-4ubuntu4) "
+            "15.2.0, GNU ld (GNU Binutils for Ubuntu) 2.45) "
+            "#20-Ubuntu SMP PREEMPT_DYNAMIC\n");
     }
 
     /* /proc/filesystems -> supported filesystem types */
     if (!strcmp(path, "/proc/filesystems")) {
-        const char *data =
+        return proc_emit_literal(
             "\tmpfs\n"
             "\tproc\n"
             "\tsysfs\n"
             "\tdevtmpfs\n"
             "\text4\n"
-            "\tvfat\n";
-        return proc_synthetic_fd(data, strlen(data));
+            "\tvfat\n");
     }
 
     /* /proc/self/mountinfo -> Linux mountinfo format (different from
@@ -1269,120 +1672,132 @@ int proc_intercept_open(const guest_t *g,
      * - type source super_options
      */
     if (!strcmp(path, "/proc/self/mountinfo")) {
-        char buf[1024];
-        int len =
-            snprintf(buf, sizeof(buf),
-                     "1 0 0:1 / / rw,relatime - ext4 /dev/root rw\n"
-                     "2 1 0:2 / /proc rw,nosuid,nodev,noexec - proc proc rw\n"
-                     "3 1 0:3 / /tmp rw,nosuid,nodev - tmpfs tmpfs rw\n"
-                     "4 1 0:4 / /dev rw,nosuid - devtmpfs devtmpfs rw\n"
-                     "5 4 0:5 / /dev/shm rw,nosuid,nodev - tmpfs tmpfs rw\n");
-        return proc_synthetic_fd_str(buf, len, sizeof(buf));
+        return proc_emit_literal(
+            "1 0 0:1 / / rw,relatime - ext4 /dev/root rw\n"
+            "2 1 0:2 / /proc rw,nosuid,nodev,noexec - proc proc rw\n"
+            "3 1 0:3 / /tmp rw,nosuid,nodev - tmpfs tmpfs rw\n"
+            "4 1 0:4 / /dev rw,nosuid - devtmpfs devtmpfs rw\n"
+            "5 4 0:5 / /dev/shm rw,nosuid,nodev - tmpfs tmpfs rw\n");
     }
 
     /* /proc/mounts, /etc/mtab -> synthetic mount table */
     if (!strcmp(path, "/proc/mounts") || !strcmp(path, "/proc/self/mounts") ||
         !strcmp(path, "/etc/mtab")) {
-        char buf[512];
-        int len = snprintf(buf, sizeof(buf),
-                           "/ / ext4 rw,relatime 0 0\n"
-                           "proc /proc proc rw,nosuid,nodev,noexec 0 0\n"
-                           "tmpfs /tmp tmpfs rw,nosuid,nodev 0 0\n"
-                           "devtmpfs /dev devtmpfs rw,nosuid 0 0\n"
-                           "tmpfs /dev/shm tmpfs rw,nosuid,nodev 0 0\n");
-        return proc_synthetic_fd_str(buf, len, sizeof(buf));
+        return proc_emit_literal(
+            "/ / ext4 rw,relatime 0 0\n"
+            "proc /proc proc rw,nosuid,nodev,noexec 0 0\n"
+            "tmpfs /tmp tmpfs rw,nosuid,nodev 0 0\n"
+            "devtmpfs /dev devtmpfs rw,nosuid 0 0\n"
+            "tmpfs /dev/shm tmpfs rw,nosuid,nodev 0 0\n");
     }
 
-    /* /proc/self/oom_score_adj -> writable stub.
-     * Containers and systemd write this; accept writes and return
-     * last-written value (default 0).
+    /* OOM nodes share one stored adjustment.
+     *   oom_score_adj: returns the raw adjustment in [-1000, 1000].
+     *   oom_adj:       legacy view, scaled into [-17, 15] for compatibility.
+     *   oom_score:     stub computed score, currently a fixed 0.
      */
-    if (proc_is_oom_path(path)) {
-        int val = atomic_load(&oom_score_adj_value);
+    if (oom_kind != OOM_PATH_NONE) {
         char buf[32];
-        int len = snprintf(buf, sizeof(buf), "%d\n", val);
-        return proc_synthetic_fd_str(buf, len, sizeof(buf));
+        int len = proc_oom_format_value(oom_kind, buf, sizeof(buf));
+        return proc_synthetic_fd(buf, (size_t) len);
     }
 
-    /* /proc/self/fdinfo/<N> -> per-fd flags/pos/mnt_id */
-    if (!strncmp(path, "/proc/self/fdinfo/", 18)) {
-        char *endptr;
-        long n = strtol(path + 18, &endptr, 10);
-        if (endptr == path + 18 || *endptr != '\0' || n < 0 ||
-            n >= FD_TABLE_SIZE) {
-            errno = ENOENT;
-            return -1;
-        }
-        fd_entry_t snap;
-        if (!fd_snapshot((int) n, &snap)) {
-            errno = ENOENT;
-            return -1;
-        }
-        off_t pos = 0;
-        int host_fd = fd_to_host((int) n);
-        if (host_fd >= 0)
-            pos = lseek(host_fd, 0, SEEK_CUR);
-        if (pos < 0)
-            pos = 0;
-        int flags = snap.linux_flags;
-        char buf[256];
-        int len = snprintf(buf, sizeof(buf),
-                           "pos:\t%lld\n"
-                           "flags:\t0%o\n"
-                           "mnt_id:\t0\n",
-                           (long long) pos, flags);
-        return proc_synthetic_fd_str(buf, len, sizeof(buf));
-    }
-
-    /* /proc/self/fdinfo -> directory listing via persistent temp dir (macOS
-     * getdents needs real directory entries).
+    /* /proc/self/fdinfo/<N> -> per-fd flags/pos/mnt_id plus type-specific
+     * fields for fds where Linux exposes additional state (eventfd counter,
+     * signalfd mask, timerfd settings).
      */
-    if (!strcmp(path, "/proc/self/fdinfo") ||
-        !strcmp(path, "/proc/self/fdinfo/")) {
-        static char fdinfodir[128];
-        static pthread_mutex_t fdinfodir_lock = PTHREAD_MUTEX_INITIALIZER;
-
-        pthread_mutex_lock(&fdinfodir_lock);
-        if (proc_lazy_mkdtemp(fdinfodir, sizeof(fdinfodir),
-                              "/tmp/elfuse-fdinfo-XXXXXX") < 0) {
-            pthread_mutex_unlock(&fdinfodir_lock);
+    if (!strncmp(path, "/proc/self/fdinfo/", 18)) {
+        int n = proc_parse_fd_index(path, 18, ENOENT);
+        if (n < 0)
+            return -1;
+        fd_entry_t snap;
+        if (!fd_snapshot(n, &snap)) {
+            errno = ENOENT;
             return -1;
         }
 
-        for (int i = 0; i < FD_TABLE_SIZE; i++) {
-            char entry[192];
-            snprintf(entry, sizeof(entry), "%s/%d", fdinfodir, i);
-            fd_entry_t snap;
-            if (fd_snapshot(i, &snap)) {
-                int tfd = open(entry, O_CREAT | O_WRONLY, 0444);
-                if (tfd >= 0)
-                    close(tfd);
-            } else {
-                unlink(entry);
+        /* fd_to_host_dup atomically duplicates under fd_lock so a concurrent
+         * close+reopen on another vCPU cannot redirect the lseek to an
+         * unrelated host fd that took the freed slot. The probe pollutes
+         * errno with ESPIPE on non-seekable fds (sockets, pipes), so save
+         * and restore around the call to keep the caller's view clean.
+         */
+        off_t pos = 0;
+        int dup_fd = fd_to_host_dup(n);
+        if (dup_fd >= 0) {
+            int saved_errno = errno;
+            off_t probe = lseek(dup_fd, 0, SEEK_CUR);
+            if (probe >= 0)
+                pos = probe;
+            errno = saved_errno;
+            close(dup_fd);
+        }
+
+        char extra[160];
+        extra[0] = '\0';
+        if (snap.type == FD_EVENTFD) {
+            uint64_t count;
+            /* fs/eventfd.c uses a single space after the colon, matching
+             * the timerfd convention (and unlike pos:/flags:/mnt_id: in
+             * fs/proc/fd.c which use tabs). */
+            if (eventfd_fdinfo_snapshot(n, &count))
+                snprintf(extra, sizeof(extra), "eventfd-count: %16llx\n",
+                         (unsigned long long) count);
+        } else if (snap.type == FD_SIGNALFD) {
+            uint64_t mask;
+            /* fs/signalfd.c uses a tab after the colon (matching the
+             * pos:/flags:/mnt_id: convention in fs/proc/fd.c, not the
+             * single-space style of eventfd/timerfd). Verified against a
+             * real Linux 6.x /proc/self/fdinfo dump. */
+            if (signalfd_fdinfo_snapshot(n, &mask))
+                snprintf(extra, sizeof(extra), "sigmask:\t%016llx\n",
+                         (unsigned long long) mask);
+        } else if (snap.type == FD_TIMERFD) {
+            int clockid;
+            uint64_t ticks;
+            int64_t value_ns, interval_ns;
+            if (timerfd_fdinfo_snapshot(n, &clockid, &ticks, &value_ns,
+                                        &interval_ns)) {
+                /* Linux fs/timerfd.c emits these fields with single
+                 * spaces after the colon, not tabs (unlike pos:/flags:/
+                 * mnt_id: in fs/proc/fd.c, which do use tabs). Match the
+                 * upstream format so guest readers parsing fdinfo via a
+                 * "it_value: (" prefix find the field. */
+                snprintf(extra, sizeof(extra),
+                         "clockid: %d\n"
+                         "ticks: %llu\n"
+                         "settime flags: 0\n"
+                         "it_value: (%lld, %lld)\n"
+                         "it_interval: (%lld, %lld)\n",
+                         clockid, (unsigned long long) ticks,
+                         (long long) (value_ns / 1000000000LL),
+                         (long long) (value_ns % 1000000000LL),
+                         (long long) (interval_ns / 1000000000LL),
+                         (long long) (interval_ns % 1000000000LL));
             }
         }
 
-        int fd = proc_open_dir_fd(fdinfodir, linux_flags);
-        pthread_mutex_unlock(&fdinfodir_lock);
-        return fd >= 0 ? fd : -1;
+        return proc_emit_fmt(
+            "pos:\t%lld\n"
+            "flags:\t0%o\n"
+            "mnt_id:\t0\n"
+            "%s",
+            (long long) pos, snap.linux_flags, extra);
+    }
+
+    /* /proc/self/fdinfo -> directory listing. Each open gets its own scratch
+     * dir so concurrent getdents on independent dirfds cannot interfere
+     * (the previous shared-dir design unlinked entries under a sibling
+     * enumerator). The dirs are tracked for atexit cleanup.
+     */
+    if (!strcmp(path, "/proc/self/fdinfo") ||
+        !strcmp(path, "/proc/self/fdinfo/")) {
+        return proc_open_fd_scratch("elfuse-fdinfo", linux_flags);
     }
 
     /* /proc/self/fd/N -> open the target of the fd (readlink-style) */
-    if (!strncmp(path, "/proc/self/fd/", 14)) {
-        char *endptr;
-        long n = strtol(path + 14, &endptr, 10);
-        if (endptr == path + 14 || *endptr != '\0' || n < 0 ||
-            n >= FD_TABLE_SIZE) {
-            errno = EBADF;
-            return -1;
-        }
-        int host_fd = fd_to_host((int) n);
-        if (host_fd < 0) {
-            errno = EBADF;
-            return -1;
-        }
-        return dup(host_fd);
-    }
+    if (!strncmp(path, "/proc/self/fd/", 14))
+        return dev_fd_dup(path, 14);
 
     /* /proc/meminfo -> synthetic memory info from host vm_statistics */
     if (!strcmp(path, "/proc/meminfo")) {
@@ -1420,9 +1835,7 @@ int proc_intercept_open(const guest_t *g,
             buffers_kb = total_kb / 20;
             cached_kb = total_kb / 4;
         }
-        char buf[2048];
-        int len = snprintf(
-            buf, sizeof(buf),
+        return proc_emit_fmt(
             "MemTotal:       %llu kB\n"
             "MemFree:        %llu kB\n"
             "MemAvailable:   %llu kB\n"
@@ -1456,7 +1869,6 @@ int proc_intercept_open(const guest_t *g,
             (unsigned long long) (total_kb - free_kb - cached_kb - buffers_kb),
             (unsigned long long) (cached_kb / 2),
             (unsigned long long) (total_kb / 2));
-        return proc_synthetic_fd_str(buf, len, sizeof(buf));
     }
 
     /* /proc/self/io -> synthetic I/O counters.
@@ -1465,15 +1877,14 @@ int proc_intercept_open(const guest_t *g,
      * it does not track per-guest I/O.
      */
     if (!strcmp(path, "/proc/self/io")) {
-        static const char data[] =
+        return proc_emit_literal(
             "rchar: 0\n"
             "wchar: 0\n"
             "syscr: 0\n"
             "syscw: 0\n"
             "read_bytes: 0\n"
             "write_bytes: 0\n"
-            "cancelled_write_bytes: 0\n";
-        return proc_synthetic_fd(data, sizeof(data) - 1);
+            "cancelled_write_bytes: 0\n");
     }
 
     /* /proc/self/stat -> single-line process stat (man 5 proc).
@@ -1505,33 +1916,24 @@ int proc_intercept_open(const guest_t *g,
                 rss_pages += sz / (uint64_t) page_size;
         }
 
-        const char *exe = proc_get_elf_path();
-        const char *comm = "elfuse";
-        if (exe) {
-            const char *slash = strrchr(exe, '/');
-            comm = slash ? slash + 1 : exe;
-        }
-
-        char buf[1024];
         /* Fields: pid(1) (comm)(2) state(3) ppid(4) pgrp(5) session(6)
          *   tty_nr(7) tpgid(8) flags(9) minflt(10) cminflt(11) majflt(12)
          *   cmajflt(13) utime(14) stime(15) cutime(16) cstime(17)
          *   priority(18) nice(19) num_threads(20) itrealvalue(21)
          *   starttime(22) vsize(23) rss(24) rsslim(25) ... (52 fields total)
          */
-        int len = snprintf(
-            buf, sizeof(buf),
+        return proc_emit_fmt(
             "%lld (%.15s) R %lld %lld %lld 0 -1 0 "        /* 1-9 */
             "0 0 0 0 %ld %ld 0 0 "                         /* 10-17 */
             "20 0 %d 0 0 %llu %llu "                       /* 18-24 */
             "18446744073709551615 0 0 0 0 0 0 "            /* 25-31 */
             "0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n", /* 32-52 */
-            (long long) proc_get_pid(), comm, (long long) proc_get_ppid(),
+            (long long) proc_get_pid(), proc_comm_name(),
+            (long long) proc_get_ppid(),
             (long long) proc_get_pid(), /* pgrp = pid */
             (long long) proc_get_pid(), /* session = pid */
             utime_ticks, stime_ticks, thread_active_count(),
             (unsigned long long) vsize, (unsigned long long) rss_pages);
-        return proc_synthetic_fd_str(buf, len, sizeof(buf));
     }
 
     /* /proc/stat -> synthetic CPU statistics */
@@ -1569,21 +1971,17 @@ int proc_intercept_open(const guest_t *g,
 
     /* /etc/passwd -> synthetic passwd with root + current user */
     if (!strcmp(path, "/etc/passwd")) {
-        char buf[512];
-        int len = snprintf(buf, sizeof(buf),
-                           "root:x:0:0:root:/root:/bin/sh\n"
-                           "user:x:1000:1000:user:/home/user:/bin/sh\n");
-        return proc_synthetic_fd_str(buf, len, sizeof(buf));
+        return proc_emit_literal(
+            "root:x:0:0:root:/root:/bin/sh\n"
+            "user:x:1000:1000:user:/home/user:/bin/sh\n");
     }
 
     /* /etc/group -> synthetic group file */
     if (!strcmp(path, "/etc/group")) {
-        char buf[512];
-        int len = snprintf(buf, sizeof(buf),
-                           "root:x:0:\n"
-                           "staff:x:20:\n"
-                           "user:x:1000:\n");
-        return proc_synthetic_fd_str(buf, len, sizeof(buf));
+        return proc_emit_literal(
+            "root:x:0:\n"
+            "staff:x:20:\n"
+            "user:x:1000:\n");
     }
 
     return PROC_NOT_INTERCEPTED;
@@ -1602,35 +2000,20 @@ int proc_intercept_stat(const char *path, struct stat *st)
      */
     /* /dev/shm is a directory */
     if (!strcmp(path, "/dev/shm") || !strcmp(path, "/dev/shm/")) {
-        memset(st, 0, sizeof(*st));
-        st->st_mode = S_IFDIR | 01777; /* sticky bit, like real /dev/shm */
-        st->st_nlink = 2;
+        stat_fill_proc_dir(st, 01777, 2); /* sticky bit, like real /dev/shm */
         return 0;
     }
     /* /dev/shm/<name> files: check the host temp dir */
     if (!strncmp(path, "/dev/shm/", 9)) {
-        const char *shm = shm_dir_path();
-        if (!shm)
-            return -1;
-        const char *suffix = path + 9;
-        if (strstr(suffix, "..") || strchr(suffix, '/') || suffix[0] == '\0') {
-            errno = EACCES;
-            return -1;
-        }
         char host_path[512];
-        int n = snprintf(host_path, sizeof(host_path), "%s/%s", shm, suffix);
-        if (n < 0 || (size_t) n >= sizeof(host_path)) {
-            errno = ENAMETOOLONG;
+        if (dev_shm_resolve_path(path + 9, host_path, sizeof(host_path)) < 0)
             return -1;
-        }
         return stat(host_path, st);
     }
 
     /* /proc and /proc/<our_pid> are directories */
     if (!strcmp(path, "/proc") || !strcmp(path, "/proc/")) {
-        memset(st, 0, sizeof(*st));
-        st->st_mode = S_IFDIR | 0555;
-        st->st_nlink = 3;
+        stat_fill_proc_dir(st, 0555, 3);
         return 0;
     }
     {
@@ -1641,29 +2024,28 @@ int proc_intercept_stat(const char *path, struct stat *st)
                  (long long) proc_get_pid());
         if (!strcmp(path, pidbuf) || !strcmp(path, pidslash) ||
             !strcmp(path, "/proc/self") || !strcmp(path, "/proc/self/")) {
-            memset(st, 0, sizeof(*st));
-            st->st_mode = S_IFDIR | 0555;
-            st->st_nlink = 3;
+            stat_fill_proc_dir(st, 0555, 3);
             return 0;
         }
     }
+    if (!strcmp(path, "/proc/net") || !strcmp(path, "/proc/net/")) {
+        stat_fill_proc_dir(st, 0555, 2);
+        return 0;
+    }
 
-    /* /proc/<our_pid>/<file> -> treat as /proc/self/<file> */
-    if (!strncmp(path, "/proc/", 6)) {
-        char *endp;
-        long pid = strtol(path + 6, &endp, 10);
-        if (endp != path + 6 && pid == (long) proc_get_pid() && *endp == '/') {
-            char alias[LINUX_PATH_MAX];
-            snprintf(alias, sizeof(alias), "/proc/self%s", endp);
+    /* /proc/<our_pid>[/...] -> /proc/self[...]. */
+    {
+        char alias[LINUX_PATH_MAX];
+        int aliased = proc_alias_self(path, alias, sizeof(alias));
+        if (aliased < 0)
+            return -1;
+        if (aliased > 0)
             return proc_intercept_stat(alias, st);
-        }
     }
 
     /* /proc/self/task and /proc/self/task/<tid> are directories */
     if (!strcmp(path, "/proc/self/task") || !strcmp(path, "/proc/self/task/")) {
-        memset(st, 0, sizeof(*st));
-        st->st_mode = S_IFDIR | 0555;
-        st->st_nlink = 2 + thread_active_count();
+        stat_fill_proc_dir(st, 0555, 2 + (nlink_t) thread_active_count());
         return 0;
     }
     if (!strncmp(path, "/proc/self/task/", 16)) {
@@ -1675,68 +2057,41 @@ int proc_intercept_stat(const char *path, struct stat *st)
                 return -1;
             }
             if (*endp == '\0' || !strcmp(endp, "/")) {
-                /* /proc/self/task/<tid> directory */
-                memset(st, 0, sizeof(*st));
-                st->st_mode = S_IFDIR | 0555;
-                st->st_nlink = 2;
+                stat_fill_proc_dir(st, 0555, 2);
                 return 0;
             }
             if (!strcmp(endp, "/stat") || !strcmp(endp, "/status")) {
-                memset(st, 0, sizeof(*st));
-                st->st_mode = S_IFREG | 0444;
-                st->st_nlink = 1;
-                st->st_size = 256;
-                st->st_blksize = 4096;
-                st->st_blocks = 1;
+                stat_fill_proc_file(st, 0444);
                 return 0;
             }
         }
     }
 
-    if (proc_is_oom_path(path)) {
-        memset(st, 0, sizeof(*st));
-        st->st_mode = S_IFREG | 0644;
-        st->st_nlink = 1;
-        st->st_size = 2;
-        st->st_blksize = 4096;
-        st->st_blocks = 1;
-        return 0;
+    {
+        int kind = proc_oom_path_kind(path);
+        if (kind != OOM_PATH_NONE) {
+            stat_fill_proc_file(st, (kind == OOM_PATH_SCORE) ? 0444 : 0644);
+            return 0;
+        }
     }
 
     if (!strcmp(path, "/proc/self/fdinfo") ||
-        !strcmp(path, "/proc/self/fdinfo/")) {
-        memset(st, 0, sizeof(*st));
-        st->st_mode = S_IFDIR | 0555;
-        st->st_nlink = 2;
-        return 0;
-    }
-
-    if (!strcmp(path, "/proc/self/fd") || !strcmp(path, "/proc/self/fd/")) {
-        memset(st, 0, sizeof(*st));
-        st->st_mode = S_IFDIR | 0555;
-        st->st_nlink = 2;
+        !strcmp(path, "/proc/self/fdinfo/") || !strcmp(path, "/proc/self/fd") ||
+        !strcmp(path, "/proc/self/fd/")) {
+        stat_fill_proc_dir(st, 0555, 2);
         return 0;
     }
 
     if (!strncmp(path, "/proc/self/fdinfo/", 18)) {
-        char *endp;
-        long fd = strtol(path + 18, &endp, 10);
-        if (endp == path + 18 || *endp != '\0' || fd < 0 ||
-            fd >= FD_TABLE_SIZE) {
-            errno = ENOENT;
+        int fd = proc_parse_fd_index(path, 18, ENOENT);
+        if (fd < 0)
             return -1;
-        }
         fd_entry_t snap;
-        if (!fd_snapshot((int) fd, &snap)) {
+        if (!fd_snapshot(fd, &snap)) {
             errno = ENOENT;
             return -1;
         }
-        memset(st, 0, sizeof(*st));
-        st->st_mode = S_IFREG | 0444;
-        st->st_nlink = 1;
-        st->st_size = 32;
-        st->st_blksize = 4096;
-        st->st_blocks = 1;
+        stat_fill_proc_file(st, 0444);
         return 0;
     }
 
@@ -1772,26 +2127,17 @@ int proc_intercept_stat(const char *path, struct stat *st)
 
     for (const char **p = known_proc_files; *p; p++) {
         if (!strcmp(path, *p)) {
-            memset(st, 0, sizeof(*st));
-            st->st_mode = S_IFREG | 0444; /* Regular file, read-only */
-            st->st_nlink = 1;
-            st->st_size = 256; /* Approximate; exact value not critical */
-            st->st_blksize = 4096;
-            st->st_blocks = 1;
+            stat_fill_proc_file(st, 0444);
             return 0;
         }
     }
 
     /* /proc/self/fd/N: stat the underlying host fd */
     if (!strncmp(path, "/proc/self/fd/", 14)) {
-        char *endptr;
-        long n = strtol(path + 14, &endptr, 10);
-        if (endptr == path + 14 || *endptr != '\0' || n < 0 ||
-            n >= FD_TABLE_SIZE) {
-            errno = EBADF;
+        int n = proc_parse_fd_index(path, 14, EBADF);
+        if (n < 0)
             return -1;
-        }
-        int host_fd = fd_to_host((int) n);
+        int host_fd = fd_to_host(n);
         if (host_fd < 0) {
             errno = EBADF;
             return -1;
@@ -1806,6 +2152,15 @@ int proc_intercept_stat(const char *path, struct stat *st)
 
 int proc_intercept_readlink(const char *path, char *buf, size_t bufsiz)
 {
+    {
+        char alias[LINUX_PATH_MAX];
+        int aliased = proc_alias_self(path, alias, sizeof(alias));
+        if (aliased < 0)
+            return -1;
+        if (aliased > 0)
+            return proc_intercept_readlink(alias, buf, bufsiz);
+    }
+
     /* /proc/self/exe -> path of current ELF binary */
     if (!strcmp(path, "/proc/self/exe")) {
         const char *exe = proc_get_elf_path();
@@ -1863,6 +2218,72 @@ int proc_intercept_readlink(const char *path, char *buf, size_t bufsiz)
     return PROC_NOT_INTERCEPTED;
 }
 
+int proc_intercept_read(int guest_fd,
+                        void *buf,
+                        size_t count,
+                        int64_t offset,
+                        ssize_t *read_out)
+{
+    fd_entry_t snap;
+    if (!fd_snapshot(guest_fd, &snap))
+        return 0;
+
+    int kind = proc_oom_path_kind(snap.proc_path);
+    if (kind == OOM_PATH_NONE)
+        return 0;
+
+    /* Recompute from the shared atomic on every read so lseek(0)+read on an
+     * already-open fd sees updates written through oom_score_adj or oom_adj.
+     */
+    char text[32];
+    int len = proc_oom_format_value(kind, text, sizeof(text));
+    return proc_oom_copy_slice(buf, count, offset, text, (size_t) len,
+                               read_out);
+}
+
+int proc_intercept_readv(int guest_fd,
+                         const struct iovec *iov,
+                         int iovcnt,
+                         int64_t offset,
+                         ssize_t *read_out)
+{
+    fd_entry_t snap;
+    if (!fd_snapshot(guest_fd, &snap))
+        return 0;
+
+    int kind = proc_oom_path_kind(snap.proc_path);
+    if (kind == OOM_PATH_NONE)
+        return 0;
+    if (offset < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    char text[32];
+    int len = proc_oom_format_value(kind, text, sizeof(text));
+    size_t src_len = (size_t) len;
+    if ((uint64_t) offset >= src_len) {
+        *read_out = 0;
+        return 1;
+    }
+
+    size_t src_off = (size_t) offset;
+    ssize_t total = 0;
+    for (int i = 0; i < iovcnt && src_off < src_len; i++) {
+        size_t n = iov[i].iov_len;
+        if (n > src_len - src_off)
+            n = src_len - src_off;
+        if (n == 0)
+            continue;
+        memcpy(iov[i].iov_base, text + src_off, n);
+        src_off += n;
+        total += (ssize_t) n;
+    }
+
+    *read_out = total;
+    return 1;
+}
+
 int proc_intercept_write(int guest_fd,
                          int host_fd,
                          const void *buf,
@@ -1874,33 +2295,72 @@ int proc_intercept_write(int guest_fd,
     fd_entry_t snap;
     if (!fd_snapshot(guest_fd, &snap))
         return 0;
-    if (!proc_is_oom_writable(snap.proc_path))
+    int kind = proc_oom_path_kind(snap.proc_path);
+    if (kind == OOM_PATH_SCORE) {
+        /* Linux: oom_score has no write handler. proc_reg_write returns
+         * -EIO when the underlying proc_dir_entry exposes no write op,
+         * not -EINVAL. Match that so guests probing the error code see
+         * the same value as on a real kernel. */
+        errno = EIO;
+        return -1;
+    }
+    if (kind != OOM_PATH_SCORE_ADJ && kind != OOM_PATH_ADJ)
         return 0;
+
+    /* Linux: zero-byte writes to proc nodes succeed without side effects.
+     * Without this short-circuit, sys_writev would funnel a zero-length
+     * vector through proc_parse_int_write and get -EINVAL.
+     */
+    if (count == 0) {
+        *written_out = 0;
+        return 1;
+    }
 
     int val;
     if (proc_parse_int_write(buf, count, &val) < 0)
         return -1;
-    if (val < -1000 || val > 1000) {
-        errno = EINVAL;
-        return -1;
+
+    int score_adj;
+    if (kind == OOM_PATH_ADJ) {
+        if (val < LINUX_OOM_DISABLE || val > LINUX_OOM_ADJUST_MAX) {
+            errno = EINVAL;
+            return -1;
+        }
+        score_adj = oom_adj_to_score_adj(val);
+    } else {
+        if (val < LINUX_OOM_SCORE_ADJ_MIN || val > LINUX_OOM_SCORE_ADJ_MAX) {
+            errno = EINVAL;
+            return -1;
+        }
+        score_adj = val;
     }
 
-    atomic_store(&oom_score_adj_value, val);
-
+    /* Both interfaces persist the value the writer supplied: oom_adj keeps the
+     * legacy [-17,15] number, oom_score_adj keeps the [-1000,1000] number.
+     * proc_oom_refresh_live_fds_locked re-renders each open fd's backing file
+     * through proc_oom_format_value, so the kind-specific view stays correct
+     * across reads.
+     */
     char text[32];
     int len = snprintf(text, sizeof(text), "%d\n", val);
-    if (len < 0) {
-        errno = EINVAL;
-        return -1;
-    }
 
+    /* Serialize the backing-fd rewrite so concurrent writers cannot race the
+     * truncate+pwrite sequence. Publish to the global atomic last so a
+     * partial-rewrite failure leaves the process-wide value unchanged.
+     */
+    pthread_mutex_lock(&oom_write_lock);
+    int rc = -1;
     if (ftruncate(host_fd, 0) < 0)
-        return -1;
+        goto unlock;
     if (pwrite(host_fd, text, (size_t) len, 0) != len)
-        return -1;
+        goto unlock;
     if (!use_pwrite && lseek(host_fd, offset + (int64_t) count, SEEK_SET) < 0)
-        return -1;
-
+        goto unlock;
+    atomic_store(&oom_score_adj_value, score_adj);
+    proc_oom_refresh_live_fds_locked();
     *written_out = (ssize_t) count;
-    return 1;
+    rc = 1;
+unlock:
+    pthread_mutex_unlock(&oom_write_lock);
+    return rc;
 }

@@ -12,6 +12,7 @@
 
 #include <stddef.h>
 #include <sys/stat.h>
+#include <sys/uio.h>
 #include "core/guest.h"
 
 /* Sentinel return value: path was not intercepted, caller should fall through
@@ -52,6 +53,24 @@ int proc_intercept_write(int guest_fd,
                          int64_t offset,
                          int use_pwrite,
                          ssize_t *written_out);
+
+/* Intercept reads from synthetic proc files that must reflect shared state on
+ * every read rather than the per-open temp-file snapshot.
+ * Returns 1 if handled (with *read_out set), 0 if not intercepted, or -1 on
+ * error with errno set.
+ */
+int proc_intercept_read(int guest_fd,
+                        void *buf,
+                        size_t count,
+                        int64_t offset,
+                        ssize_t *read_out);
+
+/* Vector form of proc_intercept_read for readv/preadv. */
+int proc_intercept_readv(int guest_fd,
+                         const struct iovec *iov,
+                         int iovcnt,
+                         int64_t offset,
+                         ssize_t *read_out);
 
 /* Get the /dev/shm emulation directory path (creating it on first call).
  * Used by sys_unlinkat to rewrite /dev/shm/<name> paths.

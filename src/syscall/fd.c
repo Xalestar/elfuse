@@ -116,6 +116,53 @@ static int timerfd_alloc(void)
     return sfd_alloc_slot(timerfd_state, TIMERFD_MAX, sizeof(timerfd_state[0]));
 }
 
+/* Called with sfd_lock held. Drain any kevent expirations sitting on the
+ * timer's kqueue and fold them into the slot's accumulator. Used by
+ * timerfd_read before consuming the counter and by timerfd_fdinfo_snapshot
+ * before reporting it; without this drain, fdinfo would lag the actual
+ * fire count by however many ticks were pending in the kqueue.
+ */
+static void timerfd_drain_pending_locked(int slot)
+{
+    int kq = timerfd_state[slot].kq_fd;
+    struct kevent kev;
+    struct timespec ts_zero = {0, 0};
+    int nev = kevent(kq, NULL, 0, &kev, 1, &ts_zero);
+    if (nev > 0) {
+        uint64_t fires = (uint64_t) kev.data;
+        if (fires == 0)
+            fires = 1; /* At least one expiration */
+        timerfd_state[slot].expirations += fires;
+    }
+}
+
+/* Called with sfd_lock held. Returns nanoseconds until the next expiration,
+ * or 0 when the timer is disarmed or a one-shot timer has already expired.
+ */
+static int64_t timerfd_remaining_ns_locked(int slot, int64_t now_ns)
+{
+    if (!timerfd_state[slot].armed)
+        return 0;
+
+    int64_t elapsed = now_ns - timerfd_state[slot].arm_time_ns;
+    if (elapsed < 0)
+        elapsed = 0;
+
+    if (timerfd_state[slot].interval_ns > 0) {
+        int64_t total = timerfd_state[slot].initial_ns;
+        if (elapsed >= total) {
+            int64_t since_first = elapsed - total;
+            int64_t interval = timerfd_state[slot].interval_ns;
+            int64_t remaining = interval - (since_first % interval);
+            return remaining == 0 ? interval : remaining;
+        }
+        return total - elapsed;
+    }
+
+    int64_t remaining = timerfd_state[slot].initial_ns - elapsed;
+    return remaining > 0 ? remaining : 0;
+}
+
 int64_t sys_timerfd_create(int clockid, int flags)
 {
     if (clockid != LINUX_CLOCK_REALTIME && clockid != LINUX_CLOCK_MONOTONIC)
@@ -203,8 +250,7 @@ int64_t sys_timerfd_settime(guest_t *g,
             struct timespec now;
             clock_gettime(CLOCK_MONOTONIC, &now);
             int64_t now_ns = now.tv_sec * NS_PER_SEC + now.tv_nsec;
-            int64_t elapsed = now_ns - timerfd_state[slot].arm_time_ns;
-            int64_t remaining = timerfd_state[slot].initial_ns - elapsed;
+            int64_t remaining = timerfd_remaining_ns_locked(slot, now_ns);
             if (remaining > 0) {
                 old.it_value_sec = remaining / NS_PER_SEC;
                 old.it_value_nsec = remaining % NS_PER_SEC;
@@ -319,27 +365,10 @@ int64_t sys_timerfd_gettime(guest_t *g, int fd, uint64_t curr_value_gva)
         its.it_interval_sec = timerfd_state[slot].interval_ns / NS_PER_SEC;
         its.it_interval_nsec = timerfd_state[slot].interval_ns % NS_PER_SEC;
 
-        /* Compute actual remaining time from arm time + initial value */
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
         int64_t now_ns = now.tv_sec * NS_PER_SEC + now.tv_nsec;
-        int64_t elapsed = now_ns - timerfd_state[slot].arm_time_ns;
-        int64_t remaining;
-
-        if (timerfd_state[slot].interval_ns > 0) {
-            /* Repeating timer: remaining = interval - (elapsed % interval) */
-            int64_t total = timerfd_state[slot].initial_ns;
-            if (elapsed >= total) {
-                int64_t since_first = elapsed - total;
-                remaining = timerfd_state[slot].interval_ns -
-                            (since_first % timerfd_state[slot].interval_ns);
-            } else {
-                remaining = total - elapsed;
-            }
-        } else {
-            /* One-shot: remaining = initial - elapsed */
-            remaining = timerfd_state[slot].initial_ns - elapsed;
-        }
+        int64_t remaining = timerfd_remaining_ns_locked(slot, now_ns);
 
         if (remaining <= 0) {
             /* Timer already expired (one-shot) */
@@ -374,18 +403,8 @@ int64_t timerfd_read(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t count)
 
     int kq = timerfd_state[slot].kq_fd;
 
-    /* Collect pending timer events via kevent(). The data field contains
-     * the number of times the timer fired since the last kevent() call.
-     */
-    struct kevent kev;
-    struct timespec ts_zero = {0, 0};
-    int nev = kevent(kq, NULL, 0, &kev, 1, &ts_zero);
-    if (nev > 0) {
-        uint64_t fires = (uint64_t) kev.data;
-        if (fires == 0)
-            fires = 1; /* At least one expiration */
-        timerfd_state[slot].expirations += fires;
-    }
+    /* Collect pending timer events into the slot's accumulator. */
+    timerfd_drain_pending_locked(slot);
 
     if (timerfd_state[slot].expirations == 0) {
         /* No events yet; check if non-blocking */
@@ -408,8 +427,9 @@ int64_t timerfd_read(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t count)
          * kevent() returns EBADF in that case, and the code re-validates the
          * slot.
          */
+        struct kevent kev;
         pthread_mutex_unlock(&sfd_lock);
-        nev = kevent(kq, NULL, 0, &kev, 1, NULL);
+        int nev = kevent(kq, NULL, 0, &kev, 1, NULL);
         pthread_mutex_lock(&sfd_lock);
         /* Re-validate: slot may have been freed by timerfd_close() */
         if (timerfd_state[slot].guest_fd != guest_fd) {
@@ -1072,4 +1092,68 @@ void signalfd_notify(int signum)
         }
     }
     pthread_mutex_unlock(&sfd_lock);
+}
+
+/* /proc/self/fdinfo type-specific snapshots. Each takes sfd_lock to prevent
+ * tearing across concurrent read/write/settime; lock order is fd_lock(3)
+ * -> sfd_lock(5a), and these accessors take only sfd_lock so the procemu
+ * caller is free to drop fd_lock between fd_snapshot and the lookup here.
+ */
+
+bool eventfd_fdinfo_snapshot(int guest_fd, uint64_t *count_out)
+{
+    pthread_mutex_lock(&sfd_lock);
+    int slot = eventfd_find(guest_fd);
+    if (slot < 0) {
+        pthread_mutex_unlock(&sfd_lock);
+        return false;
+    }
+    *count_out = eventfd_state[slot].counter;
+    pthread_mutex_unlock(&sfd_lock);
+    return true;
+}
+
+bool signalfd_fdinfo_snapshot(int guest_fd, uint64_t *mask_out)
+{
+    pthread_mutex_lock(&sfd_lock);
+    int slot = signalfd_find(guest_fd);
+    if (slot < 0) {
+        pthread_mutex_unlock(&sfd_lock);
+        return false;
+    }
+    *mask_out = signalfd_state[slot].mask;
+    pthread_mutex_unlock(&sfd_lock);
+    return true;
+}
+
+bool timerfd_fdinfo_snapshot(int guest_fd,
+                             int *clockid_out,
+                             uint64_t *ticks_out,
+                             int64_t *value_ns_out,
+                             int64_t *interval_ns_out)
+{
+    pthread_mutex_lock(&sfd_lock);
+    int slot = timerfd_find(guest_fd);
+    if (slot < 0) {
+        pthread_mutex_unlock(&sfd_lock);
+        return false;
+    }
+    /* Fold any pending kqueue fires into expirations before exporting,
+     * matching what timerfd_read does. Without this, fdinfo lags by
+     * however many ticks were sitting on the kqueue.
+     */
+    timerfd_drain_pending_locked(slot);
+    *clockid_out = timerfd_state[slot].clockid;
+    *ticks_out = timerfd_state[slot].expirations;
+    *interval_ns_out = timerfd_state[slot].interval_ns;
+    int64_t value_ns = 0;
+    if (timerfd_state[slot].armed) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        int64_t now_ns = (int64_t) now.tv_sec * NS_PER_SEC + now.tv_nsec;
+        value_ns = timerfd_remaining_ns_locked(slot, now_ns);
+    }
+    *value_ns_out = value_ns;
+    pthread_mutex_unlock(&sfd_lock);
+    return true;
 }

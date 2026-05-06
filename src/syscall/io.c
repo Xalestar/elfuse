@@ -479,6 +479,66 @@ static int64_t host_fd_ref_open_regular_io(int guest_fd, host_fd_ref_t *ref)
     return host_fd_ref_open_io(guest_fd, ref);
 }
 
+static int64_t proc_try_read_intercept(int fd,
+                                       int host_fd,
+                                       void *buf,
+                                       size_t count,
+                                       int64_t offset,
+                                       int use_pread)
+{
+    ssize_t intercepted = 0;
+    int handled = proc_intercept_read(fd, buf, count, offset, &intercepted);
+    if (handled < 0)
+        return linux_errno();
+    if (handled > 0) {
+        if (!use_pread &&
+            lseek(host_fd, offset + (int64_t) intercepted, SEEK_SET) < 0)
+            return linux_errno();
+        return intercepted;
+    }
+    return INT64_MIN;
+}
+
+static int64_t proc_try_readv_intercept(int fd,
+                                        int host_fd,
+                                        const struct iovec *iov,
+                                        int iovcnt,
+                                        int64_t offset,
+                                        int use_pread)
+{
+    ssize_t intercepted = 0;
+    int handled = proc_intercept_readv(fd, iov, iovcnt, offset, &intercepted);
+    if (handled < 0)
+        return linux_errno();
+    if (handled > 0) {
+        if (!use_pread &&
+            lseek(host_fd, offset + (int64_t) intercepted, SEEK_SET) < 0)
+            return linux_errno();
+        return intercepted;
+    }
+    return INT64_MIN;
+}
+
+/* Sendfile/copy_file_range chunk read: route the chunk through proc_intercept
+ * when the source fd is a synthetic /proc node, otherwise fall through
+ * (INT64_MIN). For the streaming (use_pread=0) variant the input offset is
+ * irrelevant; the helper queries the live host fd cursor.
+ */
+static int64_t proc_try_chunk_read_intercept(int fd,
+                                             int host_fd,
+                                             void *buf,
+                                             size_t count,
+                                             int64_t offset,
+                                             int use_pread)
+{
+    if (!use_pread) {
+        offset = lseek(host_fd, 0, SEEK_CUR);
+        if (offset < 0)
+            return INT64_MIN;
+    }
+    return proc_try_read_intercept(fd, host_fd, buf, count, offset, use_pread);
+}
+
 static int64_t proc_try_writev_intercept(int fd,
                                          int host_fd,
                                          const struct iovec *iov,
@@ -613,6 +673,16 @@ int64_t sys_read(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
     if (count > avail)
         count = avail;
 
+    off_t offset = lseek(host_ref.fd, 0, SEEK_CUR);
+    if (offset >= 0) {
+        int64_t intercepted =
+            proc_try_read_intercept(fd, host_ref.fd, buf, count, offset, 0);
+        if (intercepted != INT64_MIN) {
+            host_fd_ref_close(&host_ref);
+            return intercepted;
+        }
+    }
+
     ssize_t ret = read(host_ref.fd, buf, count);
     host_fd_ref_close(&host_ref);
     return ret < 0 ? linux_errno() : ret;
@@ -641,6 +711,13 @@ int64_t sys_pread64(guest_t *g,
     }
     if (count > avail)
         count = avail;
+
+    int64_t intercepted =
+        proc_try_read_intercept(fd, host_ref.fd, buf, count, offset, 1);
+    if (intercepted != INT64_MIN) {
+        host_fd_ref_close(&host_ref);
+        return intercepted;
+    }
 
     ssize_t ret = pread(host_ref.fd, buf, count, offset);
     host_fd_ref_close(&host_ref);
@@ -832,6 +909,17 @@ int64_t sys_readv(guest_t *g, int fd, uint64_t iov_gva, int iovcnt)
         return err;
     }
 
+    off_t offset = lseek(host_ref.fd, 0, SEEK_CUR);
+    if (offset >= 0) {
+        int64_t intercepted = proc_try_readv_intercept(
+            fd, host_ref.fd, host_iov.iov, iovcnt, offset, 0);
+        if (intercepted != INT64_MIN) {
+            host_iov_free(&host_iov);
+            host_fd_ref_close(&host_ref);
+            return intercepted;
+        }
+    }
+
     ssize_t ret = readv(host_ref.fd, host_iov.iov, iovcnt);
     int64_t result = ret < 0 ? linux_errno() : ret;
     host_iov_free(&host_iov);
@@ -917,6 +1005,14 @@ int64_t sys_preadv(guest_t *g,
     if (err < 0) {
         host_fd_ref_close(&host_ref);
         return err;
+    }
+
+    int64_t intercepted = proc_try_readv_intercept(
+        fd, host_ref.fd, host_iov.iov, iovcnt, offset, 1);
+    if (intercepted != INT64_MIN) {
+        host_iov_free(&host_iov);
+        host_fd_ref_close(&host_ref);
+        return intercepted;
     }
 
     ssize_t ret = preadv(host_ref.fd, host_iov.iov, iovcnt, offset);
@@ -1354,9 +1450,19 @@ int64_t sys_sendfile(guest_t *g,
         size_t chunk = remaining > sizeof(buf) ? sizeof(buf) : remaining;
         ssize_t nr;
         if (offset >= 0) {
-            nr = pread(in_ref.fd, buf, chunk, offset);
+            int64_t intercepted = proc_try_chunk_read_intercept(
+                in_fd, in_ref.fd, buf, chunk, offset, 1);
+            if (intercepted != INT64_MIN)
+                nr = intercepted;
+            else
+                nr = pread(in_ref.fd, buf, chunk, offset);
         } else {
-            nr = read(in_ref.fd, buf, chunk);
+            int64_t intercepted = proc_try_chunk_read_intercept(
+                in_fd, in_ref.fd, buf, chunk, 0, 0);
+            if (intercepted != INT64_MIN)
+                nr = intercepted;
+            else
+                nr = read(in_ref.fd, buf, chunk);
         }
         if (nr < 0) {
             if (total > 0)
@@ -1443,9 +1549,19 @@ int64_t sys_copy_file_range(guest_t *g,
         size_t chunk = remaining > sizeof(buf) ? sizeof(buf) : remaining;
         ssize_t nr;
         if (off_in >= 0) {
-            nr = pread(in_ref.fd, buf, chunk, off_in);
+            int64_t intercepted = proc_try_chunk_read_intercept(
+                fd_in, in_ref.fd, buf, chunk, off_in, 1);
+            if (intercepted != INT64_MIN)
+                nr = intercepted;
+            else
+                nr = pread(in_ref.fd, buf, chunk, off_in);
         } else {
-            nr = read(in_ref.fd, buf, chunk);
+            int64_t intercepted = proc_try_chunk_read_intercept(
+                fd_in, in_ref.fd, buf, chunk, 0, 0);
+            if (intercepted != INT64_MIN)
+                nr = intercepted;
+            else
+                nr = read(in_ref.fd, buf, chunk);
         }
         if (nr < 0) {
             if (total > 0)

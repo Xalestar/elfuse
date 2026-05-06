@@ -66,3 +66,15 @@ int64_t timerfd_read(int guest_fd,
  * writes a byte to make poll/epoll see readability.
  */
 void signalfd_notify(int signum);
+
+/* Snapshot per-fd state for /proc/self/fdinfo. Each accessor returns true when
+ * the guest_fd refers to a live instance of that special-fd type. The values
+ * are read under sfd_lock so concurrent read/write/settime cannot tear them.
+ */
+bool eventfd_fdinfo_snapshot(int guest_fd, uint64_t *count_out);
+bool signalfd_fdinfo_snapshot(int guest_fd, uint64_t *mask_out);
+bool timerfd_fdinfo_snapshot(int guest_fd,
+                             int *clockid_out,
+                             uint64_t *ticks_out,
+                             int64_t *value_ns_out,
+                             int64_t *interval_ns_out);

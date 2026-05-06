@@ -66,16 +66,14 @@ static const char *proc_virtual_dir_path(const char *path,
 
 static const char *proc_stateful_file_path(const char *path)
 {
-    if (!path || strncmp(path, "/proc", 5) != 0)
+    if (!path || strncmp(path, "/proc/", 6) != 0)
         return NULL;
 
     if (!strcmp(path, "/proc/self/oom_score_adj") ||
-        !strcmp(path, "/proc/self/oom_adj")) {
+        !strcmp(path, "/proc/self/oom_adj") ||
+        !strcmp(path, "/proc/self/oom_score")) {
         return path;
     }
-
-    if (strncmp(path, "/proc/", 6) != 0)
-        return NULL;
 
     char *endp;
     long pid = strtol(path + 6, &endp, 10);
@@ -86,6 +84,8 @@ static const char *proc_stateful_file_path(const char *path)
         return "/proc/self/oom_score_adj";
     if (!strcmp(endp, "/oom_adj"))
         return "/proc/self/oom_adj";
+    if (!strcmp(endp, "/oom_score"))
+        return "/proc/self/oom_score";
 
     return NULL;
 }
@@ -117,9 +117,14 @@ static const char *proc_virtual_dir_path(const char *path,
         virt = "/proc";
     } else if (!strcmp(path, "/proc/self") || !strcmp(path, "/proc/self/")) {
         virt = "/proc/self";
+    } else if (!strcmp(path, "/proc/net") || !strcmp(path, "/proc/net/")) {
+        virt = "/proc/net";
     } else if (!strcmp(path, "/proc/self/fd") ||
                !strcmp(path, "/proc/self/fd/")) {
         virt = "/proc/self/fd";
+    } else if (!strcmp(path, "/proc/self/fdinfo") ||
+               !strcmp(path, "/proc/self/fdinfo/")) {
+        virt = "/proc/self/fdinfo";
     } else if (!strcmp(path, "/proc/self/task") ||
                !strcmp(path, "/proc/self/task/")) {
         virt = "/proc/self/task";
@@ -137,6 +142,9 @@ static const char *proc_virtual_dir_path(const char *path,
         if (endp != path + 6 && pid == (long) proc_get_pid() &&
             (*endp == '\0' || !strcmp(endp, "/"))) {
             virt = "/proc/self";
+        } else if (endp != path + 6 && pid == (long) proc_get_pid() &&
+                   (!strcmp(endp, "/fdinfo") || !strcmp(endp, "/fdinfo/"))) {
+            virt = "/proc/self/fdinfo";
         } else if (endp != path + 6 && pid == (long) proc_get_pid() &&
                    !strcmp(endp, "/fd")) {
             virt = "/proc/self/fd";

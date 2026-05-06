@@ -144,6 +144,22 @@ int main(void)
             FAIL("readlink failed");
     }
 
+    TEST("readlink /proc/<pid>/exe aliases /proc/self/exe");
+    {
+        char path[64];
+        char self_buf[4096], pid_buf[4096];
+        snprintf(path, sizeof(path), "/proc/%d/exe", getpid());
+        ssize_t self_n =
+            readlink("/proc/self/exe", self_buf, sizeof(self_buf) - 1);
+        ssize_t pid_n = readlink(path, pid_buf, sizeof(pid_buf) - 1);
+        if (self_n > 0 && pid_n > 0) {
+            self_buf[self_n] = '\0';
+            pid_buf[pid_n] = '\0';
+            EXPECT_TRUE(!strcmp(self_buf, pid_buf), "exe targets differ");
+        } else
+            FAIL("readlink failed");
+    }
+
     /* openat(procfd, "<pid>/stat"): proc walkers keep /proc as a dirfd. */
     TEST("openat /proc/<pid>/stat");
     {
