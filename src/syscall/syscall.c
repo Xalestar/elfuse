@@ -63,6 +63,22 @@
 /* Generated from src/syscall/dispatch.tbl into $(BUILD_DIR). */
 #include "dispatch.h"
 
+/* HV_SYS_REG_ACTLR_EL1 was added in the macOS 15 (Sequoia) SDK. Older SDKs
+ * (e.g., the Nix-pinned apple-sdk-14.4) lack the enumerator. The encoding is
+ * stable: op0=3, op1=0, CRn=1, CRm=0, op2=1 -> 0xc081. Hypervisor.framework
+ * exposes ACTLR_EL1 only on hardware/OS combinations where the bit is
+ * meaningful (Apple Silicon TSO toggle); older platforms simply leave actlr
+ * at 0, which falls through to PR_SET_MEM_MODEL_DEFAULT.
+ *
+ * The guard checks the SDK version rather than the macro presence: on
+ * macOS 15+ the symbol is an enumerator (not a #define), so a plain
+ * #ifndef would always fire and shadow the SDK name with a macro of the
+ * same spelling.
+ */
+#if __MAC_OS_X_VERSION_MAX_ALLOWED < 150000
+#define HV_SYS_REG_ACTLR_EL1 ((hv_sys_reg_t) 0xc081)
+#endif
+
 
 void syscall_init(void)
 {
