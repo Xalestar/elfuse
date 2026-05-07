@@ -34,6 +34,8 @@
 #include "syscall/abi.h"
 #include "syscall/proc.h"
 
+#include "debug/log.h"
+
 /* Interrupt flag: when set, futex_wait returns -EINTR. Used to simulate SIGCHLD
  * delivery when all CLONE_THREAD workers exit: wakes the main thread from
  * blocking futex_wait without triggering a full exit_group.
@@ -124,6 +126,11 @@ static futex_bucket_t buckets[FUTEX_BUCKETS];
 static inline unsigned futex_hash(uint64_t uaddr)
 {
     return (unsigned) ((uaddr >> 2) ^ (uaddr >> 14)) % FUTEX_BUCKETS;
+}
+
+static inline bool futex_uaddr_is_aligned(uint64_t uaddr)
+{
+    return (uaddr & 0x3) == 0;
 }
 
 /* Unlink a waiter from its bucket's singly-linked list. Caller must hold
@@ -225,6 +232,8 @@ static int64_t futex_wait(guest_t *g,
                           int is_absolute)
 {
     if (bitset == 0)
+        return -LINUX_EINVAL;
+    if (!futex_uaddr_is_aligned(uaddr))
         return -LINUX_EINVAL;
 
     unsigned idx = futex_hash(uaddr);
@@ -375,6 +384,8 @@ static int64_t futex_wake(uint64_t uaddr, uint32_t val, uint32_t bitset)
 {
     if (bitset == 0)
         return -LINUX_EINVAL;
+    if (!futex_uaddr_is_aligned(uaddr))
+        return -LINUX_EINVAL;
 
     unsigned idx = futex_hash(uaddr);
     futex_bucket_t *b = &buckets[idx];
@@ -422,6 +433,9 @@ static int64_t futex_requeue(guest_t *g,
                              int do_cmp,
                              uint32_t expected)
 {
+    if (!futex_uaddr_is_aligned(uaddr) || !futex_uaddr_is_aligned(uaddr2))
+        return -LINUX_EINVAL;
+
     unsigned idx_src = futex_hash(uaddr);
     unsigned idx_dst = futex_hash(uaddr2);
     futex_bucket_t *b_src = &buckets[idx_src];
@@ -521,6 +535,9 @@ static int64_t futex_wake_op(guest_t *g,
                              uint32_t val2,
                              uint32_t val3)
 {
+    if (!futex_uaddr_is_aligned(uaddr) || !futex_uaddr_is_aligned(uaddr2))
+        return -LINUX_EINVAL;
+
     unsigned idx1 = futex_hash(uaddr);
     unsigned idx2 = futex_hash(uaddr2);
     futex_bucket_t *b1 = &buckets[idx1];
@@ -699,6 +716,9 @@ static int64_t futex_wake_op(guest_t *g,
  */
 static int64_t futex_lock_pi(guest_t *g, uint64_t uaddr, uint64_t timeout_gva)
 {
+    if (!futex_uaddr_is_aligned(uaddr))
+        return -LINUX_EINVAL;
+
     uint32_t *word = (uint32_t *) guest_ptr_w(g, uaddr);
     if (!word)
         return -LINUX_EFAULT;
@@ -891,6 +911,9 @@ static int64_t futex_lock_pi(guest_t *g, uint64_t uaddr, uint64_t timeout_gva)
  */
 static int64_t futex_trylock_pi(guest_t *g, uint64_t uaddr)
 {
+    if (!futex_uaddr_is_aligned(uaddr))
+        return -LINUX_EINVAL;
+
     uint32_t *word = (uint32_t *) guest_ptr_w(g, uaddr);
     if (!word)
         return -LINUX_EFAULT;
@@ -916,6 +939,9 @@ static int64_t futex_trylock_pi(guest_t *g, uint64_t uaddr)
  */
 static int64_t futex_unlock_pi(guest_t *g, uint64_t uaddr)
 {
+    if (!futex_uaddr_is_aligned(uaddr))
+        return -LINUX_EINVAL;
+
     uint32_t *word = (uint32_t *) guest_ptr_w(g, uaddr);
     if (!word)
         return -LINUX_EFAULT;
@@ -1210,7 +1236,7 @@ int64_t sys_futex_waitv(guest_t *g,
          * FUTEX2_SIZE_U32 that is 4-byte alignment; an unaligned futex word
          * loses atomicity on aarch64 and matches no kernel-side behavior.
          */
-        if (elts[i].uaddr & 0x3)
+        if (!futex_uaddr_is_aligned(elts[i].uaddr))
             return -LINUX_EINVAL;
     }
 
@@ -1402,8 +1428,12 @@ void robust_list_walk(guest_t *g, thread_entry_t *t)
             futex_gva = list_ptr + (uint64_t) futex_offset;
         else
             futex_gva = list_ptr - (uint64_t) (-futex_offset);
-        if (futex_gva >= g->ipa_base + g->guest_size) {
-            /* Address out of guest range; skip this entry */
+        if (futex_gva >= g->ipa_base + g->guest_size ||
+            !futex_uaddr_is_aligned(futex_gva)) {
+            /* Out of range or unaligned: skip. Linux's unaligned_p() rejects
+             * these; emulating the same avoids partial cross-page writes
+             * leaving the futex word corrupted while the wake is suppressed.
+             */
             uint64_t next;
             if (guest_read_small(g, list_ptr, &next, sizeof(next)) < 0)
                 break;
@@ -1422,8 +1452,14 @@ void robust_list_walk(guest_t *g, thread_entry_t *t)
                 /* Set FUTEX_OWNER_DIED and clear TID */
                 uint32_t new_val =
                     (futex_val & ~FUTEX_TID_MASK) | FUTEX_OWNER_DIED;
-                guest_write_small(g, futex_gva, &new_val, sizeof(new_val));
-                futex_wake(futex_gva, 1, FUTEX_BITSET_MATCH_ANY);
+                if (guest_write_small(g, futex_gva, &new_val, sizeof(new_val)) <
+                    0)
+                    log_debug(
+                        "futex: robust list OWNER_DIED write to 0x%llx "
+                        "failed; waiters on this lock may hang",
+                        (unsigned long long) futex_gva);
+                else
+                    futex_wake(futex_gva, 1, FUTEX_BITSET_MATCH_ANY);
             }
         }
 
@@ -1444,6 +1480,9 @@ void robust_list_walk(guest_t *g, thread_entry_t *t)
             futex_gva = pending + (uint64_t) futex_offset;
         else
             futex_gva = pending - (uint64_t) (-futex_offset);
+        if (futex_gva >= g->ipa_base + g->guest_size ||
+            !futex_uaddr_is_aligned(futex_gva))
+            return;
         uint32_t futex_val;
         if (guest_read_small(g, futex_gva, &futex_val, sizeof(futex_val)) ==
             0) {
@@ -1451,8 +1490,14 @@ void robust_list_walk(guest_t *g, thread_entry_t *t)
             if (owner == (uint32_t) t->guest_tid) {
                 uint32_t new_val =
                     (futex_val & ~FUTEX_TID_MASK) | FUTEX_OWNER_DIED;
-                guest_write_small(g, futex_gva, &new_val, sizeof(new_val));
-                futex_wake(futex_gva, 1, FUTEX_BITSET_MATCH_ANY);
+                if (guest_write_small(g, futex_gva, &new_val, sizeof(new_val)) <
+                    0)
+                    log_debug(
+                        "futex: robust list pending OWNER_DIED write to "
+                        "0x%llx failed; waiters on this lock may hang",
+                        (unsigned long long) futex_gva);
+                else
+                    futex_wake(futex_gva, 1, FUTEX_BITSET_MATCH_ANY);
             }
         }
     }
