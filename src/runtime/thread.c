@@ -21,7 +21,7 @@
 
 #include "runtime/thread.h"
 #include "debug/log.h"
-#include "core/guest.h" /* SHIM_DATA_BASE, BLOCK_2MIB, GUEST_IPA_BASE */
+#include "core/guest.h" /* guest_t (shim_data_base/ipa_base), BLOCK_2MIB */
 #include "hvutil.h"     /* vcpu_get_gpr, vcpu_get_sysreg */
 
 /* From syscall/signal.h, included here directly to avoid pulling in
@@ -38,8 +38,15 @@ static int thread_can_add_deferred_unmap_locked(thread_entry_t *t,
                                                 uint64_t start,
                                                 uint64_t end);
 
-/* Top of the EL1 exception stack region (one 4KiB slot per thread) */
-#define SP_EL1_TOP (GUEST_IPA_BASE + SHIM_DATA_BASE + BLOCK_2MIB)
+/* Top of the EL1 exception stack region (one 4KiB slot per thread).
+ * The shim data block sits at high IPA, computed at guest_init time and
+ * stored in g->shim_data_base; the top of the EL1 stacks is the next
+ * 2MiB boundary above that. Caller must hold a guest_t reference.
+ */
+static inline uint64_t sp_el1_top(const guest_t *g)
+{
+    return g->ipa_base + g->shim_data_base + BLOCK_2MIB;
+}
 
 /* Thread table. */
 
@@ -103,6 +110,7 @@ void thread_register_main(hv_vcpu_t vcpu,
     t->host_thread = pthread_self();
     t->clear_child_tid = 0;
     t->sp_el1 = sp_el1;
+    t->sp_el1_slot = 0; /* Main thread always owns slot 0 */
     t->active = 1;
     t->altstack_flags = LINUX_SS_DISABLE;
     t->on_altstack = false;
@@ -138,6 +146,7 @@ thread_entry_t *thread_alloc(int64_t tid,
             pthread_cond_destroy(&t->resume_cond);
         }
         memset(t, 0, sizeof(*t));
+        t->sp_el1_slot = -1; /* No SP_EL1 yet; thread_alloc_sp_el1 fills this */
         t->guest_tid = tid;
         if (stack_start < stack_end) {
             t->stack_map_start = stack_start;
@@ -156,18 +165,15 @@ thread_entry_t *thread_alloc(int64_t tid,
 }
 
 /* Free an SP_EL1 slot for reuse. Must be called with thread_lock held.
- * Derives the slot index from the IPA and clears the bitmask bit.
+ * Reads the slot index recorded at allocation time and clears the bit.
  */
-static void thread_free_sp_el1_locked(uint64_t sp)
+static void thread_free_sp_el1_locked(thread_entry_t *t)
 {
-    if (sp == 0)
-        return;
-    uint64_t top = SP_EL1_TOP;
-    if (sp > top)
-        return;
-    int slot = (int) ((top - sp) / 4096);
+    int slot = t->sp_el1_slot;
     if (RANGE_CHECK(slot, 0, MAX_THREADS))
         sp_el1_allocated &= ~BIT64(slot);
+    t->sp_el1 = 0;
+    t->sp_el1_slot = -1;
 }
 
 static void thread_ptrace_cleanup_locked(thread_entry_t *t)
@@ -205,7 +211,7 @@ void thread_deactivate(thread_entry_t *t)
     }
 
     /* Free SP_EL1 slot so it can be reused by future threads */
-    thread_free_sp_el1_locked(t->sp_el1);
+    thread_free_sp_el1_locked(t);
 
     t->active = 0;
     atomic_fetch_sub(&active_thread_count, 1);
@@ -272,7 +278,7 @@ int thread_count_active_vm_clones(void)
     return count;
 }
 
-uint64_t thread_alloc_sp_el1(void)
+uint64_t thread_alloc_sp_el1(const guest_t *g, thread_entry_t *t)
 {
     uint64_t sp = 0;
 
@@ -284,12 +290,14 @@ uint64_t thread_alloc_sp_el1(void)
         log_error("thread: SP_EL1 slots exhausted");
     } else {
         int slot = bit_ctz64(free_mask);
-        /* Main thread's SP_EL1 = IPA_BASE + SHIM_DATA_BASE + 2MiB.
+        /* Main thread's SP_EL1 sits at the top of the shim data block.
          * Each subsequent thread is 4KiB below.
          */
-        uint64_t top = SP_EL1_TOP;
+        uint64_t top = sp_el1_top(g);
         sp = top - (uint64_t) slot * 4096;
         sp_el1_allocated |= BIT64(slot);
+        t->sp_el1 = sp;
+        t->sp_el1_slot = slot;
     }
 
     pthread_mutex_unlock(&thread_lock);
@@ -357,7 +365,7 @@ void thread_destroy_all_vcpus(void)
             continue;
         hv_vcpu_destroy(t->vcpu);
         t->vcpu = 0;
-        thread_free_sp_el1_locked(t->sp_el1);
+        thread_free_sp_el1_locked(t);
         t->active = 0;
         /* Do NOT destroy condvars. Same race as thread_deactivate: a waiter
          * woken by an earlier broadcast may still reference the condvar.
@@ -892,7 +900,7 @@ int64_t thread_ptrace_wait(int64_t tracer_tid,
                 /* Destroy condvars after the last waiter returns from
                  * pthread_cond_wait().
                  */
-                thread_free_sp_el1_locked(t->sp_el1);
+                thread_free_sp_el1_locked(t);
                 t->active = 0;
                 atomic_fetch_sub(&active_thread_count, 1);
                 t->ptrace_cleanup_pending = true;

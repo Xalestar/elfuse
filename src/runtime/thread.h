@@ -10,8 +10,8 @@
  * O(1) access to the current thread's entry from any syscall handler.
  *
  * SP_EL1 allocation: each thread gets a 4KiB EL1 exception stack carved from
- * the shim data region (SHIM_DATA_BASE + 2MiB). Thread 0 (main) gets the top,
- * thread N gets offset -(N * 4096).
+ * the shim data region (g->shim_data_base + 2MiB). Thread 0 (main) gets the
+ * top, thread N gets offset -(N * 4096).
  */
 
 #pragma once
@@ -20,6 +20,8 @@
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
+
+#include "core/guest.h"  /* guest_t (for thread_alloc_sp_el1) */
 #include "syscall/abi.h" /* linux_user_pt_regs_t */
 
 /* Maximum number of concurrent guest threads in one VM. */
@@ -34,6 +36,11 @@ typedef struct {
     pthread_t host_thread;    /* macOS host thread running this vCPU */
     uint64_t clear_child_tid; /* GVA for CLONE_CHILD_CLEARTID (0=none) */
     uint64_t sp_el1;          /* Per-thread EL1 stack top (IPA) */
+    int sp_el1_slot;          /* Slot index in sp_el1_allocated (-1 = none).
+                               * Stored at alloc time so the free path does
+                               * not need to recompute (top - sp) / 4096; the
+                               * shim data block is now at high IPA and only
+                               * known via guest_t. */
     int active;               /* Non-zero while thread is running.
                                * Stays int (not bool) because lock-free paths in thread.c
                                * use __atomic_load_n on this field; the 32-bit width keeps
@@ -181,12 +188,15 @@ int thread_active_count(void);
 /* Fast path: return non-zero when exactly one guest thread is active. */
 int thread_is_single_active(void);
 
-/* Allocate a per-thread SP_EL1 value. Thread N gets the Nth 4KiB slot counting
- * down from the top of the shim data region. The IPA base (GUEST_IPA_BASE +
- * SHIM_DATA_BASE + 2MiB) is the main thread's SP_EL1; each subsequent thread
- * subtracts 4KiB. Returns the IPA, or 0 on failure.
+/* Allocate a per-thread SP_EL1 stack and record both the IPA and the slot
+ * index into t. Thread N gets the Nth 4KiB slot counting down from the top
+ * of the shim data block (g->shim_data_base + 2MiB). The shim block lives
+ * at high IPA computed by guest_init, so callers must pass g; the slot
+ * index is stored in t->sp_el1_slot so the free path (which is reached
+ * from teardown contexts that lack g) can clear the bitmask directly.
+ * Returns the SP_EL1 IPA, or 0 on slot exhaustion.
  */
-uint64_t thread_alloc_sp_el1(void);
+uint64_t thread_alloc_sp_el1(const guest_t *g, thread_entry_t *t);
 
 /* Iterate over all active threads, calling fn(entry, ctx) for each.
  * Holds the thread table lock during iteration.
