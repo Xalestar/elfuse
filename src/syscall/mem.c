@@ -1185,10 +1185,13 @@ int64_t sys_mmap(guest_t *g,
 
         /* Reject MAP_FIXED targeting VM infrastructure: page table pool,
          * shim code, and shim data/stack regions.  A guest must not be
-         * able to overwrite EL1 exception vectors or page tables.
+         * able to overwrite EL1 exception vectors or page tables. The
+         * reserve sits at high IPA (just below g->interp_base) so the
+         * range check uses the runtime fields rather than compile-time
+         * low-memory constants.
          */
         uint64_t fix_end = off + length;
-        if (off < ELF_DEFAULT_BASE && fix_end > PT_POOL_BASE)
+        if (guest_range_hits_infra(g, off, fix_end))
             return -LINUX_EINVAL;
 
         result_off = off;
@@ -2414,7 +2417,7 @@ static int compare_range_pair(const void *a, const void *b)
 static int munmap_guest_range(guest_t *g, uint64_t unmap_off, uint64_t end)
 {
     /* Reject munmap targeting VM infrastructure regions. */
-    if (unmap_off < ELF_DEFAULT_BASE && end > PT_POOL_BASE)
+    if (guest_range_hits_infra(g, unmap_off, end))
         return -LINUX_EINVAL;
 
     /* Restore slab backing under any active MAP_SHARED file overlay before
@@ -2565,7 +2568,7 @@ int64_t sys_mprotect(guest_t *g, uint64_t addr, uint64_t length, int prot)
             /* Reject mprotect targeting VM infrastructure (page tables, shim).
              * Matches the guard in sys_munmap.
              */
-            if (mprot_off < ELF_DEFAULT_BASE && mprot_end > PT_POOL_BASE)
+            if (guest_range_hits_infra(g, mprot_off, mprot_end))
                 return -LINUX_EINVAL;
 
             guest_region_set_prot(g, mprot_off, mprot_end, prot);

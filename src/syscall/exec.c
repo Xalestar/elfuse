@@ -488,7 +488,7 @@ int64_t sys_execve(hv_vcpu_t vcpu,
     const unsigned char *shim_ptr = proc_get_shim_blob();
     unsigned int shim_size = proc_get_shim_size();
     if (shim_ptr && shim_size > 0) {
-        memcpy((uint8_t *) g->host_base + SHIM_BASE, shim_ptr, shim_size);
+        memcpy((uint8_t *) g->host_base + g->shim_base, shim_ptr, shim_size);
     }
 
     /* Load the executable image that was validated before guest_reset(). */
@@ -500,6 +500,11 @@ int64_t sys_execve(hv_vcpu_t vcpu,
             path_host);
         exit(128);
     }
+
+    /* Track lowest loaded ELF address for the legacy fork IPC path
+     * after exec replaces the previous image (see guest_get_used_regions).
+     */
+    g->elf_load_min = elf_info.load_min + elf_load_base;
 
     /* If PT_INTERP was present, map the already-validated interpreter at the
      * exec-time interp_base.
@@ -540,7 +545,7 @@ int64_t sys_execve(hv_vcpu_t vcpu,
             sys_icache_invalidate(host_addr, interp_info.segments[i].memsz);
         }
     }
-    sys_icache_invalidate((uint8_t *) g->host_base + SHIM_BASE, shim_size);
+    sys_icache_invalidate((uint8_t *) g->host_base + g->shim_base, shim_size);
 
     /* Reset brk to the first page after loaded executable data. */
     uint64_t brk_start = PAGE_ALIGN_UP(elf_info.load_max + elf_load_base);
@@ -574,16 +579,16 @@ int64_t sys_execve(hv_vcpu_t vcpu,
     /* Keep the shim executable-only; HVF faults on merged RWX mappings. */
     if (nregions >= MAX_REGIONS)
         goto too_many_regions;
-    regions[nregions++] = (mem_region_t) {.gpa_start = SHIM_BASE,
-                                          .gpa_end = SHIM_BASE + shim_size,
+    regions[nregions++] = (mem_region_t) {.gpa_start = g->shim_base,
+                                          .gpa_end = g->shim_base + shim_size,
                                           .perms = MEM_PERM_RX};
 
     /* EL1 exception handlers use this block for stack and scratch state. */
     if (nregions >= MAX_REGIONS)
         goto too_many_regions;
     regions[nregions++] =
-        (mem_region_t) {.gpa_start = SHIM_DATA_BASE,
-                        .gpa_end = SHIM_DATA_BASE + BLOCK_2MIB,
+        (mem_region_t) {.gpa_start = g->shim_data_base,
+                        .gpa_end = g->shim_data_base + BLOCK_2MIB,
                         .perms = MEM_PERM_RW};
 
     /* The vDSO sits in the same 2MiB block as the shim. The page-table builder
@@ -667,10 +672,10 @@ int64_t sys_execve(hv_vcpu_t vcpu,
     }
 
     /* Rebuild /proc/self/maps metadata in parallel with the new page tables. */
-    guest_region_add(g, SHIM_BASE, SHIM_BASE + shim_size,
+    guest_region_add(g, g->shim_base, g->shim_base + shim_size,
                      LINUX_PROT_READ | LINUX_PROT_EXEC, LINUX_MAP_PRIVATE, 0,
                      "[shim]");
-    guest_region_add(g, SHIM_DATA_BASE, SHIM_DATA_BASE + BLOCK_2MIB,
+    guest_region_add(g, g->shim_data_base, g->shim_data_base + BLOCK_2MIB,
                      LINUX_PROT_READ | LINUX_PROT_WRITE, LINUX_MAP_PRIVATE, 0,
                      "[shim-data]");
     for (int i = 0; i < elf_info.num_segments; i++) {

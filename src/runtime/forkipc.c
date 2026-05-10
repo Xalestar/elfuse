@@ -110,6 +110,32 @@ int fork_child_main(int ipc_fd,
     absock_set_namespace_id(hdr.absock_namespace_id);
     proc_set_session(hdr.sid, hdr.pgid);
 
+    /* Validate header layout fields before any size-derived arithmetic.
+     * guest_init / guest_init_from_shm derive interp_base, mmap_limit, and
+     * the high-IPA infra reserve from these inputs; underflow on tiny or
+     * malformed values would place pt_pool_base and friends near UINT64_MAX,
+     * which then feeds unchecked host-buffer offsets in pt_alloc_page and
+     * pt_at. Reject impossible layouts up front.
+     *
+     * Lower bound: guest_size must leave room for both mmap_limit
+     * (size - 8 GiB) and interp_base (size - 4 GiB) plus the 4 MiB infra
+     * reserve below it. 8 GiB satisfies all three with margin.
+     * Upper bound: guest_size must fit in the negotiated IPA width.
+     * IPA bits: 36 (Apple M2) and 40 (M3+) are the supported widths.
+     */
+    if (hdr.ipa_bits < 36 || hdr.ipa_bits > 40) {
+        log_error("fork-child: invalid ipa_bits %u", (unsigned) hdr.ipa_bits);
+        close(ipc_fd);
+        return 1;
+    }
+    if (hdr.guest_size < 0x200000000ULL ||
+        hdr.guest_size > (1ULL << hdr.ipa_bits)) {
+        log_error("fork-child: invalid guest_size 0x%llx (ipa_bits=%u)",
+                  (unsigned long long) hdr.guest_size, (unsigned) hdr.ipa_bits);
+        close(ipc_fd);
+        return 1;
+    }
+
     /* Create guest memory before receiving state so all incoming offsets can be
      * bounds-checked against the negotiated guest size.
      */
@@ -144,11 +170,20 @@ int fork_child_main(int ipc_fd,
     }
 
     /* Restore allocator/page-table cursors before mmap/brk can run in child.
-     * Validate pt_pool_next and ttbr0: both must reside within the page table
-     * pool [PT_POOL_BASE, PT_POOL_END). Accepting out-of-range values from IPC
-     * would corrupt page table allocation or translation walks.
+     * Validate pt_pool_next and ttbr0 against the child's own page-table
+     * pool, which the child just computed from hdr.guest_size +
+     * hdr.ipa_bits via compute_infra_layout.
+     *
+     * Range alone is not enough: pt_alloc_page advances pt_pool_next in
+     * GUEST_PAGE_SIZE quanta, and pt_at converts page-table GPAs straight
+     * into host-buffer pointers. An unaligned value passes the [base, end)
+     * gate but then misaligns the walker. Require:
+     *   - pt_pool_next page-aligned relative to pt_pool_base
+     *   - ttbr0 strictly inside the in-use pool [pt_pool_base, pt_pool_next)
+     *     (parent must have allocated the L0 page) and page-aligned.
      */
-    if (hdr.pt_pool_next < PT_POOL_BASE || hdr.pt_pool_next > PT_POOL_END) {
+    if (hdr.pt_pool_next < g.pt_pool_base || hdr.pt_pool_next > g.pt_pool_end ||
+        ((hdr.pt_pool_next - g.pt_pool_base) % GUEST_PAGE_SIZE) != 0) {
         log_error("fork-child: invalid pt_pool_next 0x%llx",
                   (unsigned long long) hdr.pt_pool_next);
         guest_destroy(&g);
@@ -156,7 +191,8 @@ int fork_child_main(int ipc_fd,
         return 1;
     }
     uint64_t ttbr0_off = hdr.ttbr0 - g.ipa_base;
-    if (ttbr0_off < PT_POOL_BASE || ttbr0_off >= PT_POOL_END) {
+    if (ttbr0_off < g.pt_pool_base || ttbr0_off >= hdr.pt_pool_next ||
+        ((ttbr0_off - g.pt_pool_base) % GUEST_PAGE_SIZE) != 0) {
         log_error("fork-child: invalid ttbr0 0x%llx",
                   (unsigned long long) hdr.ttbr0);
         guest_destroy(&g);
@@ -165,6 +201,7 @@ int fork_child_main(int ipc_fd,
     }
     g.brk_base = hdr.brk_base;
     g.brk_current = hdr.brk_current;
+    g.elf_load_min = hdr.elf_load_min;
     g.stack_base = hdr.stack_base;
     g.stack_top = hdr.stack_top;
     g.mmap_next = hdr.mmap_next;
@@ -379,13 +416,12 @@ static int64_t sys_clone_thread(hv_vcpu_t parent_vcpu,
     if (current_thread)
         t->blocked = current_thread->blocked;
 
-    /* Allocate per-thread EL1 stack */
-    uint64_t child_sp_el1 = thread_alloc_sp_el1();
+    /* Allocate per-thread EL1 stack (records both sp and slot in t). */
+    uint64_t child_sp_el1 = thread_alloc_sp_el1(g, t);
     if (child_sp_el1 == 0) {
         thread_deactivate(t);
         return -LINUX_ENOMEM;
     }
-    t->sp_el1 = child_sp_el1;
 
     /* Capture parent register state before spawning worker.
      * HVF binds vCPU to the creating thread, so the worker must call
@@ -656,13 +692,12 @@ static int64_t sys_clone_vm(hv_vcpu_t parent_vcpu,
     if (current_thread)
         t->blocked = current_thread->blocked;
 
-    /* Allocate per-thread EL1 stack */
-    uint64_t child_sp_el1 = thread_alloc_sp_el1();
+    /* Allocate per-thread EL1 stack (records both sp and slot in t). */
+    uint64_t child_sp_el1 = thread_alloc_sp_el1(g, t);
     if (child_sp_el1 == 0) {
         thread_deactivate(t);
         return -LINUX_ENOMEM;
     }
-    t->sp_el1 = child_sp_el1;
 
     /* Capture parent register state */
     uint64_t parent_elr = vcpu_get_sysreg(parent_vcpu, HV_SYS_REG_ELR_EL1);
@@ -1085,6 +1120,7 @@ int64_t sys_clone(hv_vcpu_t vcpu,
         .child_pid = child_guest_pid,
         .parent_pid = proc_get_pid(),
         .guest_size = g->guest_size,
+        .elf_load_min = g->elf_load_min,
         .brk_base = g->brk_base,
         .brk_current = g->brk_current,
         .stack_base = g->stack_base,

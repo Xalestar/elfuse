@@ -164,6 +164,13 @@ $(BUILD_DIR)/test-futex-waitv: tests/test-futex-waitv.c | $(BUILD_DIR)
 	@echo "  CROSS   $< (with -lpthread)"
 	$(Q)$(CROSS_COMPILE)gcc -D_GNU_SOURCE -static -O2 -o $@ $< -lpthread
 
+# test-fork-lowbase must be a non-PIE ET_EXEC linked below ELF_DEFAULT_BASE so
+# nested forks exercise elf_load_min preservation across fork IPC.
+$(BUILD_DIR)/test-fork-lowbase: tests/test-fork-lowbase.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (low-base ET_EXEC)"
+	$(Q)$(CROSS_COMPILE)gcc -D_GNU_SOURCE -static -O2 -no-pie \
+		-Wl,-Ttext-segment=0x200000 -o $@ $<
+
 endif
 
 include mk/tests.mk
