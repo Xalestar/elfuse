@@ -147,6 +147,9 @@ test-sysv-shm
 [section] Credential/identity emulation tests
 test-credentials                   # diff=skip
 
+[section] Scheduler policy stub tests
+test-sched-policy
+
 [section] membarrier tests
 test-membarrier
 
