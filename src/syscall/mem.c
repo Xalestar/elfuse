@@ -228,6 +228,26 @@ static void split_regions_at_boundary(guest_t *g, uint64_t boundary)
     }
 }
 
+/* Find the smallest i such that g->regions[i].end > gap_start. All earlier
+ * regions are entirely below gap_start and would be skipped by the loop body
+ * with no other effect. Regions are kept sorted by start and non-overlapping
+ * (sys_mmap MAP_FIXED removes overlaps before insertion), so ends are
+ * monotonic across the array and binary-searchable.
+ */
+static int first_region_end_above(const guest_t *g, uint64_t gap_start)
+{
+    int lo = 0;
+    int hi = g->nregions;
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / 2;
+        if (g->regions[mid].end <= gap_start)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return lo;
+}
+
 static uint64_t find_free_gap_inner(const guest_t *g,
                                     uint64_t length,
                                     uint64_t min_addr,
@@ -243,8 +263,15 @@ static uint64_t find_free_gap_inner(const guest_t *g,
     size_t hps = host_page_size_cached();
     uint64_t gap_start = ALIGN_UP(min_addr, hps);
 
-    for (int i = 0; i < g->nregions; i++) {
-        /* Skip regions entirely before the current search position */
+    /* Skip the prefix of regions entirely below gap_start in O(log n). After a
+     * successful allocation the gap hint advances near or past the existing
+     * region tail, so the linear walk would otherwise re-scan that whole
+     * prefix on every mmap, addr-hint probe, or hint-miss full scan.
+     */
+    for (int i = first_region_end_above(g, gap_start); i < g->nregions; i++) {
+        /* A region can still slip below gap_start after the ALIGN_UP advance
+         * below skips past a smaller adjacent region; keep the cheap guard.
+         */
         if (g->regions[i].end <= gap_start)
             continue;
 
