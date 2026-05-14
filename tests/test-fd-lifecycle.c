@@ -16,12 +16,16 @@
 
 #include "test-harness.h"
 
+#ifndef SYS_memfd_create
+#define SYS_memfd_create 279
+#endif
+
 #ifndef MFD_ALLOW_SEALING
 #define MFD_ALLOW_SEALING 0x0002U
 #endif
 
-#ifndef SYS_memfd_create
-#define SYS_memfd_create 279
+#ifndef MFD_HUGETLB
+#define MFD_HUGETLB 0x0004U
 #endif
 
 #ifndef F_ADD_SEALS
@@ -38,6 +42,20 @@ static int create_memfd(void)
 {
     return (int) syscall(SYS_memfd_create, "elfuse-seal-test",
                          MFD_ALLOW_SEALING);
+}
+
+static void test_memfd_accepts_valid_linux_flags(void)
+{
+    TEST("memfd accepts valid flags");
+
+    int fd = (int) syscall(SYS_memfd_create, "elfuse-valid-flags",
+                           MFD_ALLOW_SEALING | MFD_HUGETLB);
+    if (fd < 0) {
+        FAIL("memfd_create rejected valid flags");
+        return;
+    }
+    close(fd);
+    PASS();
 }
 
 static void test_memfd_seals_survive_dup(void)
@@ -217,6 +235,7 @@ int main(void)
     test_memfd_seals_survive_dup();
     test_memfd_seals_propagate_to_dup();
     test_memfd_seals_cleared_on_reuse();
+    test_memfd_accepts_valid_linux_flags();
     test_rlimit_nofile_reports_emfile();
     test_dup3_above_rlimit_fails();
 

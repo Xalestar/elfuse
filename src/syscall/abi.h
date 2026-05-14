@@ -638,6 +638,10 @@ typedef struct {
 #define LINUX_F_SEAL_WRITE 0x0008
 #define LINUX_F_SEAL_FUTURE_WRITE 0x0010
 
+/* memfd_create flags (MFD_*). */
+#define LINUX_MFD_CLOEXEC 0x0001U
+#define LINUX_MFD_ALLOW_SEALING 0x0002U
+
 /* fcntl sealing commands */
 #define LINUX_F_ADD_SEALS 1033
 #define LINUX_F_GET_SEALS 1034

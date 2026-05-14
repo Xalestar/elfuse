@@ -27,6 +27,7 @@ FILTER=""
 LIST_ONLY=0
 VERBOSE=0
 TAP=0
+ALLOW_MISSING_BINARIES="${ALLOW_MISSING_BINARIES:-auto}"
 
 usage()
 {
@@ -90,6 +91,32 @@ case "$TESTDIR" in
     /*) TESTDIR_ABS="$TESTDIR" ;;
     *) TESTDIR_ABS="$REPO_ROOT/$TESTDIR" ;;
 esac
+
+# Canonicalize before the auto-policy comparison so that equivalent paths
+# (./build, symlinked build dir, trailing-slash) still resolve to the
+# default-strict branch instead of silently flipping into allow-missing
+# mode. If the dir does not exist yet, fall back to the raw string; the
+# per-test "not built" check still fires later.
+canonicalize()
+{
+    if [ -d "$1" ]; then
+        (cd "$1" && pwd -P)
+    else
+        printf '%s' "$1"
+    fi
+}
+
+if [ "$ALLOW_MISSING_BINARIES" = "auto" ]; then
+    testdir_canon=$(canonicalize "$TESTDIR_ABS")
+    build_canon=$(canonicalize "$REPO_ROOT/build")
+    bin_canon=$(canonicalize "$REPO_ROOT/build/bin")
+    if [ "$testdir_canon" = "$build_canon" ] \
+        || [ "$testdir_canon" = "$bin_canon" ]; then
+        ALLOW_MISSING_BINARIES=0
+    else
+        ALLOW_MISSING_BINARIES=1
+    fi
+fi
 
 if [ ! -f "$TEST_LIST" ]; then
     echo "error: $TEST_LIST not found" >&2
@@ -271,16 +298,30 @@ for i in "${filtered_idx[@]}"; do
     done
 
     if [ ! -f "$binary" ]; then
+        if [ "$ALLOW_MISSING_BINARIES" -eq 1 ]; then
+            if [ "$TAP" -eq 1 ]; then
+                echo "ok $test_num - $name # SKIP binary not found"
+            else
+                if [ "$section" != "$prev_section" ]; then
+                    printf "%s\n" "$section"
+                    prev_section="$section"
+                fi
+                report_case skip "$name" ""
+            fi
+            skip=$((skip + 1))
+            continue
+        fi
+
         if [ "$TAP" -eq 1 ]; then
-            echo "ok $test_num - $name # SKIP binary not found"
+            echo "not ok $test_num - $name # missing binary: $binary"
         else
             if [ "$section" != "$prev_section" ]; then
                 printf "%s\n" "$section"
                 prev_section="$section"
             fi
-            report_case skip "$name" ""
+            report_case fail "$name" " (missing binary)"
         fi
-        skip=$((skip + 1))
+        fail=$((fail + 1))
         continue
     fi
 

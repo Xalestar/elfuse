@@ -171,6 +171,19 @@ $(BUILD_DIR)/test-fork-lowbase: tests/test-fork-lowbase.c | $(BUILD_DIR)
 	$(Q)$(CROSS_COMPILE)gcc -D_GNU_SOURCE -static -O2 -no-pie \
 		-Wl,-Ttext-segment=0x200000 -o $@ $<
 
+# test-lowbase-mem variants must be non-PIE ET_EXEC binaries linked below
+# ELF_DEFAULT_BASE so mprotect/munmap exercise the old low-address reject
+# window at two offsets.
+$(BUILD_DIR)/test-lowbase-mem-200000: tests/test-lowbase-mem.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (low-base ET_EXEC @0x200000)"
+	$(Q)$(CROSS_COMPILE)gcc -D_GNU_SOURCE -static -O2 -no-pie \
+		-Wl,-Ttext-segment=0x200000 -o $@ $<
+
+$(BUILD_DIR)/test-lowbase-mem-300000: tests/test-lowbase-mem.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (low-base ET_EXEC @0x300000)"
+	$(Q)$(CROSS_COMPILE)gcc -D_GNU_SOURCE -static -O2 -no-pie \
+		-Wl,-Ttext-segment=0x300000 -o $@ $<
+
 endif
 
 include mk/tests.mk
