@@ -254,3 +254,17 @@ run_timeout()
         fail=$((fail + 1))
     fi
 }
+
+check_host()
+{
+    local label="$1"
+    shift
+
+    if "$@"; then
+        test_report ok "$label"
+        pass=$((pass + 1))
+    else
+        test_report fail "$label"
+        fail=$((fail + 1))
+    fi
+}

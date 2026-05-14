@@ -16,6 +16,8 @@ endif
 
 # Exclude native macOS test files from cross-compilation
 NATIVE_TESTS := tests/test-multi-vcpu.c tests/test-rwx.c
+SPECIAL_TEST_SRCS := tests/test-lowbase-mem.c
+SPECIAL_TEST_BINS := $(BUILD_DIR)/test-lowbase-mem-200000 $(BUILD_DIR)/test-lowbase-mem-300000
 
 ifdef GUEST_TEST_BINARIES
   TEST_DIR  := $(GUEST_TEST_BINARIES)/bin
@@ -23,9 +25,9 @@ ifdef GUEST_TEST_BINARIES
   TEST_HELLO_DEP :=
 else
   TEST_DIR  := $(BUILD_DIR)
-  TEST_C_SRCS := $(filter-out $(NATIVE_TESTS),$(wildcard tests/*.c))
+  TEST_C_SRCS := $(filter-out $(NATIVE_TESTS) $(SPECIAL_TEST_SRCS),$(wildcard tests/*.c))
   TEST_C_BINS := $(patsubst tests/%.c,$(BUILD_DIR)/%,$(TEST_C_SRCS))
-  TEST_DEPS := $(BUILD_DIR)/test-hello $(TEST_C_BINS)
+  TEST_DEPS := $(BUILD_DIR)/test-hello $(TEST_C_BINS) $(SPECIAL_TEST_BINS)
   TEST_HELLO_DEP := $(BUILD_DIR)/test-hello
 endif
 

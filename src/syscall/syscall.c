@@ -1276,13 +1276,20 @@ static int64_t sc_memfd_create(guest_t *g,
                                uint64_t x5,
                                bool verbose)
 {
-    (void) g;
-    (void) x0;
     (void) x2;
     (void) x3;
     (void) x4;
     (void) x5;
     (void) verbose;
+    if (!x0)
+        return -LINUX_EFAULT;
+
+    const unsigned int flags = (unsigned int) x1;
+
+    char first = '\0';
+    if (guest_read_small(g, x0, &first, sizeof(first)) < 0)
+        return -LINUX_EFAULT;
+
     char template[] = "/tmp/elfuse-memfd-XXXXXX";
     int fd = mkstemp(template);
     if (fd < 0)
@@ -1293,9 +1300,10 @@ static int64_t sc_memfd_create(guest_t *g,
         close(fd);
         return linux_errno();
     }
-    if ((int) x1 & 1)
+    if (flags & LINUX_MFD_CLOEXEC)
         fd_table[gfd].linux_flags |= LINUX_O_CLOEXEC;
-    fd_table[gfd].seals = ((int) x1 & 2) ? 0 : LINUX_F_SEAL_SEAL;
+    fd_table[gfd].seals =
+        (flags & LINUX_MFD_ALLOW_SEALING) ? 0 : LINUX_F_SEAL_SEAL;
     return gfd;
 }
 

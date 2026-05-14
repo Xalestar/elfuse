@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+"""Best-effort syscall coverage audit for dispatch.tbl against tests/."""
+
+from __future__ import annotations
+
+import pathlib
+import re
+import sys
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+DISPATCH = ROOT / "src" / "syscall" / "dispatch.tbl"
+TESTS = ROOT / "tests"
+
+ENTRY_RE = re.compile(r"^(SYS_[A-Za-z0-9_]+)\s+(sc_[A-Za-z0-9_]+)\s+([01])$")
+
+ALIASES: dict[str, set[str]] = {
+    "faccessat": {"faccessat2"},
+    "renameat": {"renameat2"},
+    # Linux syscall name vs. libc wrapper name. On 64-bit aarch64 each
+    # entry on the left is the dispatch.tbl entry; the entries on the
+    # right are libc function names that route through that syscall.
+    "pread64": {"pread"},
+    "pwrite64": {"pwrite"},
+    "epoll_pwait": {"epoll_wait"},
+    "eventfd2": {"eventfd"},
+    "rt_sigaction": {"sigaction"},
+    "rt_sigprocmask": {"sigprocmask"},
+    "signalfd4": {"signalfd"},
+}
+
+INDIRECT_COVERAGE: dict[str, str] = {
+    "getxattr": "Covered indirectly through xattr plumbing and O_PATH rejection paths.",
+    "lgetxattr": "Symlink xattr semantics are filesystem-sensitive; audit via fs-xattr code and negative-path tests.",
+    "lsetxattr": "Symlink xattr semantics are filesystem-sensitive; audit via fs-xattr code and negative-path tests.",
+    "listxattr": "Covered indirectly through xattr plumbing; success-path coverage is filesystem-dependent.",
+    "llistxattr": "Symlink xattr list semantics are filesystem-sensitive; retained as indirect coverage.",
+    "flistxattr": "Covered indirectly through xattr plumbing and fd-based xattr checks.",
+    "fgetxattr": "Covered indirectly through xattr plumbing and fd-based xattr checks.",
+    "lremovexattr": "Symlink xattr semantics are filesystem-sensitive; retained as indirect coverage.",
+    "rt_sigsuspend": "Signal suspension is exercised by higher-level signal tests; direct raw coverage is timing-sensitive.",
+    "rt_sigpending": "Signal pending state is exercised indirectly by the signal suite.",
+    "ptrace": "Covered by debugger integration via tests/test-gdbstub.sh.",
+    "chroot": "Exercised only by the dynamic coreutils shell suite via the chroot(8) applet; the syscall itself has no dedicated C test (requires elevated privilege).",
+    "truncate": "Only ftruncate(2) is exercised directly; path-based truncate is exercised by coreutils 'truncate' applet in shell suites.",
+    "rt_sigreturn": "Kernel-only return-from-handler trampoline; invoked implicitly by every signal handler exit. No userspace callers.",
+    "exit_group": "Invoked implicitly by glibc/musl _exit() and exit(); every test process exits through this syscall.",
+    "get_robust_list": "Pthread-internal: glibc may set/get a robust-list pointer transparently during thread setup; rarely called directly by application code.",
+    "set_robust_list": "Pthread-internal: glibc and musl issue set_robust_list during thread bring-up via a path that the audit corpus does not call directly.",
+    "readlinkat": "Exercised indirectly through libc readlink() and the proc/openat symlink-resolution paths in test-procfs-exec; no direct readlinkat() call in C tests.",
+    "faccessat": "Exercised indirectly through libc access() and the coreutils suite (test, ls, cp); faccessat2 has no direct call-shape match either.",
+}
+
+
+def load_dispatch_names() -> list[str]:
+    names: list[str] = []
+    for line in DISPATCH.read_text(encoding="utf-8").splitlines():
+        match = ENTRY_RE.match(line.strip())
+        if match:
+            names.append(match.group(1)[4:])
+    return names
+
+
+C_SUFFIXES = (".c", ".h")
+
+_BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
+_LINE_COMMENT = re.compile(r"//[^\n]*")
+
+
+def strip_c_comments(text: str) -> str:
+    """Drop C block and line comments. Required before the call-shape
+    regex below so that mentions like "// TODO: test sync(2)" cannot
+    falsely cover a syscall.
+    """
+    text = _BLOCK_COMMENT.sub(" ", text)
+    text = _LINE_COMMENT.sub(" ", text)
+    return text
+
+
+def load_test_corpora() -> tuple[str, str]:
+    """Return (c_corpus, other_corpus). Splitting matters because shell
+    scripts that invoke coreutils applets ("run sync 0", "run kill ...")
+    would otherwise falsely cover the like-named syscalls. C corpus is
+    fed through strip_c_comments() so commented-out syscalls cannot
+    claim coverage either.
+    """
+    c_chunks: list[str] = []
+    other_chunks: list[str] = []
+    for path in sorted(TESTS.rglob("*")):
+        if not path.is_file():
+            continue
+        text = path.read_text(encoding="utf-8", errors="ignore")
+        if path.suffix in C_SUFFIXES:
+            c_chunks.append(strip_c_comments(text))
+        else:
+            other_chunks.append(text)
+    return "\n".join(c_chunks), "\n".join(other_chunks)
+
+
+def has_direct_reference(name: str, c_corpus: str, other_corpus: str) -> bool:
+    # C: require call-shape ("name(") or an explicit syscall-number macro.
+    # That covers libc wrappers (open(...), read(...), ...) and direct
+    # syscall(SYS_*, ...) uses, while rejecting bare-word occurrences in
+    # comments, TEST() labels, and error messages like FAIL("child sync recv").
+    # Non-C corpus (shell, Python): only count explicit syscall-number
+    # macros. Coreutils applet names share words with syscalls (sync, kill,
+    # chroot, chmod) and "name(" rarely makes sense in those files anyway.
+    c_patterns = [
+        rf"\b{name}\s*\(",
+        rf"\bSYS_{name}\b",
+        rf"\b__NR_{name}\b",
+    ]
+    other_patterns = [
+        rf"\bSYS_{name}\b",
+        rf"\b__NR_{name}\b",
+    ]
+    if any(re.search(p, c_corpus) for p in c_patterns):
+        return True
+    return any(re.search(p, other_corpus) for p in other_patterns)
+
+
+def main() -> int:
+    c_corpus, other_corpus = load_test_corpora()
+    missing: list[str] = []
+
+    for name in load_dispatch_names():
+        if has_direct_reference(name, c_corpus, other_corpus):
+            continue
+        if any(
+            has_direct_reference(alias, c_corpus, other_corpus)
+            for alias in ALIASES.get(name, set())
+        ):
+            continue
+        if name in INDIRECT_COVERAGE:
+            continue
+        missing.append(name)
+
+    if missing:
+        print("Uncovered syscalls in dispatch.tbl:", file=sys.stderr)
+        for name in missing:
+            print(f"  - {name}", file=sys.stderr)
+        return 1
+
+    print("syscall coverage audit: PASS")
+    for name, reason in sorted(INDIRECT_COVERAGE.items()):
+        print(f"  indirect {name}: {reason}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

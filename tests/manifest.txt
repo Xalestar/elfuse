@@ -44,6 +44,7 @@ test-socket
 test-file-ops
 test-sysinfo
 test-io-opt
+test-syscall-smoke
 test-poll                      # diff=skip
 
 [section] I/O subsystem tests
@@ -94,6 +95,10 @@ test-opath
 [section] Guard page / mmap edge cases
 test-guard-page
 test-mmap-hint
+
+[section] Low-base ET_EXEC memory regression tests
+test-lowbase-mem-200000
+test-lowbase-mem-300000
 
 [section] mremap tests
 test-mremap

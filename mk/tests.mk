@@ -1,6 +1,6 @@
 # Test targets
 
-.PHONY: test-hello test-all check test-gdbstub test-coreutils test-busybox \
+.PHONY: test-hello test-all check check-syscall-coverage test-gdbstub test-coreutils test-busybox \
         test-static-bins \
         test-dynamic test-dynamic-coreutils test-glibc-dynamic \
         test-glibc-coreutils test-perf \
@@ -15,8 +15,12 @@ test-hello: $(ELFUSE_BIN) $(TEST_HELLO_DEP)
 	@printf "$(BLUE)▸ Running$(RESET) test-hello\n"
 	$(ELFUSE_BIN) $(TEST_DIR)/test-hello
 
+## Verify dispatch.tbl coverage of the kernel-supported syscall set
+check-syscall-coverage:
+	@python3 scripts/check-syscall-coverage.py
+
 ## Run the unit test suite plus busybox applet validation
-check: $(ELFUSE_BIN) $(TEST_DEPS)
+check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage
 	@bash tests/driver.sh -e $(ELFUSE_BIN) -d $(TEST_DIR) -v
 	@printf "\n$(BLUE)━━━ proctitle low-stack regression ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-proctitle-low-stack
@@ -124,7 +128,7 @@ test-coreutils: $(ELFUSE_BIN)
 		exit 1; \
 	fi
 	@if [ "$(COREUTILS_BIN)" = "$(FIXTURES_DIR)/aarch64-musl/dyn-bin" ]; then \
-		bash tests/test-coreutils-smoke.sh $(ELFUSE_BIN) $(COREUTILS_BIN) $(SYSROOT_DIR); \
+		COREUTILS_PROFILE=smoke bash tests/test-coreutils.sh $(ELFUSE_BIN) $(COREUTILS_BIN) $(SYSROOT_DIR); \
 	elif [ -n "$(SYSROOT_DIR)" ] && [ -d "$(SYSROOT_DIR)" ]; then \
 		bash tests/test-coreutils.sh $(ELFUSE_BIN) $(COREUTILS_BIN) $(SYSROOT_DIR); \
 	else \
@@ -270,7 +274,7 @@ test-dynamic-coreutils: $(ELFUSE_BIN)
 		exit 1; \
 	fi
 	@if [ "$(DYNAMIC_COREUTILS_BIN)" = "$(FIXTURES_DIR)/aarch64-musl/dyn-bin" ]; then \
-		bash tests/test-coreutils-smoke.sh $(ELFUSE_BIN) $(DYNAMIC_COREUTILS_BIN) $(SYSROOT_DIR); \
+		COREUTILS_PROFILE=smoke bash tests/test-dynamic-coreutils.sh $(ELFUSE_BIN) $(SYSROOT_DIR) $(DYNAMIC_COREUTILS_BIN); \
 	else \
 		bash tests/test-dynamic-coreutils.sh $(ELFUSE_BIN) $(SYSROOT_DIR) $(DYNAMIC_COREUTILS_BIN); \
 	fi

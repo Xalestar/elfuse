@@ -28,6 +28,96 @@ coreutils_populate_fixtures()
     ln -s "$tmpdir/hello.txt" "$tmpdir/symlink.txt"
 }
 
+coreutils_file_mode()
+{
+    if stat -f '%Lp' -- "$1" > /dev/null 2>&1; then
+        stat -f '%Lp' -- "$1"
+    else
+        stat -c '%a' -- "$1"
+    fi
+}
+
+coreutils_file_size()
+{
+    if stat -f '%z' -- "$1" > /dev/null 2>&1; then
+        stat -f '%z' -- "$1"
+    else
+        stat -c '%s' -- "$1"
+    fi
+}
+
+coreutils_assert_exists()
+{
+    local label="${1:?missing label}" path="${2:?missing path}"
+    check_host "$label" test -e "$path"
+}
+
+coreutils_assert_not_exists()
+{
+    local label="${1:?missing label}" path="${2:?missing path}"
+    check_host "$label" test ! -e "$path"
+}
+
+coreutils_assert_fifo()
+{
+    local label="${1:?missing label}" path="${2:?missing path}"
+    check_host "$label" test -p "$path"
+}
+
+coreutils_assert_symlink_target()
+{
+    local label="${1:?missing label}" path="${2:?missing path}" expected="${3:?missing expected}"
+    local got
+    got=$(readlink -- "$path" 2> /dev/null || true)
+    if [ "$got" = "$expected" ]; then
+        test_report ok "$label"
+        pass=$((pass + 1))
+    else
+        test_report fail "$label"
+        fail=$((fail + 1))
+    fi
+}
+
+coreutils_assert_file_equals()
+{
+    local label="${1:?missing label}" path="${2:?missing path}" expected="${3:?missing expected}"
+    check_host "$label" cmp -s -- "$path" "$expected"
+}
+
+coreutils_assert_mode()
+{
+    local label="${1:?missing label}" path="${2:?missing path}" expected="${3:?missing expected}"
+    local got
+    got=$(coreutils_file_mode "$path" 2> /dev/null || true)
+    if [ "$got" = "$expected" ]; then
+        test_report ok "$label"
+        pass=$((pass + 1))
+    else
+        test_report fail "$label"
+        fail=$((fail + 1))
+    fi
+}
+
+coreutils_assert_size()
+{
+    local label="${1:?missing label}" path="${2:?missing path}" expected="${3:?missing expected}"
+    local got
+    got=$(coreutils_file_size "$path" 2> /dev/null || true)
+    if [ "$got" = "$expected" ]; then
+        test_report ok "$label"
+        pass=$((pass + 1))
+    else
+        test_report fail "$label"
+        fail=$((fail + 1))
+    fi
+}
+
+coreutils_assert_contains()
+{
+    local label="${1:?missing label}" path="${2:?missing path}" pattern="${3:?missing pattern}"
+    check_host "$label" grep -qE -- "$pattern" "$path"
+}
+
 coreutils_print_suite_header()
 {
     local title="${1:?missing title}"
