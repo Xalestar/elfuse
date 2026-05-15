@@ -27,6 +27,7 @@
 #include "runtime/procemu.h"
 
 #include "syscall/abi.h"
+#include "syscall/fuse.h"
 #include "syscall/fs.h"
 #include "syscall/internal.h"
 #include "syscall/net.h" /* absock_unregister_fd */
@@ -223,6 +224,11 @@ static int64_t read_translated_path(guest_t *g,
     return 0;
 }
 
+static int64_t reject_unsupported_fuse_path_op(const path_translation_t *tx)
+{
+    return tx && tx->fuse_path ? -LINUX_ENOSYS : INT64_MIN;
+}
+
 /* open/close. */
 
 int64_t sys_openat_path(guest_t *g,
@@ -261,8 +267,8 @@ int64_t sys_openat_path(guest_t *g,
         return linux_errno();
 
     int flags = translate_open_flags(linux_flags);
-    if (tx.proc_resolved == 0 && dirfd == LINUX_AT_FDCWD && pathp[0] != '/' &&
-        !proc_get_sysroot()) {
+    if (!tx.fuse_path && tx.proc_resolved == 0 && dirfd == LINUX_AT_FDCWD &&
+        pathp[0] != '/' && !proc_get_sysroot()) {
         int host_fd = openat(AT_FDCWD, pathp, flags, mode);
         if (host_fd < 0)
             return linux_errno();
@@ -282,6 +288,12 @@ int64_t sys_openat_path(guest_t *g,
 
     /* Intercept /proc and /dev paths before touching the host filesystem */
     if (path_might_use_open_intercept(tx.intercept_path)) {
+        if (!strcmp(tx.intercept_path, "/dev/fuse"))
+            return fuse_proc_open(linux_flags);
+        int64_t fuse_fd =
+            fuse_open_path(g, tx.intercept_path, linux_flags, mode);
+        if (fuse_fd != INT64_MIN)
+            return fuse_fd;
         int intercepted =
             proc_intercept_open(g, tx.intercept_path, linux_flags, mode);
         if (intercepted >= 0) {
@@ -445,6 +457,13 @@ static int duplicate_guest_fd(int src_fd,
                               bool fixed_slot,
                               int linux_flags)
 {
+    if (RANGE_CHECK(src_fd, 0, FD_TABLE_SIZE)) {
+        int t = fd_table[src_fd].type;
+        if (t == FD_FUSE_DEV || t == FD_FUSE_FILE || t == FD_FUSE_DIR)
+            return fuse_dup_fd(src_fd, min_guest_fd, fixed_guest_fd, fixed_slot,
+                               linux_flags);
+    }
+
     host_fd_ref_t host_ref;
     if (host_fd_ref_open(src_fd, &host_ref) < 0) {
         errno = EBADF;
@@ -531,6 +550,10 @@ int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg)
     if (!RANGE_CHECK(fd, 0, FD_TABLE_SIZE))
         return -LINUX_EBADF;
 
+    int fd_type = fd_table[fd].type;
+    bool fuse_fd = (fd_type == FD_FUSE_DEV || fd_type == FD_FUSE_FILE ||
+                    fd_type == FD_FUSE_DIR);
+
     /* Linux F_DUPFD=0, F_GETFD=1, F_SETFD=2, F_GETFL=3, F_SETFL=4,
      * F_DUPFD_CLOEXEC=1030
      */
@@ -547,6 +570,8 @@ int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg)
         if (gfd < 0) {
             if (errno == EBADF)
                 return -LINUX_EBADF;
+            if (errno == EOPNOTSUPP)
+                return -LINUX_EOPNOTSUPP;
             return -LINUX_EMFILE;
         }
         return gfd;
@@ -561,6 +586,8 @@ int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg)
             fd_table[fd].linux_flags &= ~LINUX_O_CLOEXEC;
         return 0;
     case 3: { /* F_GETFL */
+        if (fuse_fd)
+            return fd_table[fd].linux_flags;
         fd_entry_t snap;
         if (!fd_snapshot(fd, &snap))
             return -LINUX_EBADF;
@@ -582,6 +609,18 @@ int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg)
     }
     case 4: /* F_SETFL */
     {
+        if (fuse_fd) {
+            int preserved =
+                fd_table[fd].linux_flags &
+                (LINUX_O_CLOEXEC | LINUX_O_PATH | LINUX_O_DIRECTORY |
+                 LINUX_O_NOFOLLOW | LINUX_O_DIRECT | LINUX_O_LARGEFILE);
+            fd_table[fd].linux_flags =
+                preserved |
+                ((int) arg &
+                 ~(LINUX_O_CLOEXEC | LINUX_O_PATH | LINUX_O_DIRECTORY |
+                   LINUX_O_NOFOLLOW | LINUX_O_DIRECT | LINUX_O_LARGEFILE));
+            return 0;
+        }
         host_fd_ref_t host_ref;
         if (host_fd_ref_open(fd, &host_ref) < 0)
             return -LINUX_EBADF;
@@ -736,6 +775,8 @@ int64_t sys_getdents64(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
         return -LINUX_EBADF;
     if (fd_table[fd].type == FD_CLOSED)
         return -LINUX_EBADF;
+    if (fuse_is_dir_fd(fd))
+        return fuse_getdents64(g, fd, buf_gva, count);
     /* Linux: getdents on an O_PATH fd returns EBADF, even when the underlying
      * inode is a directory. The early gate keeps the next NOTDIR fallback
      * specific to non-directory regular fds.
@@ -840,6 +881,21 @@ int64_t sys_chdir(guest_t *g, uint64_t path_gva)
         return 0;
     }
 
+    if (tx.intercept_path && fuse_path_matches_mount(tx.intercept_path)) {
+        struct stat st;
+        /* chdir() always follows symlinks, so do not pass AT_SYMLINK_NOFOLLOW.
+         */
+        int stat_rc = fuse_stat_path(tx.intercept_path, &st, 0);
+        if (stat_rc < 0)
+            return stat_rc;
+        if (!S_ISDIR(st.st_mode))
+            return -LINUX_ENOTDIR;
+        if (chdir(tx.host_path) < 0)
+            return linux_errno();
+        proc_cwd_set_virtual(tx.intercept_path);
+        return 0;
+    }
+
     if (chdir(tx.host_path) < 0)
         return linux_errno();
 
@@ -850,6 +906,10 @@ int64_t sys_chdir(guest_t *g, uint64_t path_gva)
 
 int64_t sys_fchdir(int fd)
 {
+    int64_t fuse_rc = fuse_fchdir(fd);
+    if (fuse_rc != INT64_MIN)
+        return fuse_rc;
+
     host_fd_ref_t host_ref;
     if (host_fd_ref_open(fd, &host_ref) < 0)
         return -LINUX_EBADF;
@@ -943,6 +1003,10 @@ int64_t sys_pipe2(guest_t *g, uint64_t fds_gva, int linux_flags)
 
 int64_t sys_lseek(int fd, int64_t offset, int whence)
 {
+    int64_t frc = fuse_lseek_fd(fd, offset, whence);
+    if (frc != INT64_MIN)
+        return frc;
+
     host_fd_ref_t host_ref;
     int64_t err = host_fd_ref_open_io(fd, &host_ref);
     if (err < 0)
@@ -984,6 +1048,9 @@ int64_t sys_readlinkat(guest_t *g,
     }
     /* intercepted == PROC_NOT_INTERCEPTED: fall through */
 
+    if (tx.fuse_path)
+        return -LINUX_ENOSYS;
+
     host_fd_ref_t dir_ref;
     if (host_dirfd_ref_open(dirfd, &dir_ref) < 0)
         return -LINUX_EBADF;
@@ -1018,6 +1085,9 @@ int64_t sys_unlinkat(guest_t *g, int dirfd, uint64_t path_gva, int flags)
     int64_t rc =
         read_translated_path(g, dirfd, path_gva, PATH_TR_CREATE, path, &tx);
     if (rc < 0)
+        return rc;
+    rc = reject_unsupported_fuse_path_op(&tx);
+    if (rc != INT64_MIN)
         return rc;
 
     host_fd_ref_t dir_ref;
@@ -1065,6 +1135,9 @@ int64_t sys_mkdirat(guest_t *g, int dirfd, uint64_t path_gva, int mode)
     int64_t rc = read_translated_path(
         g, dirfd, path_gva, PATH_TR_CREATE | PATH_TR_CREATE_PARENTS, path, &tx);
     if (rc < 0)
+        return rc;
+    rc = reject_unsupported_fuse_path_op(&tx);
+    if (rc != INT64_MIN)
         return rc;
 
     host_fd_ref_t dir_ref;
@@ -1119,6 +1192,8 @@ int64_t sys_renameat2(guest_t *g,
     if (path_translate_at(olddirfd, oldpath, PATH_TR_NONE, &old_tx) < 0 ||
         path_translate_at(newdirfd, newpath, PATH_TR_CREATE, &new_tx) < 0)
         return linux_errno();
+    if (old_tx.fuse_path || new_tx.fuse_path)
+        return -LINUX_ENOSYS;
 
     host_fd_ref_t olddir_ref, newdir_ref;
     if (host_dirfd_ref_open(olddirfd, &olddir_ref) < 0)
@@ -1202,6 +1277,9 @@ int64_t sys_mknodat(guest_t *g, int dirfd, uint64_t path_gva, int mode, int dev)
         g, dirfd, path_gva, PATH_TR_CREATE | PATH_TR_CREATE_PARENTS, path, &tx);
     if (rc < 0)
         return rc;
+    rc = reject_unsupported_fuse_path_op(&tx);
+    if (rc != INT64_MIN)
+        return rc;
 
     host_fd_ref_t dir_ref;
     if (host_dirfd_ref_open(dirfd, &dir_ref) < 0)
@@ -1246,6 +1324,9 @@ int64_t sys_symlinkat(guest_t *g,
                                       linkpath, &tx);
     if (rc < 0)
         return rc;
+    rc = reject_unsupported_fuse_path_op(&tx);
+    if (rc != INT64_MIN)
+        return rc;
 
     host_fd_ref_t dir_ref;
     if (host_dirfd_ref_open(dirfd, &dir_ref) < 0)
@@ -1285,6 +1366,8 @@ int64_t sys_linkat(guest_t *g,
     if (path_translate_at(olddirfd, oldpath, PATH_TR_NONE, &old_tx) < 0 ||
         path_translate_at(newdirfd, newpath, PATH_TR_CREATE, &new_tx) < 0)
         return linux_errno();
+    if (old_tx.fuse_path || new_tx.fuse_path)
+        return -LINUX_ENOSYS;
 
     host_fd_ref_t olddir_ref, newdir_ref;
     if (host_dirfd_ref_open(olddirfd, &olddir_ref) < 0)
@@ -1318,6 +1401,17 @@ int64_t sys_faccessat(guest_t *g,
         char dot_path[2];
         if (guest_read_small(g, path_gva, dot_path, sizeof(dot_path)) == 0 &&
             dot_path[0] == '.' && dot_path[1] == '\0') {
+            proc_cwd_view_t view;
+            if (proc_acquire_cwd_view(&view) == 0) {
+                if (view.path && view.path[0] == '/' &&
+                    fuse_path_matches_mount(view.path)) {
+                    char cwd_path[LINUX_PATH_MAX];
+                    str_copy_trunc(cwd_path, view.path, sizeof(cwd_path));
+                    proc_release_cwd_view(&view);
+                    return fuse_access_path(cwd_path, mode, flags);
+                }
+                proc_release_cwd_view(&view);
+            }
             int mac_flags = translate_faccessat_flags(flags);
             if (faccessat(AT_FDCWD, ".", mode, mac_flags) < 0)
                 return linux_errno();
@@ -1336,6 +1430,9 @@ int64_t sys_faccessat(guest_t *g,
 
     if (!validate_at_flags(flags, LINUX_AT_EACCESS | LINUX_AT_SYMLINK_NOFOLLOW))
         return -LINUX_EINVAL;
+
+    if (tx.fuse_path)
+        return fuse_access_path(tx.intercept_path, mode, flags);
 
     if (tx.proc_resolved == 0 && dirfd == LINUX_AT_FDCWD && path[0] != '/') {
         int mac_flags = translate_faccessat_flags(flags);
@@ -1421,6 +1518,9 @@ int64_t sys_truncate(guest_t *g, uint64_t path_gva, int64_t length)
                                       path, &tx);
     if (rc < 0)
         return rc;
+    rc = reject_unsupported_fuse_path_op(&tx);
+    if (rc != INT64_MIN)
+        return rc;
 
     if (truncate(tx.host_path, length) < 0)
         return linux_errno();
@@ -1462,6 +1562,9 @@ int64_t sys_fchmodat(guest_t *g,
         path, &tx);
     if (rc < 0)
         return rc;
+    rc = reject_unsupported_fuse_path_op(&tx);
+    if (rc != INT64_MIN)
+        return rc;
 
     host_fd_ref_t dir_ref;
     if (host_dirfd_ref_open(dirfd, &dir_ref) < 0)
@@ -1493,6 +1596,9 @@ int64_t sys_fchownat(guest_t *g,
         (flags & LINUX_AT_SYMLINK_NOFOLLOW) ? PATH_TR_NOFOLLOW : PATH_TR_NONE,
         path, &tx);
     if (rc < 0)
+        return rc;
+    rc = reject_unsupported_fuse_path_op(&tx);
+    if (rc != INT64_MIN)
         return rc;
 
     host_fd_ref_t dir_ref;
@@ -1551,6 +1657,11 @@ int64_t sys_utimensat(guest_t *g,
                                               : PATH_TR_NONE,
                                           path, &tx);
         if (rc < 0) {
+            host_fd_ref_close(&dir_ref);
+            return rc;
+        }
+        rc = reject_unsupported_fuse_path_op(&tx);
+        if (rc != INT64_MIN) {
             host_fd_ref_close(&dir_ref);
             return rc;
         }

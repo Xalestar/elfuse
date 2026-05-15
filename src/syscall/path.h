@@ -25,7 +25,9 @@ typedef struct {
     const char *intercept_path;
     const char *host_path;
     int proc_resolved;
+    bool fuse_path;
     char proc_path[LINUX_PATH_MAX];
+    char guest_buf[LINUX_PATH_MAX];
     char host_buf[LINUX_PATH_MAX];
 } path_translation_t;
 

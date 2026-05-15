@@ -21,7 +21,7 @@ enum {
 /* AArch64 instruction encoders.
  *
  * Three families share an encoding shape; the lists below drive a token-
- * pasted `a64_<name>` definition for each entry, eliminating the per-
+ * pasted a64_<name> definition for each entry, eliminating the per-
  * instruction boilerplate. Each encoder asserts its operand preconditions
  * so a bad caller surfaces immediately instead of silently emitting a
  * different (but still valid) instruction.

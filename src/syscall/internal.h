@@ -138,8 +138,9 @@ int64_t linux_errno(void);
  */
 int translate_at_flags(int linux_flags);
 
-/* Reject any flag bits outside `allowed`. Caller returns -LINUX_EINVAL on
- * failure. Shared by every *at() handler that validates its flags argument.
+/* Reject any flag bits outside the allowed mask. Caller returns
+ * -LINUX_EINVAL on failure. Shared by every *at() handler that validates
+ * its flags argument.
  */
 static inline int validate_at_flags(int flags, int allowed)
 {

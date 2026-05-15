@@ -23,6 +23,7 @@
 
 #include "runtime/thread.h"
 #include "syscall/abi.h"
+#include "syscall/fuse.h"
 #include "syscall/internal.h"
 #include "syscall/mem.h"
 
@@ -1176,6 +1177,9 @@ int64_t sys_mmap(guest_t *g,
     /* Linux requires page-aligned offset for file-backed mmap */
     if (!is_anon && (offset & 4095))
         return -LINUX_EINVAL;
+
+    if (!is_anon && fuse_fd_refuse_mmap(fd))
+        return -LINUX_ENODEV;
 
     /* Round length up to page size (overflow-safe) */
     if (length > UINT64_MAX - 4095)

@@ -36,6 +36,7 @@
 #define SYS_symlinkat 36
 #define SYS_linkat 37
 #define SYS_renameat 38
+#define SYS_mount 40
 #define SYS_truncate 45
 #define SYS_statfs 43
 #define SYS_fstatfs 44
@@ -278,12 +279,14 @@ typedef struct {
 #define LINUX_EBUSY 16
 #define LINUX_EEXIST 17
 #define LINUX_EXDEV 18
+#define LINUX_ENODEV 19
 #define LINUX_ENOTDIR 20
 #define LINUX_EINVAL 22
 #define LINUX_EMFILE 24
 #define LINUX_ENOTTY 25
 #define LINUX_EFBIG 27
 #define LINUX_ENOSPC 28
+#define LINUX_ESPIPE 29
 #define LINUX_ERANGE 34
 #define LINUX_EDEADLK 35
 #define LINUX_ENAMETOOLONG 36
@@ -629,6 +632,9 @@ typedef struct {
 #define FD_PATH 11
 #define FD_NETLINK 12
 #define FD_PIDFD 13
+#define FD_FUSE_DEV 14
+#define FD_FUSE_FILE 15
+#define FD_FUSE_DIR 16
 #define FD_VIRTUAL_PATH_MAX 64
 
 /* File sealing flags (F_SEAL_*) for memfd_create. Tracked per-FD. */

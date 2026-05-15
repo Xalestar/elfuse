@@ -379,11 +379,11 @@ static void test_einval(void)
 
     TEST("clock_nanosleep(bad clockid) -> EINVAL");
     {
-        /* Replaces an earlier "bad flags" probe that was unreliable: the
-         * Linux kernel's clock_nanosleep only validates `flags &
-         * TIMER_ABSTIME` and silently ignores other bits, so a raw-syscall
-         * flag check round-trips to glibc territory rather than the kernel.
-         * An invalid clockid is a real kernel-side error path.
+        /* Replaces an earlier "bad flags" probe that was unreliable: Linux's
+         * clock_nanosleep only validates the (flags & TIMER_ABSTIME) bit and
+         * silently ignores other bits, so a raw-syscall flag check round-trips
+         * to glibc territory rather than the kernel. An invalid clockid is a
+         * real kernel-side error path.
          */
         struct timespec ts = {.tv_sec = 0, .tv_nsec = 1};
         EXPECT_RAW_ERRNO(raw_syscall4(__NR_clock_nanosleep, 99 /* invalid */, 0,

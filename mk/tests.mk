@@ -8,7 +8,7 @@
         test-full test-multi-vcpu test-rwx test-sysroot-rename \
         test-case-collision test-case-collision-fallback test-sysroot-create-paths \
         test-proctitle-low-stack \
-        test-sysroot-procfs-exec test-timeout-disable \
+        test-sysroot-procfs-exec test-timeout-disable test-fuse-alpine \
         test-sysroot-nofollow test-sysroot-chdir perf
 
 ## Build and run the assembly hello world test
@@ -29,6 +29,8 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage
 	@$(MAKE) --no-print-directory test-busybox
 	@printf "\n$(BLUE)━━━ sysroot procfs exec validation ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-sysroot-procfs-exec
+	@printf "\n$(BLUE)━━━ Alpine sysroot FUSE validation ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-fuse-alpine
 	@printf "\n$(BLUE)━━━ timeout=0 validation ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-timeout-disable
 
@@ -296,6 +298,14 @@ test-dynamic: $(ELFUSE_BIN)
 	fi
 	@printf "$(BLUE)▸ Running$(RESET) dynamic hello-dynamic (--sysroot)\n"
 	$(ELFUSE_BIN) --sysroot $(SYSROOT_DIR) $(GUEST_DYNAMIC_TESTS)/bin/hello-dynamic
+
+## Run guest FUSE validation against the Alpine musl sysroot
+test-fuse-alpine: $(ELFUSE_BIN) $(BUILD_DIR)/test-fuse-basic
+	@if [ -z "$(SYSROOT_DIR)" ] || [ ! -d "$(SYSROOT_DIR)" ]; then \
+		printf "$(YELLOW)SKIP$(RESET) Alpine sysroot not found. Set SYSROOT_DIR=/path/to/sysroot or run tests/fetch-fixtures.sh.\n"; \
+		exit 0; \
+	fi
+	@bash tests/test-fuse-alpine.sh $(ELFUSE_BIN) $(SYSROOT_DIR) $(BUILD_DIR)/test-fuse-basic
 
 ## Run dynamically-linked coreutils tests (--sysroot)
 test-dynamic-coreutils: $(ELFUSE_BIN)

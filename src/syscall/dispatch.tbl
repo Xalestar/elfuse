@@ -60,6 +60,7 @@ SYS_symlinkat sc_symlinkat 1
 SYS_linkat sc_linkat 1
 SYS_renameat sc_renameat 1
 SYS_renameat2 sc_renameat2 1
+SYS_mount sc_mount 1
 SYS_readlinkat sc_readlinkat 1
 SYS_newfstatat sc_newfstatat 1
 SYS_fstat sc_fstat 0

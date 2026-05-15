@@ -36,6 +36,7 @@ SRCS := \
     syscall/translate.c \
     syscall/mem.c \
     syscall/path.c \
+    syscall/fuse.c \
     syscall/sidecar.c \
     syscall/fs.c \
     syscall/fs-stat.c \
@@ -146,6 +147,11 @@ $(BUILD_DIR)/%: tests/%.c | $(BUILD_DIR)
 
 # test-pthread needs -lpthread
 $(BUILD_DIR)/test-pthread: tests/test-pthread.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc -D_GNU_SOURCE -static -O2 -o $@ $< -lpthread
+
+# test-fuse-basic runs a guest daemon thread and consumer in one process
+$(BUILD_DIR)/test-fuse-basic: tests/test-fuse-basic.c | $(BUILD_DIR)
 	@echo "  CROSS   $< (with -lpthread)"
 	$(Q)$(CROSS_COMPILE)gcc -D_GNU_SOURCE -static -O2 -o $@ $< -lpthread
 

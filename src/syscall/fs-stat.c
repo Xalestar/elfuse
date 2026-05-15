@@ -14,6 +14,7 @@
 #include "runtime/procemu.h"
 
 #include "syscall/abi.h"
+#include "syscall/fuse.h"
 #include "syscall/fs.h"
 #include "syscall/internal.h"
 #include "syscall/path.h"
@@ -182,12 +183,26 @@ static int64_t stat_at_path(guest_t *g,
                         sizeof(path), &pathp) < 0)
         return -LINUX_EFAULT;
 
+    if (pathp[0] == '/' && fuse_path_matches_mount(pathp)) {
+        int frc = fuse_stat_path(pathp, mac_st, flags);
+        if (frc < 0)
+            return frc;
+        return 0;
+    }
+
     path_translation_t tx;
     if (path_translate_at(dirfd, pathp,
                           (flags & LINUX_AT_SYMLINK_NOFOLLOW) ? PATH_TR_NOFOLLOW
                                                               : PATH_TR_NONE,
                           &tx) < 0)
         return linux_errno();
+
+    if (tx.fuse_path) {
+        int frc = fuse_stat_path(tx.intercept_path, mac_st, flags);
+        if (frc < 0)
+            return frc;
+        return 0;
+    }
 
     if (tx.proc_resolved == 0 && dirfd == LINUX_AT_FDCWD && pathp[0] != '/' &&
         pathp[0] != '\0' && !proc_get_sysroot()) {
@@ -244,13 +259,21 @@ done:
 
 int64_t sys_fstat(guest_t *g, int fd, uint64_t stat_gva)
 {
+    struct stat mac_st;
+    int frc = fuse_fstat_fd(fd, &mac_st);
+    if (frc == 0) {
+        if (write_linux_stat(g, stat_gva, &mac_st) < 0)
+            return -LINUX_EFAULT;
+        return 0;
+    }
+    if (frc != -LINUX_EBADF)
+        return frc;
+
     host_fd_ref_t host_ref;
     if (host_fd_ref_open(fd, &host_ref) < 0) {
         log_debug("fstat(%d): invalid guest fd", fd);
         return -LINUX_EBADF;
     }
-
-    struct stat mac_st;
     if (fstat(host_ref.fd, &mac_st) < 0) {
         log_debug("fstat(%d->%d): host fstat failed errno=%d", fd, host_ref.fd,
                   errno);
@@ -297,6 +320,8 @@ int64_t sys_statfs(guest_t *g, uint64_t path_gva, uint64_t buf_gva)
     path_translation_t tx;
     if (path_translate_at(LINUX_AT_FDCWD, path, PATH_TR_NONE, &tx) < 0)
         return linux_errno();
+    if (tx.fuse_path)
+        return -LINUX_ENOSYS;
 
     struct statfs mac_st;
     if (statfs(tx.host_path, &mac_st) < 0)

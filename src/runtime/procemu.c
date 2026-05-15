@@ -49,6 +49,7 @@
 
 #include "syscall/abi.h"
 #include "syscall/fd.h"
+#include "syscall/fuse.h"
 #include "syscall/internal.h"
 #include "syscall/proc.h"
 #include "syscall/sys.h"
@@ -2000,6 +2001,7 @@ int proc_intercept_open(const guest_t *g,
             "\tproc\n"
             "\tsysfs\n"
             "\tdevtmpfs\n"
+            "\tfuse\n"
             "\text4\n"
             "\tvfat\n");
     }
@@ -2009,23 +2011,35 @@ int proc_intercept_open(const guest_t *g,
      * - type source super_options
      */
     if (!strcmp(path, "/proc/self/mountinfo")) {
-        return proc_emit_literal(
+        char buf[8192];
+        size_t off = (size_t) snprintf(
+            buf, sizeof(buf),
             "1 0 0:1 / / rw,relatime - ext4 /dev/root rw\n"
             "2 1 0:2 / /proc rw,nosuid,nodev,noexec - proc proc rw\n"
             "3 1 0:3 / /tmp rw,nosuid,nodev - tmpfs tmpfs rw\n"
             "4 1 0:4 / /dev rw,nosuid - devtmpfs devtmpfs rw\n"
             "5 4 0:5 / /dev/shm rw,nosuid,nodev - tmpfs tmpfs rw\n");
+        if (off >= sizeof(buf) ||
+            fuse_append_mountinfo(buf, sizeof(buf), &off) < 0)
+            return -1;
+        return proc_synthetic_fd(buf, off);
     }
 
     /* /proc/mounts, /etc/mtab -> synthetic mount table */
     if (!strcmp(path, "/proc/mounts") || !strcmp(path, "/proc/self/mounts") ||
         !strcmp(path, "/etc/mtab")) {
-        return proc_emit_literal(
-            "/ / ext4 rw,relatime 0 0\n"
-            "proc /proc proc rw,nosuid,nodev,noexec 0 0\n"
-            "tmpfs /tmp tmpfs rw,nosuid,nodev 0 0\n"
-            "devtmpfs /dev devtmpfs rw,nosuid 0 0\n"
-            "tmpfs /dev/shm tmpfs rw,nosuid,nodev 0 0\n");
+        char buf[8192];
+        size_t off =
+            (size_t) snprintf(buf, sizeof(buf),
+                              "/ / ext4 rw,relatime 0 0\n"
+                              "proc /proc proc rw,nosuid,nodev,noexec 0 0\n"
+                              "tmpfs /tmp tmpfs rw,nosuid,nodev 0 0\n"
+                              "devtmpfs /dev devtmpfs rw,nosuid 0 0\n"
+                              "tmpfs /dev/shm tmpfs rw,nosuid,nodev 0 0\n");
+        if (off >= sizeof(buf) ||
+            fuse_append_mounts(buf, sizeof(buf), &off) < 0)
+            return -1;
+        return proc_synthetic_fd(buf, off);
     }
 
     /* OOM nodes share one stored adjustment.
@@ -2114,12 +2128,15 @@ int proc_intercept_open(const guest_t *g,
             }
         }
 
+        int mnt_id = 0;
+        if (fuse_fd_mnt_id(n, &mnt_id) < 0)
+            mnt_id = 0;
         return proc_emit_fmt(
             "pos:\t%lld\n"
             "flags:\t0%o\n"
-            "mnt_id:\t0\n"
+            "mnt_id:\t%d\n"
             "%s",
-            (long long) pos, snap.linux_flags, extra);
+            (long long) pos, snap.linux_flags, mnt_id, extra);
     }
 
     /* /proc/self/fdinfo -> directory listing. Each open gets its own scratch
@@ -2367,6 +2384,9 @@ int proc_intercept_stat(const char *path, struct stat *st)
      * irrelevant here; callers need stat to succeed before opening the
      * synthetic file.
      */
+    if (!strcmp(path, "/dev/fuse"))
+        return fuse_proc_stat(st);
+
     /* /dev/shm is a directory */
     if (!strcmp(path, "/dev/shm") || !strcmp(path, "/dev/shm/")) {
         stat_fill_proc_dir(st, 01777, 2,

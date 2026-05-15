@@ -17,6 +17,7 @@
 #include "utils.h"
 
 #include "syscall/abi.h"
+#include "syscall/fuse.h"
 #include "syscall/path.h"
 #include "syscall/proc.h"
 #include "syscall/sidecar.h"
@@ -50,6 +51,8 @@ bool path_might_use_open_intercept(const char *path)
         return true;
     if (!strncmp(path, "/dev", 4))
         return true;
+    if (fuse_path_matches_mount(path))
+        return true;
     if (path_prefix_match(path, SYSFS_CPU_PREFIX, sizeof(SYSFS_CPU_PREFIX) - 1))
         return true;
     if (!strcmp(path, "/etc/mtab") || !strcmp(path, "/etc/passwd") ||
@@ -69,6 +72,10 @@ bool path_might_use_stat_intercept(const char *path)
     if (!strncmp(path, "/proc", 5))
         return true;
     if (!strncmp(path, "/dev/shm", 8))
+        return true;
+    if (!strcmp(path, "/dev/fuse"))
+        return true;
+    if (fuse_path_matches_mount(path))
         return true;
     if (path_prefix_match(path, SYSFS_CPU_PREFIX, sizeof(SYSFS_CPU_PREFIX) - 1))
         return true;
@@ -149,6 +156,16 @@ int path_translate_at(guest_fd_t dirfd,
     if (tx->proc_resolved > 0) {
         tx->guest_path = tx->proc_path;
         tx->intercept_path = tx->proc_path;
+    } else {
+        int fuse_rc = fuse_resolve_at_path(dirfd, path, tx->guest_buf,
+                                           sizeof(tx->guest_buf));
+        if (fuse_rc < 0)
+            return -1;
+        if (fuse_rc > 0) {
+            tx->guest_path = tx->guest_buf;
+            tx->intercept_path = tx->guest_buf;
+            tx->fuse_path = true;
+        }
     }
 
     errno = 0;

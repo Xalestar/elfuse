@@ -48,6 +48,8 @@ What they do:
   downloaded into `build/busybox` on first run.
 - `make test-busybox`: just the BusyBox suite, useful when iterating on a
   single applet failure without rerunning the unit suite
+- `make test-fuse-alpine`: validate guest `/dev/fuse` + `mount("fuse")`
+  against the Alpine musl sysroot fixture
 - `make test-gdbstub`: debugger integration checks against the built-in GDB stub
 - `make test-matrix`: broader `elfuse` and QEMU cross-check
 - `make lint`: static analysis through `clang-tidy`
@@ -61,7 +63,7 @@ make elfuse
 make check
 ```
 
-For changes that touch procfs, path handling, networking, dynamic linking, or
+For changes that touch procfs, path handling, `/dev`, FUSE, networking, dynamic linking, or
 guest process semantics, run the matrix as well:
 
 ```sh

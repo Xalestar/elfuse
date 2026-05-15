@@ -314,9 +314,9 @@ static inline void guest_pt_gen_bump(guest_t *g)
  * a synchronous IPI into a sibling vCPU thread, so the window remains.
  * The guest is responsible for serializing concurrent PT mutations
  * against concurrent accesses (futex / pthread_mutex), which is the same
- * contract real Linux requires of well-behaved multi-threaded code. See
- * TODO.md "Bounded retry on stale TLB data abort" (P3 hardening) for the
- * tracked follow-up if a workload ever surfaces an actual reproducer.
+ * contract real Linux requires of well-behaved multi-threaded code. A
+ * bounded-retry on stale-TLB data aborts is a known hardening direction
+ * if a workload ever surfaces an actual reproducer.
  */
 extern _Thread_local tlbi_request_t cpu_tlbi_req;
 

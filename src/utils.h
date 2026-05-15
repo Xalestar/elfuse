@@ -45,7 +45,7 @@
 
 /* Branchless range check: true when minx <= x < minx + size.
  *
- * Replaces the recurring pair `x >= minx && x < minx + size` with a single
+ * Replaces the recurring pair (x >= minx && x < minx + size) with a single
  * unsigned compare: shift x into a [0, size) window and let unsigned
  * wraparound flag both underflow (x < minx) and overflow (x >= minx + size).
  * Width-safe for any operand up to uint64_t.
@@ -188,7 +188,7 @@ static inline void timespec_deadline_in_ms(struct timespec *out, long rel_ms)
  * the word and pass the bit position within it. Centralizing the shift and
  * compiler-intrinsic calls here keeps the meaning ("the bit for slot N",
  * "lowest set bit") visible at the call site instead of leaving readers to
- * decode `1ULL << (n)` and `__builtin_ctzll`.
+ * decode 1ULL << (n) and __builtin_ctzll.
  */
 
 /* The bit value for position n (0..63). n is evaluated once. */
@@ -218,6 +218,6 @@ static inline int bit_popcount64(uint64_t word)
  *
  * PACKED removes inter-field padding, used for Linux ABI structures whose
  * layout must match the kernel exactly (e.g., linux_dirent64). Apply at the
- * end of a struct definition: `} PACKED name_t;`.
+ * end of a struct definition: } PACKED name_t;.
  */
 #define PACKED __attribute__((packed))

@@ -46,6 +46,7 @@
 #include "syscall/abi.h"
 #include "syscall/exec.h"
 #include "syscall/fd.h"
+#include "syscall/fuse.h"
 #include "syscall/fs.h"
 #include "syscall/inotify.h"
 #include "syscall/internal.h"
@@ -94,6 +95,7 @@ void syscall_init(void)
     timerfd_init();
     inotify_init();
     netlink_init();
+    fuse_init();
     wakeup_pipe_init();
 }
 
@@ -202,6 +204,7 @@ SC_FORWARD(sc_readlinkat,  sys_readlinkat(g, (int) x0, x1, x2, x3))
 SC_FORWARD(sc_mknodat,     sys_mknodat(g, (int) x0, x1, (int) x2, (int) x3))
 SC_FORWARD(sc_symlinkat,   sys_symlinkat(g, x0, (int) x1, x2))
 SC_FORWARD(sc_linkat,      sys_linkat(g, (int) x0, x1, (int) x2, x3, (int) x4))
+SC_FORWARD(sc_mount,       sys_mount(g, x0, x1, x2, (unsigned long) x3, x4))
 SC_FORWARD(sc_fchmod,      sys_fchmod((int) x0, (uint32_t) x1))
 
 /* Linux fchmodat (SYS 53) is 3-arg: dirfd, path, mode.

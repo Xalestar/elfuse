@@ -29,6 +29,7 @@
 
 #include "syscall/abi.h"
 #include "syscall/fd.h"
+#include "syscall/fuse.h"
 #include "syscall/internal.h"
 #include "syscall/inotify.h"
 #include "syscall/io.h"
@@ -591,8 +592,12 @@ static int64_t io_write_result(ssize_t ret)
 
 int64_t sys_write(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
 {
-    if (RANGE_CHECK(fd, 0, FD_TABLE_SIZE) && fd_table[fd].type == FD_EVENTFD)
-        return eventfd_write(fd, g, buf_gva, count);
+    if (RANGE_CHECK(fd, 0, FD_TABLE_SIZE)) {
+        if (fd_table[fd].type == FD_FUSE_DEV)
+            return fuse_dev_write(g, fd, buf_gva, count);
+        if (fd_table[fd].type == FD_EVENTFD)
+            return eventfd_write(fd, g, buf_gva, count);
+    }
 
     host_fd_ref_t host_ref;
     int64_t err = host_fd_ref_open_checked(fd, &host_ref, true);
@@ -640,6 +645,10 @@ int64_t sys_write(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
 int64_t sys_read(guest_t *g, int fd, uint64_t buf_gva, uint64_t count)
 {
     if (RANGE_CHECK(fd, 0, FD_TABLE_SIZE)) {
+        if (fd_table[fd].type == FD_FUSE_DEV)
+            return fuse_dev_read(fd, g, buf_gva, count);
+        if (fd_table[fd].type == FD_FUSE_FILE)
+            return fuse_read_fd(g, fd, buf_gva, count);
         if (fd_table[fd].type == FD_EVENTFD)
             return eventfd_read(fd, g, buf_gva, count);
         if (fd_table[fd].type == FD_SIGNALFD)
@@ -694,6 +703,9 @@ int64_t sys_pread64(guest_t *g,
                     uint64_t count,
                     int64_t offset)
 {
+    if (fuse_is_file_fd(fd))
+        return fuse_pread_fd(g, fd, buf_gva, count, offset);
+
     host_fd_ref_t host_ref;
     int64_t err = host_fd_ref_open_regular_io(fd, &host_ref);
     if (err < 0)

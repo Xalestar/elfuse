@@ -83,6 +83,8 @@ int64_t sys_getxattr(guest_t *g,
     if (path_translate_at(LINUX_AT_FDCWD, path,
                           nofollow ? PATH_TR_NOFOLLOW : PATH_TR_NONE, &tx) < 0)
         return linux_errno();
+    if (tx.fuse_path)
+        return -LINUX_ENOSYS;
 
     int opts = nofollow ? XATTR_NOFOLLOW : 0;
 
@@ -120,6 +122,8 @@ int64_t sys_setxattr(guest_t *g,
     if (path_translate_at(LINUX_AT_FDCWD, path,
                           nofollow ? PATH_TR_NOFOLLOW : PATH_TR_NONE, &tx) < 0)
         return linux_errno();
+    if (tx.fuse_path)
+        return -LINUX_ENOSYS;
 
     void *buf;
     int64_t err = xattr_alloc_buf(size, &buf);
@@ -156,6 +160,8 @@ int64_t sys_listxattr(guest_t *g,
     if (path_translate_at(LINUX_AT_FDCWD, path,
                           nofollow ? PATH_TR_NOFOLLOW : PATH_TR_NONE, &tx) < 0)
         return linux_errno();
+    if (tx.fuse_path)
+        return -LINUX_ENOSYS;
 
     int opts = nofollow ? XATTR_NOFOLLOW : 0;
 
@@ -190,6 +196,8 @@ int64_t sys_removexattr(guest_t *g,
     if (path_translate_at(LINUX_AT_FDCWD, path,
                           nofollow ? PATH_TR_NOFOLLOW : PATH_TR_NONE, &tx) < 0)
         return linux_errno();
+    if (tx.fuse_path)
+        return -LINUX_ENOSYS;
 
     int opts = nofollow ? XATTR_NOFOLLOW : 0;
     int ret = removexattr(tx.host_path, name, opts);

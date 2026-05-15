@@ -31,6 +31,7 @@
 
 #include "syscall/abi.h"
 #include "syscall/exec.h"
+#include "syscall/fuse.h"
 #include "syscall/internal.h"
 #include "syscall/path.h"
 #include "syscall/proc.h"
@@ -118,6 +119,9 @@ int64_t sys_execve(hv_vcpu_t vcpu,
 
     char path_host_buf[LINUX_PATH_MAX];
     const char *path_host = path;
+    bool path_host_temp = false;
+    char interp_host_buf[LINUX_PATH_MAX];
+    bool interp_host_temp = false;
 
 #define MAX_ARGS 256
 #define MAX_ENVS 4096
@@ -172,7 +176,15 @@ int64_t sys_execve(hv_vcpu_t vcpu,
             err = linux_errno();
             goto fail;
         }
-        str_copy_trunc(path_host_buf, tx.host_path, sizeof(path_host_buf));
+        if (tx.fuse_path) {
+            err = fuse_materialize_path(tx.intercept_path, path_host_buf,
+                                        sizeof(path_host_buf));
+            if (err < 0)
+                goto fail;
+            path_host_temp = true;
+        } else {
+            str_copy_trunc(path_host_buf, tx.host_path, sizeof(path_host_buf));
+        }
         path_host = path_host_buf;
     }
     if (!path_host) {
@@ -304,9 +316,23 @@ int64_t sys_execve(hv_vcpu_t vcpu,
             err = linux_errno();
             goto fail;
         }
-        str_copy_trunc(path_host_buf, interp_tx.host_path,
-                       sizeof(path_host_buf));
-        path_host = path_host_buf;
+        if (path_host_temp) {
+            unlink(path_host_buf);
+            path_host_temp = false;
+        }
+        if (interp_tx.fuse_path) {
+            err =
+                fuse_materialize_path(interp_tx.intercept_path, interp_host_buf,
+                                      sizeof(interp_host_buf));
+            if (err < 0)
+                goto fail;
+            interp_host_temp = true;
+            path_host = interp_host_buf;
+        } else {
+            str_copy_trunc(path_host_buf, interp_tx.host_path,
+                           sizeof(path_host_buf));
+            path_host = path_host_buf;
+        }
 
         if (elf_load(path_host, &elf_info) < 0) {
             err = -LINUX_ENOENT;
@@ -383,6 +409,10 @@ int64_t sys_execve(hv_vcpu_t vcpu,
      */
     if (0) {
     fail:
+        if (path_host_temp)
+            unlink(path_host_buf);
+        if (interp_host_temp)
+            unlink(interp_host_buf);
         free(argv_buf);
         free(envp_buf);
         return err;
@@ -693,8 +723,7 @@ int64_t sys_execve(hv_vcpu_t vcpu,
                          elf_info.segments[i].gpa + elf_info.segments[i].memsz +
                              elf_load_base,
                          elf_pf_to_prot(elf_info.segments[i].flags),
-                         LINUX_MAP_PRIVATE, elf_info.segments[i].offset,
-                         path_host);
+                         LINUX_MAP_PRIVATE, elf_info.segments[i].offset, path);
     }
     /* interp_resolved was computed before guest_reset so no filesystem lookup
      * is needed after the point of no return.
@@ -803,6 +832,10 @@ int64_t sys_execve(hv_vcpu_t vcpu,
     log_debug("execve: loaded %s, entry=0x%llx sp=0x%llx", path_host,
               (unsigned long long) entry_ipa, (unsigned long long) sp_ipa);
 
+    if (path_host_temp)
+        unlink(path_host_buf);
+    if (interp_host_temp)
+        unlink(interp_host_buf);
     free(argv_buf);
     free(envp_buf);
 

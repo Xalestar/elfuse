@@ -95,6 +95,12 @@ int64_t sys_faccessat(guest_t *g,
                       uint64_t path_gva,
                       int mode,
                       int flags);
+int64_t sys_mount(guest_t *g,
+                  uint64_t source_gva,
+                  uint64_t target_gva,
+                  uint64_t fstype_gva,
+                  unsigned long flags,
+                  uint64_t data_gva);
 
 /* truncate */
 int64_t sys_ftruncate(int fd, int64_t length);

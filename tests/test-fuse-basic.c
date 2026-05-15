@@ -1,0 +1,643 @@
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+#ifndef SYS_mount
+#define SYS_mount 40
+#endif
+
+#ifndef SYS_getdents64
+#define SYS_getdents64 61
+#endif
+
+#ifndef O_PATH
+#define O_PATH 010000000
+#endif
+
+#define FUSE_ROOT_ID 1
+#define FUSE_ASYNC_READ (1u << 0)
+#define FUSE_BIG_WRITES (1u << 5)
+#define FUSE_MAX_PAGES (1u << 22)
+
+enum fuse_opcode {
+    FUSE_LOOKUP = 1,
+    FUSE_GETATTR = 3,
+    FUSE_OPEN = 14,
+    FUSE_READ = 15,
+    FUSE_RELEASE = 18,
+    FUSE_INIT = 26,
+    FUSE_OPENDIR = 27,
+    FUSE_READDIR = 28,
+    FUSE_RELEASEDIR = 29,
+};
+
+struct fuse_attr {
+    uint64_t ino, size, blocks, atime, mtime, ctime;
+    uint32_t atimensec, mtimensec, ctimensec;
+    uint32_t mode, nlink, uid, gid, rdev, blksize, flags;
+};
+
+struct fuse_entry_out {
+    uint64_t nodeid, generation, entry_valid, attr_valid;
+    uint32_t entry_valid_nsec, attr_valid_nsec;
+    struct fuse_attr attr;
+};
+
+struct fuse_attr_out {
+    uint64_t attr_valid;
+    uint32_t attr_valid_nsec;
+    uint32_t dummy;
+    struct fuse_attr attr;
+};
+
+struct fuse_open_out {
+    uint64_t fh;
+    uint32_t open_flags;
+    int32_t backing_id;
+};
+
+struct fuse_read_in {
+    uint64_t fh;
+    uint64_t offset;
+    uint32_t size;
+    uint32_t read_flags;
+    uint64_t lock_owner;
+    uint32_t flags;
+    uint32_t padding;
+};
+
+struct fuse_init_out {
+    uint32_t major, minor, max_readahead, flags;
+    uint16_t max_background, congestion_threshold;
+    uint32_t max_write, time_gran;
+    uint16_t max_pages, map_alignment;
+    uint32_t flags2, max_stack_depth;
+    uint16_t request_timeout, unused[11];
+};
+
+struct fuse_in_header {
+    uint32_t len, opcode;
+    uint64_t unique, nodeid;
+    uint32_t uid, gid, pid;
+    uint16_t total_extlen, padding;
+};
+
+struct fuse_out_header {
+    uint32_t len;
+    int32_t error;
+    uint64_t unique;
+};
+
+struct fuse_dirent {
+    uint64_t ino;
+    uint64_t off;
+    uint32_t namelen;
+    uint32_t type;
+    char name[];
+};
+
+struct linux_dirent64 {
+    uint64_t d_ino;
+    int64_t d_off;
+    unsigned short d_reclen;
+    unsigned char d_type;
+    char d_name[];
+};
+
+static const char hello_name[] = "hello";
+static const char hello_data[] = "hello from guest fuse\n";
+static const char source_name[] = "elfuse-test";
+
+typedef struct {
+    int fusefd;
+    int saw_release;
+    int saw_releasedir;
+    int init_error;
+} daemon_ctx_t;
+
+static void fill_dir_attr(struct fuse_attr *attr)
+{
+    memset(attr, 0, sizeof(*attr));
+    attr->ino = 1;
+    attr->mode = S_IFDIR | 0755;
+    attr->nlink = 2;
+    attr->uid = getuid();
+    attr->gid = getgid();
+    attr->blksize = 4096;
+}
+
+static void fill_file_attr(struct fuse_attr *attr)
+{
+    memset(attr, 0, sizeof(*attr));
+    attr->ino = 2;
+    attr->mode = S_IFREG | 0644;
+    attr->nlink = 1;
+    attr->uid = getuid();
+    attr->gid = getgid();
+    attr->size = sizeof(hello_data) - 1;
+    attr->blocks = 1;
+    attr->blksize = 4096;
+}
+
+static int reply_frame(int fd,
+                       uint64_t unique,
+                       int32_t error,
+                       const void *payload,
+                       size_t len)
+{
+    uint8_t buf[4096];
+    struct fuse_out_header out = {
+        .len = (uint32_t) (sizeof(out) + len),
+        .error = error,
+        .unique = unique,
+    };
+    memcpy(buf, &out, sizeof(out));
+    if (len)
+        memcpy(buf + sizeof(out), payload, len);
+    if (write(fd, buf, sizeof(out) + len) != (ssize_t) (sizeof(out) + len)) {
+        perror("write(/dev/fuse)");
+        return -1;
+    }
+    return 0;
+}
+
+static size_t append_dirent(uint8_t *buf,
+                            size_t off,
+                            uint64_t ino,
+                            uint64_t next_off,
+                            unsigned type,
+                            const char *name)
+{
+    struct fuse_dirent *de = (struct fuse_dirent *) (buf + off);
+    size_t namelen = strlen(name);
+    size_t reclen = (24 + namelen + 7) & ~7ULL;
+    de->ino = ino;
+    de->off = next_off;
+    de->namelen = (uint32_t) namelen;
+    de->type = type;
+    memcpy(de->name, name, namelen);
+    memset(((uint8_t *) de) + 24 + namelen, 0, reclen - (24 + namelen));
+    return off + reclen;
+}
+
+static void *daemon_main(void *arg)
+{
+    daemon_ctx_t *ctx = arg;
+    uint8_t buf[4096];
+    for (;;) {
+        ssize_t nr = read(ctx->fusefd, buf, sizeof(buf));
+        if (nr < 0) {
+            if (errno == ENOTCONN)
+                return NULL;
+            perror("read(/dev/fuse)");
+            exit(1);
+        }
+
+        struct fuse_in_header *in = (struct fuse_in_header *) buf;
+        switch (in->opcode) {
+        case FUSE_INIT: {
+            if (ctx->init_error) {
+                if (reply_frame(ctx->fusefd, in->unique, -ctx->init_error, NULL,
+                                0) < 0)
+                    exit(1);
+                return NULL;
+            }
+            struct fuse_init_out out = {
+                .major = 7,
+                .minor = 45,
+                .max_readahead = 1024 * 1024,
+                .flags = FUSE_ASYNC_READ | FUSE_BIG_WRITES | FUSE_MAX_PAGES,
+                .max_write = 65536,
+                .max_pages = 16,
+            };
+            if (reply_frame(ctx->fusefd, in->unique, 0, &out, sizeof(out)) < 0)
+                exit(1);
+            break;
+        }
+        case FUSE_GETATTR: {
+            struct fuse_attr_out out;
+            memset(&out, 0, sizeof(out));
+            if (in->nodeid == FUSE_ROOT_ID)
+                fill_dir_attr(&out.attr);
+            else if (in->nodeid == 2)
+                fill_file_attr(&out.attr);
+            else if (reply_frame(ctx->fusefd, in->unique, -ENOENT, NULL, 0) < 0)
+                exit(1);
+            if (in->nodeid == FUSE_ROOT_ID || in->nodeid == 2) {
+                if (reply_frame(ctx->fusefd, in->unique, 0, &out, sizeof(out)) <
+                    0)
+                    exit(1);
+            }
+            break;
+        }
+        case FUSE_LOOKUP: {
+            const char *name = (const char *) (buf + sizeof(*in));
+            if (in->nodeid != FUSE_ROOT_ID || strcmp(name, hello_name)) {
+                if (reply_frame(ctx->fusefd, in->unique, -ENOENT, NULL, 0) < 0)
+                    exit(1);
+                break;
+            }
+            struct fuse_entry_out out;
+            memset(&out, 0, sizeof(out));
+            out.nodeid = 2;
+            fill_file_attr(&out.attr);
+            if (reply_frame(ctx->fusefd, in->unique, 0, &out, sizeof(out)) < 0)
+                exit(1);
+            break;
+        }
+        case FUSE_OPENDIR: {
+            struct fuse_open_out out = {.fh = 10};
+            if (reply_frame(ctx->fusefd, in->unique, 0, &out, sizeof(out)) < 0)
+                exit(1);
+            break;
+        }
+        case FUSE_OPEN: {
+            struct fuse_open_out out = {.fh = 11};
+            if (reply_frame(ctx->fusefd, in->unique, 0, &out, sizeof(out)) < 0)
+                exit(1);
+            break;
+        }
+        case FUSE_READDIR: {
+            struct fuse_read_in *rin =
+                (struct fuse_read_in *) (buf + sizeof(*in));
+            uint8_t out[256];
+            size_t out_len = 0;
+            if (rin->offset == 0) {
+                out_len = append_dirent(out, out_len, 1, 1, DT_DIR, ".");
+                out_len = append_dirent(out, out_len, 1, 2, DT_DIR, "..");
+                out_len = append_dirent(out, out_len, 2, 3, DT_REG, hello_name);
+            }
+            if (reply_frame(ctx->fusefd, in->unique, 0, out, out_len) < 0)
+                exit(1);
+            break;
+        }
+        case FUSE_READ: {
+            struct fuse_read_in *rin =
+                (struct fuse_read_in *) (buf + sizeof(*in));
+            size_t len = sizeof(hello_data) - 1;
+            if (rin->offset >= len) {
+                if (reply_frame(ctx->fusefd, in->unique, 0, NULL, 0) < 0)
+                    exit(1);
+                break;
+            }
+            size_t avail = len - (size_t) rin->offset;
+            if (avail > rin->size)
+                avail = rin->size;
+            if (reply_frame(ctx->fusefd, in->unique, 0,
+                            hello_data + rin->offset, avail) < 0)
+                exit(1);
+            break;
+        }
+        case FUSE_RELEASE:
+            ctx->saw_release = 1;
+            if (reply_frame(ctx->fusefd, in->unique, 0, NULL, 0) < 0)
+                exit(1);
+            if (ctx->saw_release && ctx->saw_releasedir)
+                return NULL;
+            break;
+        case FUSE_RELEASEDIR:
+            ctx->saw_releasedir = 1;
+            if (reply_frame(ctx->fusefd, in->unique, 0, NULL, 0) < 0)
+                exit(1);
+            if (ctx->saw_release && ctx->saw_releasedir)
+                return NULL;
+            break;
+        default:
+            if (reply_frame(ctx->fusefd, in->unique, -ENOSYS, NULL, 0) < 0)
+                exit(1);
+            break;
+        }
+    }
+}
+
+static void die(const char *msg)
+{
+    perror(msg);
+    exit(1);
+}
+
+static void expect_contains(const char *path, const char *needle)
+{
+    int fd = open(path, O_RDONLY);
+    if (fd < 0)
+        die(path);
+    char buf[4096];
+    ssize_t nr = read(fd, buf, sizeof(buf) - 1);
+    if (nr < 0)
+        die("read(procfs)");
+    buf[nr] = '\0';
+    close(fd);
+    if (!strstr(buf, needle)) {
+        fprintf(stderr, "%s missing '%s'\n", path, needle);
+        exit(1);
+    }
+}
+
+static void expect_hello_fd(int fd)
+{
+    char buf[64];
+    ssize_t nr = read(fd, buf, sizeof(buf));
+    if (nr != (ssize_t) (sizeof(hello_data) - 1) ||
+        memcmp(buf, hello_data, sizeof(hello_data) - 1) != 0) {
+        fprintf(stderr, "unexpected read payload\n");
+        exit(1);
+    }
+}
+
+int main(void)
+{
+    const char *mount_dir = "/mnt/fuse";
+    if (access(mount_dir, F_OK) < 0)
+        die("access(mountpoint)");
+    if (access("/dev/fuse", F_OK) < 0)
+        die("access(/dev/fuse)");
+
+    struct stat st;
+    if (stat("/dev/fuse", &st) < 0)
+        die("stat(/dev/fuse)");
+    if (!S_ISCHR(st.st_mode)) {
+        fprintf(stderr, "/dev/fuse is not a character device\n");
+        return 1;
+    }
+
+    int fusefd = open("/dev/fuse", O_RDWR);
+    if (fusefd < 0)
+        die("open(/dev/fuse)");
+    if (fstat(fusefd, &st) < 0)
+        die("fstat(/dev/fuse)");
+    if (!S_ISCHR(st.st_mode)) {
+        fprintf(stderr, "fstat(/dev/fuse) did not report char device\n");
+        return 1;
+    }
+    close(fusefd);
+
+    int bad_fusefd = open("/dev/fuse", O_RDWR);
+    if (bad_fusefd < 0)
+        die("open(/dev/fuse bad)");
+
+    daemon_ctx_t bad_ctx = {.fusefd = bad_fusefd, .init_error = EPROTO};
+    pthread_t bad_tid;
+    if (pthread_create(&bad_tid, NULL, daemon_main, &bad_ctx) != 0) {
+        errno = EINVAL;
+        die("pthread_create bad daemon");
+    }
+
+    char opts[128];
+    snprintf(opts, sizeof(opts), "fd=%d,rootmode=40000,user_id=%u,group_id=%u",
+             bad_fusefd, (unsigned) getuid(), (unsigned) getgid());
+    errno = 0;
+    if (syscall(SYS_mount, source_name, mount_dir, "fuse", 0, opts) >= 0 ||
+        errno != EPROTO) {
+        fprintf(stderr, "expected mount INIT failure as EPROTO, got errno=%d\n",
+                errno);
+        return 1;
+    }
+    close(bad_fusefd);
+    if (pthread_join(bad_tid, NULL) != 0) {
+        errno = EINVAL;
+        die("pthread_join bad daemon");
+    }
+
+    fusefd = open("/dev/fuse", O_RDWR);
+    if (fusefd < 0)
+        die("open(/dev/fuse good)");
+
+    daemon_ctx_t ctx = {.fusefd = fusefd};
+    pthread_t tid;
+    if (pthread_create(&tid, NULL, daemon_main, &ctx) != 0) {
+        errno = EINVAL;
+        die("pthread_create");
+    }
+
+    snprintf(opts, sizeof(opts), "fd=%d,rootmode=40000,user_id=%u,group_id=%u",
+             fusefd, (unsigned) getuid(), (unsigned) getgid());
+    if (syscall(SYS_mount, source_name, mount_dir, "fuse", 0, opts) < 0)
+        die("mount(fuse)");
+
+    if (stat(mount_dir, &st) < 0)
+        die("stat(mountpoint)");
+    if (!S_ISDIR(st.st_mode)) {
+        fprintf(stderr, "mountpoint is not a directory\n");
+        return 1;
+    }
+
+    expect_contains("/proc/self/mountinfo", mount_dir);
+    expect_contains("/proc/self/mountinfo", " - fuse ");
+    expect_contains("/proc/mounts", mount_dir);
+    expect_contains("/proc/mounts", source_name);
+
+    char hello_path[256];
+    snprintf(hello_path, sizeof(hello_path), "%s/%s", mount_dir, hello_name);
+    if (stat(hello_path, &st) < 0)
+        die("stat(file)");
+    if (!S_ISREG(st.st_mode) ||
+        st.st_size != (off_t) (sizeof(hello_data) - 1)) {
+        fprintf(stderr, "unexpected file stat\n");
+        return 1;
+    }
+
+    int pathfd = open(hello_path, O_PATH);
+    if (pathfd < 0)
+        die("open(file O_PATH)");
+    char path_buf[8];
+    errno = 0;
+    if (read(pathfd, path_buf, sizeof(path_buf)) >= 0 || errno != EBADF) {
+        fprintf(stderr, "expected read(O_PATH file) to fail with EBADF\n");
+        return 1;
+    }
+    close(pathfd);
+
+    int pathdfd = open(mount_dir, O_PATH | O_DIRECTORY);
+    if (pathdfd < 0)
+        die("open(dir O_PATH)");
+    char path_dents[128];
+    errno = 0;
+    if (syscall(SYS_getdents64, pathdfd, path_dents, sizeof(path_dents)) >= 0 ||
+        errno != EBADF) {
+        fprintf(stderr, "expected getdents64(O_PATH dir) to fail with EBADF\n");
+        return 1;
+    }
+    if (fchdir(pathdfd) < 0)
+        die("fchdir(O_PATH fuse-dir)");
+    if (chdir("/") < 0)
+        die("chdir(/ after O_PATH)");
+    close(pathdfd);
+
+    int fd = open(hello_path, O_RDONLY);
+    if (fd < 0)
+        die("open(file)");
+    errno = 0;
+    int wfd = open(hello_path, O_RDWR);
+    if (wfd >= 0 || errno != EACCES) {
+        fprintf(stderr, "expected O_RDWR FUSE open to fail with EACCES\n");
+        return 1;
+    }
+    if (fstat(fd, &st) < 0)
+        die("fstat(file)");
+    char fdinfo_path[64];
+    snprintf(fdinfo_path, sizeof(fdinfo_path), "/proc/self/fdinfo/%d", fd);
+    expect_contains(fdinfo_path, "mnt_id:\t");
+    expect_hello_fd(fd);
+    int dupfd = dup(fd);
+    if (dupfd < 0)
+        die("dup(fuse-file)");
+    char eof_probe[8];
+    ssize_t dup_nr = read(dupfd, eof_probe, sizeof(eof_probe));
+    if (dup_nr != 0) {
+        fprintf(stderr, "expected dup'd FUSE file to share EOF offset\n");
+        return 1;
+    }
+    close(dupfd);
+
+    void *map = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (map != MAP_FAILED || errno != ENODEV) {
+        fprintf(stderr,
+                "expected mmap ENODEV on FUSE fd, got map=%p errno=%d\n", map,
+                errno);
+        return 1;
+    }
+    close(fd);
+
+    /* Canonicalization: ./ and intermediate-up traversals must collapse to
+     * the same file rather than be forwarded as literal FUSE_LOOKUP names.
+     * Without canonicalization the daemon would receive LOOKUP for "." and
+     * fail.
+     */
+    char dot_path[256];
+    snprintf(dot_path, sizeof(dot_path), "%s/./%s", mount_dir, hello_name);
+    int dotfd = open(dot_path, O_RDONLY);
+    if (dotfd < 0)
+        die("open(./hello)");
+    expect_hello_fd(dotfd);
+    close(dotfd);
+
+    /* sub/../hello must canonicalize to hello before the FUSE walk; the
+     * daemon does not implement sub or "..", so this would fail with
+     * ENOENT if the path were forwarded literally.
+     */
+    char up_path[256];
+    snprintf(up_path, sizeof(up_path), "%s/sub/../%s", mount_dir, hello_name);
+    int upfd = open(up_path, O_RDONLY);
+    if (upfd < 0)
+        die("open(sub/../hello)");
+    expect_hello_fd(upfd);
+    close(upfd);
+
+    int dfd = open(mount_dir, O_RDONLY | O_DIRECTORY);
+    if (dfd < 0)
+        die("open(dir)");
+    int dupdfd = dup(dfd);
+    if (dupdfd < 0)
+        die("dup(fuse-dir)");
+    int relfd = openat(dfd, hello_name, O_RDONLY);
+    if (relfd < 0)
+        die("openat(dirfd, hello)");
+    expect_hello_fd(relfd);
+    close(relfd);
+
+    if (fchdir(dfd) < 0)
+        die("fchdir(fuse-dir)");
+    relfd = open(hello_name, O_RDONLY);
+    if (relfd < 0)
+        die("open(cwd-relative hello)");
+    expect_hello_fd(relfd);
+    close(relfd);
+    if (chdir("/") < 0)
+        die("chdir(/)");
+
+    if (chdir(mount_dir) < 0)
+        die("chdir(mountpoint)");
+    if (access(".", F_OK) < 0)
+        die("access(.) inside fuse");
+    if (stat(".", &st) < 0)
+        die("stat(.) inside fuse");
+    if (!S_ISDIR(st.st_mode)) {
+        fprintf(stderr, "stat(.) inside fuse is not a directory\n");
+        return 1;
+    }
+    relfd = open(hello_name, O_RDONLY);
+    if (relfd < 0)
+        die("open(chdir-relative hello)");
+    expect_hello_fd(relfd);
+    close(relfd);
+    if (chdir("/") < 0)
+        die("chdir(/ restore)");
+
+    char dents[512];
+    ssize_t nr = syscall(SYS_getdents64, dfd, dents, sizeof(dents));
+    if (nr < 0)
+        die("getdents64");
+
+    int found = 0;
+    for (size_t off = 0; off < (size_t) nr;) {
+        struct linux_dirent64 *de = (struct linux_dirent64 *) (dents + off);
+        if (!strcmp(de->d_name, hello_name))
+            found = 1;
+        off += de->d_reclen;
+    }
+    if (!found) {
+        fprintf(stderr, "readdir did not report %s\n", hello_name);
+        return 1;
+    }
+    nr = syscall(SYS_getdents64, dupdfd, dents, sizeof(dents));
+    if (nr != 0) {
+        fprintf(stderr, "expected dup'd FUSE dir to share EOF offset\n");
+        return 1;
+    }
+
+    /* Daemon-death + post-tombstone routing test.
+     *
+     * Set the virtual cwd to the FUSE mount via fchdir(dfd) so the consumer
+     * has a FUSE-rooted relative-path baseline. Close /dev/fuse from the
+     * consumer side to simulate daemon death: fuse_fd_cleanup tombstones
+     * the mount (mount->session = NULL but the slot path/source/fstype/
+     * mount_id stay intact), wakes any blocked requests, and the daemon
+     * thread's next read returns ENOTCONN and the thread exits.
+     *
+     * After the daemon is gone, a relative open from the still-FUSE-rooted
+     * virtual cwd MUST return -LINUX_ENOTCONN rather than silently falling
+     * through to host-relative open against the host cwd. The tombstoned
+     * mount keeps the path matching FUSE, and fuse_open_path detects
+     * session==NULL and returns ENOTCONN.
+     */
+    if (fchdir(dfd) < 0)
+        die("fchdir(dfd) before daemon death");
+    int alive_fd = open(hello_name, O_RDONLY);
+    if (alive_fd < 0)
+        die("open(hello) pre-death sanity");
+    close(alive_fd);
+
+    close(fusefd);
+    fusefd = -1;
+    if (pthread_join(tid, NULL) != 0) {
+        errno = EINVAL;
+        die("pthread_join after daemon death");
+    }
+
+    errno = 0;
+    int dead_fd = open(hello_name, O_RDONLY);
+    if (dead_fd >= 0 || errno != ENOTCONN) {
+        fprintf(stderr,
+                "expected ENOTCONN on post-death relative open;"
+                " got fd=%d errno=%d (%s)\n",
+                dead_fd, errno, strerror(errno));
+        if (dead_fd >= 0)
+            close(dead_fd);
+        return 1;
+    }
+
+    if (chdir("/") < 0)
+        die("chdir(/) after daemon death");
+    close(dupdfd);
+    close(dfd);
+    return 0;
+}
