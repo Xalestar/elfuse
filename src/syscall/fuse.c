@@ -27,6 +27,7 @@
 #include "syscall/internal.h"
 #include "syscall/path.h"
 #include "syscall/proc.h"
+#include "syscall/signal.h"
 
 #define FUSE_KERNEL_VERSION 7
 #define FUSE_KERNEL_MINOR_VERSION 45
@@ -38,6 +39,7 @@
 
 enum fuse_opcode {
     FUSE_LOOKUP = 1,
+    FUSE_FORGET = 2,
     FUSE_GETATTR = 3,
     FUSE_OPEN = 14,
     FUSE_READ = 15,
@@ -46,6 +48,8 @@ enum fuse_opcode {
     FUSE_OPENDIR = 27,
     FUSE_READDIR = 28,
     FUSE_RELEASEDIR = 29,
+    FUSE_INTERRUPT = 36,
+    FUSE_BATCH_FORGET = 42,
 };
 
 typedef struct {
@@ -113,6 +117,24 @@ typedef struct {
 } fuse_release_in_t;
 
 typedef struct {
+    uint64_t nlookup;
+} fuse_forget_in_t;
+
+typedef struct {
+    uint64_t unique;
+} fuse_interrupt_in_t;
+
+typedef struct {
+    uint32_t count;
+    uint32_t dummy;
+} fuse_batch_forget_in_t;
+
+typedef struct {
+    uint64_t nodeid;
+    uint64_t nlookup;
+} fuse_forget_one_t;
+
+typedef struct {
     uint32_t major;
     uint32_t minor;
     uint32_t max_readahead;
@@ -174,6 +196,13 @@ typedef struct {
 #define FUSE_MAX_MOUNTS 8
 #define FUSE_MAX_OPEN_FILES 128
 #define FUSE_MAX_PENDING 128
+/* Per-session capacity for held lookup references. Sized for recursive
+ * directory walks (ls -R style) without pushing the per-session struct
+ * into multi-page territory; sizeof(struct) at the chosen cap stays under
+ * 80 KiB. Beyond this, fuse_lookup_locked() emits a compensating FORGET
+ * to keep the daemon balanced instead of leaking a reference.
+ */
+#define FUSE_MAX_NODE_REFS 4096
 #define FUSE_FAKE_DEV 0xF00D
 
 /* Implementation ceiling for a single FUSE frame (header + payload). The
@@ -192,6 +221,9 @@ typedef struct {
 typedef struct fuse_request {
     bool used;
     bool answered;
+    bool no_reply;
+    bool detached;
+    bool interrupt_sent;
     uint64_t unique;
     uint8_t *frame;
     size_t frame_len;
@@ -218,6 +250,11 @@ typedef struct {
     fuse_request_t requests[FUSE_MAX_PENDING];
     fuse_request_t *queue_head;
     fuse_request_t *queue_tail;
+    struct {
+        bool used;
+        uint64_t nodeid;
+        uint64_t nlookup;
+    } node_refs[FUSE_MAX_NODE_REFS];
 } fuse_session_t;
 
 typedef struct {
@@ -459,6 +496,19 @@ static void fuse_session_get_locked(fuse_session_t *session)
 /* Drop a session reference under fuse_lock. When the last reference is
  * dropped and the session has been closed, destroy the synchronization
  * primitives and clear the slot. Callers must not hold session->lock.
+ *
+ * The /dev/fuse fd is itself one of the session's refs (taken when the
+ * fd is allocated, dropped in fuse_fd_cleanup), so the only path that
+ * can drive refcount to zero runs through fuse_fd_cleanup setting
+ * session->closed = true and session->daemon_dead = true before its
+ * matching put. Any residual node_refs entries at this point therefore
+ * cannot reach the daemon -- fuse_emit_forget_multi_locked short-
+ * circuits on daemon_dead -- so no terminal FUSE_FORGET sweep is
+ * emitted here. The compensating FORGET paths elsewhere in this file
+ * (fuse_lookup_locked overflow, fuse_walk_path_locked mid-walk drop
+ * failure, fuse_open_path error exits) keep the daemon's nlookup view
+ * balanced while the daemon is still alive; teardown after the
+ * daemon's exit needs no further reconciliation.
  */
 static void fuse_session_put_locked(fuse_session_t *session)
 {
@@ -566,6 +616,142 @@ static fuse_request_t *fuse_alloc_request_locked(fuse_session_t *session)
     return NULL;
 }
 
+static int fuse_node_ref_hold_locked(fuse_session_t *session,
+                                     uint64_t nodeid,
+                                     uint64_t nlookup)
+{
+    if (nodeid == FUSE_ROOT_ID || nlookup == 0)
+        return 0;
+    for (int i = 0; i < FUSE_MAX_NODE_REFS; i++) {
+        if (session->node_refs[i].used &&
+            session->node_refs[i].nodeid == nodeid) {
+            session->node_refs[i].nlookup += nlookup;
+            return 0;
+        }
+    }
+    for (int i = 0; i < FUSE_MAX_NODE_REFS; i++) {
+        if (!session->node_refs[i].used) {
+            session->node_refs[i].used = true;
+            session->node_refs[i].nodeid = nodeid;
+            session->node_refs[i].nlookup = nlookup;
+            return 0;
+        }
+    }
+    return -LINUX_ENOMEM;
+}
+
+static int fuse_queue_noreply_locked(fuse_session_t *session,
+                                     uint32_t opcode,
+                                     uint64_t nodeid,
+                                     const void *payload,
+                                     size_t payload_len);
+static void fuse_free_request_locked(fuse_request_t *req);
+
+static int fuse_emit_forget_multi_locked(fuse_session_t *session,
+                                         const fuse_forget_one_t *items,
+                                         uint32_t count)
+{
+    if (!session || session->closed || session->daemon_dead || count == 0)
+        return 0;
+    if (count == 1) {
+        fuse_forget_in_t in = {.nlookup = items[0].nlookup};
+        return fuse_queue_noreply_locked(session, FUSE_FORGET, items[0].nodeid,
+                                         &in, sizeof(in));
+    }
+
+    size_t payload_len =
+        sizeof(fuse_batch_forget_in_t) + count * sizeof(fuse_forget_one_t);
+    uint8_t *payload = calloc(1, payload_len);
+    if (!payload)
+        return -LINUX_ENOMEM;
+
+    fuse_batch_forget_in_t *hdr = (fuse_batch_forget_in_t *) payload;
+    hdr->count = count;
+    memcpy(payload + sizeof(*hdr), items, count * sizeof(*items));
+    int rc = fuse_queue_noreply_locked(session, FUSE_BATCH_FORGET, 0, payload,
+                                       payload_len);
+    free(payload);
+    return rc;
+}
+
+static int fuse_node_ref_drop_locked(fuse_session_t *session,
+                                     uint64_t nodeid,
+                                     uint64_t nlookup,
+                                     bool emit_forget)
+{
+    if (nodeid == FUSE_ROOT_ID || nlookup == 0)
+        return 0;
+    for (int i = 0; i < FUSE_MAX_NODE_REFS; i++) {
+        if (!session->node_refs[i].used ||
+            session->node_refs[i].nodeid != nodeid)
+            continue;
+        if (nlookup >= session->node_refs[i].nlookup) {
+            nlookup = session->node_refs[i].nlookup;
+            memset(&session->node_refs[i], 0, sizeof(session->node_refs[i]));
+        } else {
+            session->node_refs[i].nlookup -= nlookup;
+        }
+        if (!emit_forget)
+            return 0;
+        fuse_forget_one_t one = {.nodeid = nodeid, .nlookup = nlookup};
+        return fuse_emit_forget_multi_locked(session, &one, 1);
+    }
+    return 0;
+}
+
+static int fuse_queue_request_locked(fuse_session_t *session,
+                                     uint32_t opcode,
+                                     uint64_t nodeid,
+                                     const void *payload,
+                                     size_t payload_len,
+                                     bool no_reply,
+                                     fuse_request_t **req_out)
+{
+    fuse_request_t *req = fuse_alloc_request_locked(session);
+    if (!req)
+        return -LINUX_ENOMEM;
+
+    req->no_reply = no_reply;
+    req->unique = session->next_unique++;
+    req->frame_len = sizeof(fuse_in_header_t) + payload_len;
+    req->frame = calloc(1, req->frame_len);
+    if (!req->frame) {
+        fuse_free_request_locked(req);
+        return -LINUX_ENOMEM;
+    }
+
+    fuse_in_header_t *hdr = (fuse_in_header_t *) req->frame;
+    hdr->len = (uint32_t) req->frame_len;
+    hdr->opcode = opcode;
+    hdr->unique = req->unique;
+    hdr->nodeid = nodeid;
+    hdr->uid = proc_get_uid();
+    hdr->gid = proc_get_gid();
+    hdr->pid = (uint32_t) proc_get_pid();
+    if (payload_len)
+        memcpy(req->frame + sizeof(*hdr), payload, payload_len);
+
+    if (session->queue_tail)
+        session->queue_tail->next = req;
+    else
+        session->queue_head = req;
+    session->queue_tail = req;
+    pthread_cond_broadcast(&session->queue_cond);
+    if (req_out)
+        *req_out = req;
+    return 0;
+}
+
+static int fuse_queue_noreply_locked(fuse_session_t *session,
+                                     uint32_t opcode,
+                                     uint64_t nodeid,
+                                     const void *payload,
+                                     size_t payload_len)
+{
+    return fuse_queue_request_locked(session, opcode, nodeid, payload,
+                                     payload_len, true, NULL);
+}
+
 static void fuse_free_request_locked(fuse_request_t *req)
 {
     pthread_cond_destroy(&req->cond);
@@ -629,39 +815,35 @@ static int fuse_request_locked(fuse_session_t *session,
     if (session->closed || session->daemon_dead)
         return -LINUX_ENOTCONN;
 
-    fuse_request_t *req = fuse_alloc_request_locked(session);
-    if (!req)
-        return -LINUX_ENOMEM;
-
-    req->unique = session->next_unique++;
-    req->frame_len = sizeof(fuse_in_header_t) + payload_len;
-    req->frame = calloc(1, req->frame_len);
-    if (!req->frame) {
-        fuse_free_request_locked(req);
-        return -LINUX_ENOMEM;
-    }
-
-    fuse_in_header_t *hdr = (fuse_in_header_t *) req->frame;
-    hdr->len = (uint32_t) req->frame_len;
-    hdr->opcode = opcode;
-    hdr->unique = req->unique;
-    hdr->nodeid = nodeid;
-    hdr->uid = proc_get_uid();
-    hdr->gid = proc_get_gid();
-    hdr->pid = (uint32_t) proc_get_pid();
-    if (payload_len)
-        memcpy(req->frame + sizeof(*hdr), payload, payload_len);
-
-    if (session->queue_tail)
-        session->queue_tail->next = req;
-    else
-        session->queue_head = req;
-    session->queue_tail = req;
-    pthread_cond_broadcast(&session->queue_cond);
+    fuse_request_t *req = NULL;
+    int qrc = fuse_queue_request_locked(session, opcode, nodeid, payload,
+                                        payload_len, false, &req);
+    if (qrc < 0)
+        return qrc;
 
     while (!req->answered && !session->closed && !session->daemon_dead) {
-        sched_yield();
-        pthread_cond_wait(&req->cond, &session->lock);
+        struct timespec ts;
+        timespec_deadline_in_ms(&ts, 20);
+        int wait_rc = pthread_cond_timedwait(&req->cond, &session->lock, &ts);
+        if (!req->answered && wait_rc == ETIMEDOUT) {
+            /* Only detach for non-restartable signals. SA_RESTART signals are
+             * delivered after the syscall completes naturally; breaking out
+             * here would force the guest to retry a request whose handler
+             * contract says no retry is necessary, and would emit a useless
+             * FUSE_INTERRUPT to the daemon for work the guest still wants.
+             */
+            bool restart = false;
+            if (signal_pending_interruption(&restart) && !restart) {
+                if (!req->interrupt_sent) {
+                    fuse_interrupt_in_t in = {.unique = req->unique};
+                    (void) fuse_queue_noreply_locked(session, FUSE_INTERRUPT, 0,
+                                                     &in, sizeof(in));
+                    req->interrupt_sent = true;
+                }
+                req->detached = true;
+                return -LINUX_EINTR;
+            }
+        }
     }
 
     int rc = 0;
@@ -684,6 +866,8 @@ static int fuse_request_locked(fuse_session_t *session,
         }
     }
 
+    if (req->detached)
+        return rc;
     fuse_free_request_locked(req);
     return rc;
 }
@@ -705,7 +889,16 @@ static int fuse_lookup_locked(fuse_session_t *session,
     }
     memcpy(out, reply, sizeof(*out));
     free(reply);
-    return 0;
+    int hold_rc = fuse_node_ref_hold_locked(session, out->nodeid, 1);
+    if (hold_rc < 0) {
+        /* Daemon already accepted the lookup and bumped its nlookup. The
+         * per-session ref table is full, so emit a compensating FORGET to
+         * keep the daemon's view balanced rather than leaking a reference.
+         */
+        fuse_forget_one_t one = {.nodeid = out->nodeid, .nlookup = 1};
+        (void) fuse_emit_forget_multi_locked(session, &one, 1);
+    }
+    return hold_rc;
 }
 
 static int fuse_getattr_locked(fuse_session_t *session,
@@ -731,11 +924,13 @@ static int fuse_getattr_locked(fuse_session_t *session,
 
 static int fuse_walk_path_locked(fuse_session_t *session,
                                  const char *relpath,
+                                 bool retain_final_lookup,
                                  uint64_t *nodeid_out,
                                  fuse_attr_t *attr_out)
 {
     uint64_t nodeid = FUSE_ROOT_ID;
     fuse_attr_t attr = {0};
+    uint64_t held_lookup = 0;
     const char *p = skip_slashes(relpath);
 
     if (*p == '\0') {
@@ -775,13 +970,46 @@ static int fuse_walk_path_locked(fuse_session_t *session,
 
         fuse_entry_out_t entry;
         int rc = fuse_lookup_locked(session, nodeid, name, &entry);
-        if (rc < 0)
+        if (rc < 0) {
+            /* Release the lookup hold from the previous component before
+             * propagating the error: every successful lookup along the way
+             * incremented nlookup on the daemon side, and bailing out without
+             * a matching FORGET would leak that reference.
+             */
+            if (held_lookup != 0)
+                (void) fuse_node_ref_drop_locked(session, held_lookup, 1, true);
             return rc;
+        }
+        if (held_lookup != 0) {
+            rc = fuse_node_ref_drop_locked(session, held_lookup, 1, true);
+            if (rc < 0) {
+                /* The previous component's drop already updated the local
+                 * ref table but failed to queue its FUSE_FORGET. The
+                 * just-acquired entry.nodeid hold would otherwise be
+                 * stranded in the local table on this error path and the
+                 * daemon would never see a matching FORGET for it. Drop
+                 * the new hold best-effort before propagating; if this
+                 * second drop also fails to emit, the caller still gets
+                 * the original error and the session teardown FORGET
+                 * sweep will reconcile any residual daemon-side count.
+                 */
+                (void) fuse_node_ref_drop_locked(session, entry.nodeid, 1,
+                                                 true);
+                return rc;
+            }
+        }
         nodeid = entry.nodeid;
         attr = entry.attr;
+        held_lookup = entry.nodeid;
         if (!slash)
             break;
         p = skip_slashes(slash);
+    }
+
+    if (!retain_final_lookup && held_lookup != 0) {
+        int rc = fuse_node_ref_drop_locked(session, held_lookup, 1, true);
+        if (rc < 0)
+            return rc;
     }
 
     *nodeid_out = nodeid;
@@ -911,15 +1139,23 @@ static int fuse_release_common_locked(fuse_session_t *session,
 {
     if (!session || session->daemon_dead || session->closed)
         return 0;
+    /* O_PATH opens skip FUSE_OPEN, so there is no fh to release. The path
+     * walk still incremented the daemon's nlookup, so emit FORGET to balance
+     * it. Without this, every successful O_PATH close leaks one reference.
+     */
     if (linux_flags & LINUX_O_PATH)
-        return 0;
+        return fuse_node_ref_drop_locked(session, nodeid, 1, true);
 
     fuse_release_in_t in = {
         .fh = fh,
         .flags = (uint32_t) linux_flags,
     };
-    return fuse_request_locked(session, dir ? FUSE_RELEASEDIR : FUSE_RELEASE,
-                               nodeid, &in, sizeof(in), NULL, NULL);
+    int rc = fuse_request_locked(session, dir ? FUSE_RELEASEDIR : FUSE_RELEASE,
+                                 nodeid, &in, sizeof(in), NULL, NULL);
+    int forget_rc = fuse_node_ref_drop_locked(session, nodeid, 1, true);
+    if (rc < 0)
+        return rc;
+    return forget_rc;
 }
 
 static void fuse_fd_cleanup(int guest_fd)
@@ -994,6 +1230,11 @@ static void fuse_fd_cleanup(int guest_fd)
     pthread_cond_broadcast(&session->init_cond);
     for (int i = 0; i < FUSE_MAX_PENDING; i++) {
         if (session->requests[i].used) {
+            if (session->requests[i].detached ||
+                session->requests[i].no_reply) {
+                fuse_free_request_locked(&session->requests[i]);
+                continue;
+            }
             session->requests[i].answered = true;
             session->requests[i].error = -LINUX_ENOTCONN;
             pthread_cond_broadcast(&session->requests[i].cond);
@@ -1246,11 +1487,16 @@ bool fuse_path_matches_mount(const char *path)
 }
 
 /* Resolve a guest-absolute path to a (session, mount_id, nodeid, attr).
+ * retain_final_lookup controls whether the terminal LOOKUP's nlookup is kept
+ * alive for a later open/release cycle, or forgotten before return for
+ * stat-like callers.
+ *
  * Returns 0 on success, or a negative Linux errno. The session refcount is
  * bumped on success; callers must drop it via fuse_session_put_locked when
  * done with the resolution.
  */
 static int fuse_path_lookup(const char *path,
+                            bool retain_final_lookup,
                             fuse_session_t **session_out,
                             int *mount_id_out,
                             uint64_t *nodeid_out,
@@ -1278,7 +1524,9 @@ static int fuse_path_lookup(const char *path,
     pthread_mutex_lock(&session->lock);
     pthread_mutex_unlock(&fuse_lock);
 
-    int rc = fuse_walk_path_locked(session, relpath, nodeid_out, attr_out);
+    bool keep_lookup = retain_final_lookup && session_out != NULL;
+    int rc = fuse_walk_path_locked(session, relpath, keep_lookup, nodeid_out,
+                                   attr_out);
     pthread_mutex_unlock(&session->lock);
 
     if (rc < 0) {
@@ -1313,7 +1561,7 @@ int fuse_stat_path(const char *path, struct stat *st, int at_flags)
 {
     fuse_attr_t attr;
     uint64_t nodeid = 0;
-    int rc = fuse_path_lookup(path, NULL, NULL, &nodeid, &attr);
+    int rc = fuse_path_lookup(path, false, NULL, NULL, &nodeid, &attr);
     (void) nodeid;
     if (rc < 0)
         return rc;
@@ -1413,11 +1661,14 @@ int fuse_materialize_path(const char *path, char *out_path, size_t outsz)
     int mount_id = 0;
     uint64_t nodeid = 0;
     fuse_attr_t attr;
-    int rc = fuse_path_lookup(path, &session, &mount_id, &nodeid, &attr);
+    int rc = fuse_path_lookup(path, true, &session, &mount_id, &nodeid, &attr);
     (void) mount_id;
     if (rc < 0)
         return rc;
     if (S_ISDIR(attr.mode)) {
+        pthread_mutex_lock(&session->lock);
+        (void) fuse_node_ref_drop_locked(session, nodeid, 1, true);
+        pthread_mutex_unlock(&session->lock);
         pthread_mutex_lock(&fuse_lock);
         fuse_session_put_locked(session);
         pthread_mutex_unlock(&fuse_lock);
@@ -1438,6 +1689,8 @@ int fuse_materialize_path(const char *path, char *out_path, size_t outsz)
                                                 LINUX_O_RDONLY);
         if (rc == 0 && rel_rc < 0)
             rc = rel_rc;
+    } else {
+        (void) fuse_node_ref_drop_locked(session, nodeid, 1, true);
     }
     pthread_mutex_unlock(&session->lock);
 
@@ -1522,7 +1775,7 @@ int64_t fuse_open_path(guest_t *g, const char *path, int linux_flags, int mode)
 
     uint64_t nodeid = 0;
     fuse_attr_t attr;
-    int rc = fuse_walk_path_locked(session, relpath, &nodeid, &attr);
+    int rc = fuse_walk_path_locked(session, relpath, true, &nodeid, &attr);
     if (rc < 0) {
         pthread_mutex_unlock(&session->lock);
         pthread_mutex_lock(&fuse_lock);
@@ -1534,6 +1787,7 @@ int64_t fuse_open_path(guest_t *g, const char *path, int linux_flags, int mode)
     bool want_dir = (linux_flags & LINUX_O_DIRECTORY) || S_ISDIR(attr.mode);
     bool path_only = (linux_flags & LINUX_O_PATH) != 0;
     if ((linux_flags & LINUX_O_DIRECTORY) && !S_ISDIR(attr.mode)) {
+        (void) fuse_node_ref_drop_locked(session, nodeid, 1, true);
         pthread_mutex_unlock(&session->lock);
         pthread_mutex_lock(&fuse_lock);
         fuse_session_put_locked(session);
@@ -1547,6 +1801,7 @@ int64_t fuse_open_path(guest_t *g, const char *path, int linux_flags, int mode)
      * exists for FD_FUSE_FILE.
      */
     if (!want_dir && !path_only && (linux_flags & 3) != LINUX_O_RDONLY) {
+        (void) fuse_node_ref_drop_locked(session, nodeid, 1, true);
         pthread_mutex_unlock(&session->lock);
         pthread_mutex_lock(&fuse_lock);
         fuse_session_put_locked(session);
@@ -1557,6 +1812,7 @@ int64_t fuse_open_path(guest_t *g, const char *path, int linux_flags, int mode)
     int guest_fd =
         fd_alloc(want_dir ? FD_FUSE_DIR : FD_FUSE_FILE, -1, fuse_fd_cleanup);
     if (guest_fd < 0) {
+        (void) fuse_node_ref_drop_locked(session, nodeid, 1, true);
         pthread_mutex_unlock(&session->lock);
         pthread_mutex_lock(&fuse_lock);
         fuse_session_put_locked(session);
@@ -1570,6 +1826,7 @@ int64_t fuse_open_path(guest_t *g, const char *path, int linux_flags, int mode)
     pthread_mutex_unlock(&fuse_lock);
     if (!file) {
         fd_mark_closed(guest_fd);
+        (void) fuse_node_ref_drop_locked(session, nodeid, 1, true);
         pthread_mutex_unlock(&session->lock);
         pthread_mutex_lock(&fuse_lock);
         fuse_session_put_locked(session);
@@ -1583,6 +1840,7 @@ int64_t fuse_open_path(guest_t *g, const char *path, int linux_flags, int mode)
         rc = fuse_open_common_locked(session, nodeid, linux_flags, want_dir,
                                      &out);
         if (rc < 0) {
+            (void) fuse_node_ref_drop_locked(session, nodeid, 1, true);
             pthread_mutex_unlock(&session->lock);
             pthread_mutex_lock(&fuse_lock);
             fuse_file_put_locked(file); /* releases the open-fd ref */
@@ -1947,6 +2205,8 @@ int64_t fuse_dev_read(int guest_fd,
     if (!session->queue_head)
         session->queue_tail = NULL;
     req->next = NULL;
+    if (req->no_reply)
+        fuse_free_request_locked(req);
     pthread_mutex_unlock(&session->lock);
     pthread_mutex_lock(&fuse_lock);
     fuse_session_put_locked(session);
@@ -2062,7 +2322,11 @@ int64_t fuse_dev_write(guest_t *g,
         }
         pthread_cond_broadcast(&session->init_cond);
     }
-    pthread_cond_broadcast(&req->cond);
+    if (req->detached) {
+        fuse_free_request_locked(req);
+    } else {
+        pthread_cond_broadcast(&req->cond);
+    }
     pthread_mutex_unlock(&session->lock);
     pthread_mutex_lock(&fuse_lock);
     fuse_session_put_locked(session);

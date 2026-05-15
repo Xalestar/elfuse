@@ -56,6 +56,7 @@
 /* Linux sigaction flags. */
 #define LINUX_SA_SIGINFO 0x00000004
 #define LINUX_SA_ONSTACK 0x08000000
+#define LINUX_SA_RESTART 0x10000000
 #define LINUX_SA_NODEFER 0x40000000
 #define LINUX_SA_RESETHAND 0x80000000U
 
@@ -241,6 +242,7 @@ void signal_set_fault_info(int si_code, uint64_t addr, uint64_t esr);
 
 /* Check if any unblocked signal is pending. */
 int signal_pending(void);
+bool signal_pending_interruption(bool *restart_out);
 
 /* Deliver the highest-priority pending unblocked signal to the guest.
  * Builds an rt_sigframe on the guest stack and redirects vCPU to handler.

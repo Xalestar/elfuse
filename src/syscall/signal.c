@@ -407,6 +407,69 @@ int signal_pending(void)
     return result;
 }
 
+bool signal_pending_interruption(bool *restart_out)
+{
+    pthread_mutex_lock(&sig_lock);
+    uint64_t blocked = __atomic_load_n(thread_blocked_ptr(), __ATOMIC_ACQUIRE);
+    uint64_t deliverable = sig_state.pending & ~blocked;
+    if (deliverable == 0) {
+        pthread_mutex_unlock(&sig_lock);
+        if (restart_out)
+            *restart_out = false;
+        return false;
+    }
+
+    /* restart_out reports whether every deliverable signal is non-disruptive
+     * from the caller's point of view. A signal is non-disruptive if its
+     * effective delivery is either a no-op or an SA_RESTART handler:
+     *   - SIG_IGN: discarded by signal_deliver, no guest-visible effect.
+     *   - SIG_DFL with default-ignore disposition (SIGCHLD/SIGURG/SIGWINCH):
+     *     ditto.
+     *   - User handler with SA_RESTART: handler runs but the syscall is
+     *     expected to be retried transparently.
+     * Any other signal (default-TERM, default-CORE, non-restart handler)
+     * forces the wait to be treated as interrupted; otherwise a SIGTERM
+     * hiding behind an ignored SIGCHLD would never wake the caller.
+     */
+    bool all_noninterrupt = true;
+    uint64_t bits = deliverable;
+    while (bits) {
+        int idx = bit_ctz64(bits);
+        bits &= bits - 1;
+        if (!RANGE_CHECK(idx, 0, LINUX_NSIG)) {
+            all_noninterrupt = false;
+            break;
+        }
+        linux_sigaction_t *act = &sig_state.actions[idx];
+        bool noninterrupt;
+        if (act->sa_handler == LINUX_SIG_IGN) {
+            noninterrupt = true;
+        } else if (act->sa_handler == LINUX_SIG_DFL) {
+            /* Mirror signal_deliver's SIG_DFL switch: IGN, CONT, and STOP
+             * are all discarded with no guest-visible effect on elfuse
+             * (STOP/CONT are not meaningful here), so they cannot
+             * legitimately interrupt a FUSE wait. Treating CONT or STOP
+             * as disruptive would force a spurious EINTR that never
+             * corresponds to an actual delivery.
+             */
+            sig_disposition_t disp = signal_default_disposition(idx + 1);
+            noninterrupt = disp == SIG_DISP_IGN || disp == SIG_DISP_CONT ||
+                           disp == SIG_DISP_STOP;
+        } else {
+            noninterrupt = (act->sa_flags & LINUX_SA_RESTART) != 0;
+        }
+        if (!noninterrupt) {
+            all_noninterrupt = false;
+            break;
+        }
+    }
+
+    pthread_mutex_unlock(&sig_lock);
+    if (restart_out)
+        *restart_out = all_noninterrupt;
+    return true;
+}
+
 const signal_state_t *signal_get_state(void)
 {
     /* Populate IPC-serializable fields from per-thread state under the

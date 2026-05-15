@@ -2,6 +2,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,6 +31,7 @@
 
 enum fuse_opcode {
     FUSE_LOOKUP = 1,
+    FUSE_FORGET = 2,
     FUSE_GETATTR = 3,
     FUSE_OPEN = 14,
     FUSE_READ = 15,
@@ -38,6 +40,8 @@ enum fuse_opcode {
     FUSE_OPENDIR = 27,
     FUSE_READDIR = 28,
     FUSE_RELEASEDIR = 29,
+    FUSE_INTERRUPT = 36,
+    FUSE_BATCH_FORGET = 42,
 };
 
 struct fuse_attr {
@@ -73,6 +77,24 @@ struct fuse_read_in {
     uint64_t lock_owner;
     uint32_t flags;
     uint32_t padding;
+};
+
+struct fuse_forget_in {
+    uint64_t nlookup;
+};
+
+struct fuse_interrupt_in {
+    uint64_t unique;
+};
+
+struct fuse_batch_forget_in {
+    uint32_t count;
+    uint32_t dummy;
+};
+
+struct fuse_forget_one {
+    uint64_t nodeid;
+    uint64_t nlookup;
 };
 
 struct fuse_init_out {
@@ -122,7 +144,39 @@ typedef struct {
     int saw_release;
     int saw_releasedir;
     int init_error;
+    int saw_interrupt;
+    int saw_forget;
+    uint64_t forget_nlookup_total;
+    uint64_t pending_read_unique;
+    int stall_read_once;
+    int stalled_read_active;
 } daemon_ctx_t;
+
+static volatile sig_atomic_t got_usr1;
+
+static void sigusr1_handler(int signum)
+{
+    (void) signum;
+    got_usr1 = 1;
+}
+
+static void *signal_sender_main(void *arg)
+{
+    pthread_t *target = arg;
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGUSR1);
+    if (pthread_sigmask(SIG_BLOCK, &set, NULL) != 0) {
+        perror("pthread_sigmask");
+        exit(1);
+    }
+    usleep(100000);
+    if (pthread_kill(*target, SIGUSR1) != 0) {
+        perror("pthread_kill");
+        exit(1);
+    }
+    return NULL;
+}
 
 static void fill_dir_attr(struct fuse_attr *attr)
 {
@@ -196,7 +250,7 @@ static void *daemon_main(void *arg)
     for (;;) {
         ssize_t nr = read(ctx->fusefd, buf, sizeof(buf));
         if (nr < 0) {
-            if (errno == ENOTCONN)
+            if (errno == ENOTCONN || errno == EBADF)
                 return NULL;
             perror("read(/dev/fuse)");
             exit(1);
@@ -283,6 +337,11 @@ static void *daemon_main(void *arg)
         case FUSE_READ: {
             struct fuse_read_in *rin =
                 (struct fuse_read_in *) (buf + sizeof(*in));
+            if (ctx->stall_read_once && !ctx->stalled_read_active) {
+                ctx->stalled_read_active = 1;
+                ctx->pending_read_unique = in->unique;
+                break;
+            }
             size_t len = sizeof(hello_data) - 1;
             if (rin->offset >= len) {
                 if (reply_frame(ctx->fusefd, in->unique, 0, NULL, 0) < 0)
@@ -297,19 +356,54 @@ static void *daemon_main(void *arg)
                 exit(1);
             break;
         }
+        case FUSE_FORGET: {
+            struct fuse_forget_in *fin =
+                (struct fuse_forget_in *) (buf + sizeof(*in));
+            ctx->saw_forget = 1;
+            ctx->forget_nlookup_total += fin->nlookup;
+            break;
+        }
+        case FUSE_BATCH_FORGET: {
+            struct fuse_batch_forget_in *bin =
+                (struct fuse_batch_forget_in *) (buf + sizeof(*in));
+            struct fuse_forget_one *items =
+                (struct fuse_forget_one *) (bin + 1);
+            size_t max_count =
+                (size_t) (nr - (ssize_t) sizeof(*in) - (ssize_t) sizeof(*bin)) /
+                sizeof(*items);
+            if (bin->count > max_count) {
+                fprintf(stderr, "short BATCH_FORGET payload\n");
+                exit(1);
+            }
+            ctx->saw_forget = 1;
+            for (uint32_t i = 0; i < bin->count; i++)
+                ctx->forget_nlookup_total += items[i].nlookup;
+            break;
+        }
+        case FUSE_INTERRUPT: {
+            struct fuse_interrupt_in *iin =
+                (struct fuse_interrupt_in *) (buf + sizeof(*in));
+            if (ctx->pending_read_unique != 0 &&
+                iin->unique == ctx->pending_read_unique) {
+                ctx->saw_interrupt = 1;
+                if (reply_frame(ctx->fusefd, ctx->pending_read_unique, 0,
+                                hello_data, sizeof(hello_data) - 1) < 0)
+                    exit(1);
+                ctx->pending_read_unique = 0;
+                ctx->stall_read_once = 0;
+                ctx->stalled_read_active = 0;
+            }
+            break;
+        }
         case FUSE_RELEASE:
             ctx->saw_release = 1;
             if (reply_frame(ctx->fusefd, in->unique, 0, NULL, 0) < 0)
                 exit(1);
-            if (ctx->saw_release && ctx->saw_releasedir)
-                return NULL;
             break;
         case FUSE_RELEASEDIR:
             ctx->saw_releasedir = 1;
             if (reply_frame(ctx->fusefd, in->unique, 0, NULL, 0) < 0)
                 exit(1);
-            if (ctx->saw_release && ctx->saw_releasedir)
-                return NULL;
             break;
         default:
             if (reply_frame(ctx->fusefd, in->unique, -ENOSYS, NULL, 0) < 0)
@@ -355,6 +449,13 @@ static void expect_hello_fd(int fd)
 
 int main(void)
 {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = sigusr1_handler;
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(SIGUSR1, &sa, NULL) < 0)
+        die("sigaction(SIGUSR1)");
+
     const char *mount_dir = "/mnt/fuse";
     if (access(mount_dir, F_OK) < 0)
         die("access(mountpoint)");
@@ -498,6 +599,32 @@ int main(void)
     }
     close(dupfd);
 
+    if (lseek(fd, 0, SEEK_SET) < 0)
+        die("lseek(fuse-file)");
+    ctx.stall_read_once = 1;
+    got_usr1 = 0;
+    pthread_t sender;
+    pthread_t main_tid = pthread_self();
+    if (pthread_create(&sender, NULL, signal_sender_main, &main_tid) != 0) {
+        errno = EINVAL;
+        die("pthread_create(signal sender)");
+    }
+    char intr_buf[64];
+    errno = 0;
+    if (read(fd, intr_buf, sizeof(intr_buf)) >= 0 || errno != EINTR) {
+        fprintf(stderr, "expected interrupted FUSE read to fail with EINTR\n");
+        return 1;
+    }
+    if (pthread_join(sender, NULL) != 0) {
+        errno = EINVAL;
+        die("pthread_join(signal sender)");
+    }
+    if (!got_usr1) {
+        fprintf(stderr, "SIGUSR1 handler did not run\n");
+        return 1;
+    }
+    expect_hello_fd(fd);
+
     void *map = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, fd, 0);
     if (map != MAP_FAILED || errno != ENODEV) {
         fprintf(stderr,
@@ -639,5 +766,13 @@ int main(void)
         die("chdir(/) after daemon death");
     close(dupdfd);
     close(dfd);
+    if (!ctx.saw_interrupt) {
+        fprintf(stderr, "daemon did not observe FUSE_INTERRUPT\n");
+        return 1;
+    }
+    if (!ctx.saw_forget || ctx.forget_nlookup_total == 0) {
+        fprintf(stderr, "daemon did not observe FUSE_FORGET traffic\n");
+        return 1;
+    }
     return 0;
 }

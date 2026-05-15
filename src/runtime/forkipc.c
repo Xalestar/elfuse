@@ -346,8 +346,16 @@ int fork_child_main(int ipc_fd,
  * by the worker after vCPU creation and register setup.
  */
 typedef struct {
+    pthread_mutex_t lock;
+    pthread_cond_t cond;
+    bool ready;
+    int startup_rc;
+} thread_startup_t;
+
+typedef struct {
     thread_entry_t *thread;
     guest_t *guest;
+    thread_startup_t *startup;
     bool verbose;
     uint64_t child_stack, flags, tls;
     /* Parent system regs to copy into the new vCPU */
@@ -398,6 +406,11 @@ static int64_t sys_clone_thread(hv_vcpu_t parent_vcpu,
                                 uint64_t ctid_gva,
                                 bool verbose)
 {
+    thread_startup_t startup = {
+        .lock = PTHREAD_MUTEX_INITIALIZER,
+        .cond = PTHREAD_COND_INITIALIZER,
+    };
+
     /* Allocate guest TID */
     int64_t child_tid = proc_alloc_pid();
 
@@ -446,11 +459,14 @@ static int64_t sys_clone_thread(hv_vcpu_t parent_vcpu,
     thread_create_args_t *tca = calloc(1, sizeof(thread_create_args_t));
     if (!tca) {
         thread_deactivate(t);
+        pthread_cond_destroy(&startup.cond);
+        pthread_mutex_destroy(&startup.lock);
         return -LINUX_ENOMEM;
     }
 
     tca->thread = t;
     tca->guest = g;
+    tca->startup = &startup;
     tca->verbose = verbose;
     tca->child_stack = child_stack;
     tca->flags = flags;
@@ -474,6 +490,8 @@ static int64_t sys_clone_thread(hv_vcpu_t parent_vcpu,
         if (guest_write_small(g, ptid_gva, &tid32, sizeof(tid32)) < 0) {
             free(tca);
             thread_deactivate(t);
+            pthread_cond_destroy(&startup.cond);
+            pthread_mutex_destroy(&startup.lock);
             return -LINUX_EFAULT;
         }
     }
@@ -491,6 +509,8 @@ static int64_t sys_clone_thread(hv_vcpu_t parent_vcpu,
         if (guest_write_small(g, ctid_gva, &tid32, sizeof(tid32)) < 0) {
             free(tca);
             thread_deactivate(t);
+            pthread_cond_destroy(&startup.cond);
+            pthread_mutex_destroy(&startup.lock);
             return -LINUX_EFAULT;
         }
     }
@@ -510,10 +530,48 @@ static int64_t sys_clone_thread(hv_vcpu_t parent_vcpu,
         log_error("clone_thread: pthread_create failed: %s", strerror(err));
         free(tca);
         thread_deactivate(t);
+        pthread_cond_destroy(&startup.cond);
+        pthread_mutex_destroy(&startup.lock);
+        /* Roll back any SETTID writes done before pthread_create. Same
+         * rationale as the post-handshake failure path: clone(2) does not
+         * leave live-looking TIDs behind for a thread that never started.
+         */
+        if (flags & LINUX_CLONE_PARENT_SETTID) {
+            int32_t zero = 0;
+            (void) guest_write_small(g, ptid_gva, &zero, sizeof(zero));
+        }
+        if (flags & LINUX_CLONE_CHILD_SETTID) {
+            int32_t zero = 0;
+            (void) guest_write_small(g, ctid_gva, &zero, sizeof(zero));
+        }
         return -LINUX_EAGAIN;
     }
 
     t->host_thread = host_thread;
+
+    pthread_mutex_lock(&startup.lock);
+    while (!startup.ready)
+        pthread_cond_wait(&startup.cond, &startup.lock);
+    pthread_mutex_unlock(&startup.lock);
+    pthread_cond_destroy(&startup.cond);
+    pthread_mutex_destroy(&startup.lock);
+    if (startup.startup_rc < 0) {
+        /* Worker failed during HVF bring-up after the SETTID writes had
+         * already populated the guest TID slots. Linux clone(2) does not
+         * leave a live-looking TID behind for a thread that never started,
+         * so zero the slots before the parent sees the error.
+         */
+        pthread_join(host_thread, NULL);
+        if (flags & LINUX_CLONE_PARENT_SETTID) {
+            int32_t zero = 0;
+            (void) guest_write_small(g, ptid_gva, &zero, sizeof(zero));
+        }
+        if (flags & LINUX_CLONE_CHILD_SETTID) {
+            int32_t zero = 0;
+            (void) guest_write_small(g, ctid_gva, &zero, sizeof(zero));
+        }
+        return startup.startup_rc;
+    }
 
     log_debug("clone_thread: child tid=%lld created", (long long) child_tid);
 
@@ -530,6 +588,7 @@ static void *thread_create_and_run(void *arg)
     thread_create_args_t *tca = (thread_create_args_t *) arg;
     thread_entry_t *t = tca->thread;
     guest_t *g = tca->guest;
+    thread_startup_t *startup = tca->startup;
 
     /* Create vCPU on THIS thread (HVF requirement) */
     hv_vcpu_t vcpu;
@@ -538,6 +597,11 @@ static void *thread_create_and_run(void *arg)
     if (r != HV_SUCCESS) {
         log_error("thread tid=%lld: hv_vcpu_create failed: %d",
                   (long long) t->guest_tid, (int) r);
+        pthread_mutex_lock(&startup->lock);
+        startup->startup_rc = -LINUX_EIO;
+        startup->ready = true;
+        pthread_cond_broadcast(&startup->cond);
+        pthread_mutex_unlock(&startup->lock);
         free(tca);
         thread_deactivate(t);
         return NULL;
@@ -546,49 +610,104 @@ static void *thread_create_and_run(void *arg)
     t->vcpu = vcpu;
     t->vexit = vexit;
 
+    /* Sysreg setup uses checked calls instead of HV_CHECK so the parent's
+     * startup handshake can roll back cleanly rather than tearing down the
+     * whole process on a transient HVF failure here.
+     */
+#define WORKER_HV(call)                                           \
+    do {                                                          \
+        hv_return_t _r = (call);                                  \
+        if (_r != HV_SUCCESS) {                                   \
+            log_error("thread tid=%lld: %s failed: %d",           \
+                      (long long) t->guest_tid, #call, (int) _r); \
+            goto startup_failed;                                  \
+        }                                                         \
+    } while (0)
+
     /* Copy system registers from parent (shared page tables, same MMU config)
      */
-    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_VBAR_EL1, tca->vbar));
-    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_MAIR_EL1, tca->mair));
-    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TCR_EL1, tca->tcr));
-    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TTBR0_EL1, tca->ttbr0));
-    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_CPACR_EL1, tca->cpacr));
+    WORKER_HV(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_VBAR_EL1, tca->vbar));
+    WORKER_HV(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_MAIR_EL1, tca->mair));
+    WORKER_HV(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TCR_EL1, tca->tcr));
+    WORKER_HV(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TTBR0_EL1, tca->ttbr0));
+    WORKER_HV(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_CPACR_EL1, tca->cpacr));
 
     /* MMU already on, so set SCTLR with M=1 directly (page tables exist) */
-    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SCTLR_EL1, tca->sctlr));
+    WORKER_HV(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SCTLR_EL1, tca->sctlr));
 
     /* Per-thread SP_EL1 (each vCPU needs its own EL1 exception stack) */
-    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SP_EL1, tca->sp_el1));
+    WORKER_HV(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SP_EL1, tca->sp_el1));
 
     /* SP_EL0 = child_stack (provided by clone caller) */
-    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SP_EL0, tca->child_stack));
+    WORKER_HV(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SP_EL0, tca->child_stack));
 
     /* TPIDR_EL0 = thread-local storage pointer (if CLONE_SETTLS) */
     if (tca->flags & LINUX_CLONE_SETTLS) {
-        HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TPIDR_EL0, tca->tls));
+        WORKER_HV(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TPIDR_EL0, tca->tls));
     } else {
-        HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TPIDR_EL0, tca->tpidr));
+        WORKER_HV(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TPIDR_EL0, tca->tpidr));
     }
 
     /* ELR_EL1 = clone return point (same as parent) */
-    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, tca->elr));
-    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SPSR_EL1, tca->spsr));
+    WORKER_HV(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, tca->elr));
+    WORKER_HV(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SPSR_EL1, tca->spsr));
 
-    /* Copy all 31 GPRs from parent, then set X0=0 (child clone return) */
-    vcpu_restore_gprs(vcpu, tca->gprs);
-    vcpu_set_gpr(vcpu, 0, 0);
+    /* Copy all 31 GPRs from parent, then set X0=0 (child clone return).
+     * The vcpu_restore_gprs / vcpu_restore_simd helpers in hvutil.h abort
+     * the whole process on failure via HV_CHECK, which would defeat the
+     * handshake rollback. Open-code the restore here so transient HVF
+     * failures fall into the same startup_failed path as the sysreg writes.
+     */
+    for (unsigned i = 0; i < 31; i++)
+        WORKER_HV(hv_vcpu_set_reg(vcpu, HV_REG_X0 + i, tca->gprs[i]));
+    WORKER_HV(hv_vcpu_set_reg(vcpu, HV_REG_X0, 0));
 
-    vcpu_restore_simd(vcpu, &tca->simd_state);
+    for (int i = 0; i < 32; i++)
+        WORKER_HV(hv_vcpu_set_simd_fp_reg(vcpu, HV_SIMD_FP_REG_Q0 + i,
+                                          tca->simd_state.v[i]));
+    WORKER_HV(hv_vcpu_set_reg(vcpu, HV_REG_FPSR, tca->simd_state.fpsr));
+    WORKER_HV(hv_vcpu_set_reg(vcpu, HV_REG_FPCR, tca->simd_state.fpcr));
 
     /* Start at clone return point in EL0 (not shim entry) */
-    HV_CHECK(hv_vcpu_set_reg(vcpu, HV_REG_PC, tca->elr));
-    HV_CHECK(hv_vcpu_set_reg(vcpu, HV_REG_CPSR, 0)); /* EL0t */
+    WORKER_HV(hv_vcpu_set_reg(vcpu, HV_REG_PC, tca->elr));
+    WORKER_HV(hv_vcpu_set_reg(vcpu, HV_REG_CPSR, 0)); /* EL0t */
+#undef WORKER_HV
 
     bool verbose = tca->verbose;
     free(tca);
 
     /* Set per-thread TLS pointer and enter worker run loop */
     current_thread = t;
+
+    pthread_mutex_lock(&startup->lock);
+    startup->startup_rc = 0;
+    startup->ready = true;
+    pthread_cond_broadcast(&startup->cond);
+    pthread_mutex_unlock(&startup->lock);
+
+    goto startup_ok;
+
+startup_failed:
+    /* HVF sysreg/GPR setup failed after vCPU creation. Drop the thread slot
+     * before tearing the vCPU down: thread_interrupt_all() scans the active
+     * set and calls hv_vcpus_exit() on each t->vcpu without a null check, so
+     * clearing t->vcpu while the slot is still active would let a concurrent
+     * exit_group hand a zero handle to HVF. Deactivating first removes the
+     * slot from iteration. Then destroy the vCPU on its owning thread (the
+     * only thread allowed to do so), free args, and finally signal the
+     * parent so it observes a fully torn-down state.
+     */
+    thread_deactivate(t);
+    hv_vcpu_destroy(vcpu);
+    free(tca);
+    pthread_mutex_lock(&startup->lock);
+    startup->startup_rc = -LINUX_EIO;
+    startup->ready = true;
+    pthread_cond_broadcast(&startup->cond);
+    pthread_mutex_unlock(&startup->lock);
+    return NULL;
+
+startup_ok:;
 
     log_debug("thread tid=%lld starting on vCPU", (long long) t->guest_tid);
 
