@@ -1,4 +1,4 @@
-# elfuse — aarch64-linux ELF executor on macOS Apple Silicon
+# elfuse -- aarch64-linux ELF executor on macOS Apple Silicon
 #
 # Copyright 2026 elfuse contributors
 # SPDX-License-Identifier: Apache-2.0
@@ -8,7 +8,7 @@
 #
 # Example: make elfuse
 #          make test-hello
-#          make V=1 elfuse    (verbose — show full commands)
+#          make V=1 elfuse    (verbose -- show full commands)
 
 .DEFAULT_GOAL := help
 .DELETE_ON_ERROR:
@@ -90,7 +90,7 @@ define link-and-sign
 	mv "$$tmp" "$1"
 endef
 
-# ── Main executable ──────────────────────────────────────────────
+# Main executable
 .PHONY: all elfuse
 .PHONY: gen-syscall-dispatch check-syscall-dispatch
 
@@ -119,7 +119,7 @@ elfuse: $(ELFUSE_BIN)
 $(ELFUSE_BIN): $(OBJS) | $(BUILD_DIR)
 	$(call link-and-sign,$@,$(OBJS))
 
-# ── Native test binaries (macOS, Hypervisor.framework) ───────────
+# Native test binaries (macOS, Hypervisor.framework)
 
 ## Build the multi-vCPU HVF validation test (native macOS binary)
 $(BUILD_DIR)/test-multi-vcpu: $(BUILD_DIR)/test-multi-vcpu.o | $(BUILD_DIR)
@@ -129,7 +129,16 @@ $(BUILD_DIR)/test-multi-vcpu: $(BUILD_DIR)/test-multi-vcpu.o | $(BUILD_DIR)
 $(BUILD_DIR)/test-rwx: $(BUILD_DIR)/test-rwx.o | $(BUILD_DIR)
 	$(call link-and-sign,$@,$<)
 
-# ── Guest test binaries (cross-compiled, aarch64-linux) ──────────
+## Build the proctitle argv-tail regression test (native macOS binary)
+# Links against the project-built proctitle.o so the exact in-tree code is
+# exercised; no HVF entitlement is needed because the test only manipulates
+# mmap and PROT_NONE. The codesign step is skipped for the same reason.
+$(BUILD_DIR)/test-proctitle-host: $(BUILD_DIR)/test-proctitle-host.o \
+		$(BUILD_DIR)/runtime/proctitle.o | $(BUILD_DIR)
+	@echo "  LD      $@"
+	$(Q)$(CC) $(CFLAGS) -o $@ $^
+
+# Guest test binaries (cross-compiled, aarch64-linux)
 # Only used when GUEST_TEST_BINARIES is not set.
 
 ifndef GUEST_TEST_BINARIES

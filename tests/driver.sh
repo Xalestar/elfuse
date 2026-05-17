@@ -27,7 +27,14 @@ FILTER=""
 LIST_ONLY=0
 VERBOSE=0
 TAP=0
-ALLOW_MISSING_BINARIES="${ALLOW_MISSING_BINARIES:-auto}"
+# Three values: 0 (strict, default), 1 (skip missing), auto (legacy).
+# In strict mode any missing test binary is a FAIL. The legacy "auto"
+# value flips to skip when TESTDIR is not the canonical build/ or
+# build/bin tree, which used to silently turn a partial out-of-tree
+# fixture set into a wall of green skips. Callers that genuinely want
+# permissive-skip-mode behavior should set ALLOW_MISSING_BINARIES=1
+# explicitly.
+ALLOW_MISSING_BINARIES="${ALLOW_MISSING_BINARIES:-0}"
 
 usage()
 {
@@ -230,15 +237,21 @@ evaluate_result()
     if [ "$rc" -eq 124 ]; then
         return 1
     fi
-    if [ "$rc" -eq 0 ] || {
-        [ -n "$expected" ] && [ "$rc" -eq "$expected" ]
-    }; then
-        if [ -n "$stdout_pat" ] && ! grep -qE "$stdout_pat" <<< "$output"; then
+    # When the manifest declares expected_rc=N, only that exact rc passes.
+    # Without this guard, a test that mistakenly exits 0 instead of its
+    # declared non-zero code (e.g. test-complex with expected_rc=42)
+    # would be reported PASS because rc=0 short-circuited the OR clause.
+    if [ -n "$expected" ]; then
+        if [ "$rc" -ne "$expected" ]; then
             return 1
         fi
-        return 0
+    elif [ "$rc" -ne 0 ]; then
+        return 1
     fi
-    return 1
+    if [ -n "$stdout_pat" ] && ! grep -qE "$stdout_pat" <<< "$output"; then
+        return 1
+    fi
+    return 0
 }
 
 report_case()

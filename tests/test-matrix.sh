@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# test-matrix.sh — Run aarch64 test suites under both elfuse and self-contained
+# test-matrix.sh -- Run aarch64 test suites under both elfuse and self-contained
 # qemu-system-aarch64 reference VM.
 #
 # Modes:
-#   elfuse-aarch64  — run binaries on macOS via build/elfuse
-#   qemu-aarch64    — run binaries natively inside qemu-system-aarch64
+#   elfuse-aarch64  -- run binaries on macOS via build/elfuse
+#   qemu-aarch64    -- run binaries natively inside qemu-system-aarch64
 #                     (boots an Alpine minirootfs initramfs that the
 #                     fixture script downloads on demand)
-#   all             — run both modes back-to-back
+#   all             -- run both modes back-to-back
 #
 # Environment overrides (defaults point at externals/test-fixtures/):
 #   GUEST_TEST_BINARIES        dir of internal test binaries (build/ by default)
@@ -217,6 +217,33 @@ report_timeout()
     fail=$((fail + 1))
 }
 
+# Account for an optional binary or fixture being absent. The previous
+# pattern (`if [ -e "$bin/X" ]; then test_check ... fi`) silently erased
+# the assertion when X was missing, so the suite summary could report
+# "all passed" while major coverage blocks never ran. require_binary
+# always increments skip and emits a skip line, so absences are visible
+# in the summary line at the bottom of each mode.
+require_binary()
+{
+    local label="$1" path="$2"
+    if [ -e "$path" ]; then
+        return 0
+    fi
+    test_report skip "$label" " (missing $path)"
+    skip=$((skip + 1))
+    return 1
+}
+
+# Suite-level analog of require_binary for whole fixture directories.
+# The label names the suite that is being skipped. Use this in place of
+# bare `printf "SKIP\n"` lines so the skip counter reflects reality.
+skip_suite()
+{
+    local label="$1" reason="$2"
+    test_report skip "$label" " ($reason)"
+    skip=$((skip + 1))
+}
+
 test_check()
 {
     local runner="$1"
@@ -235,11 +262,20 @@ test_check()
         report_timeout "$label"
         return
     fi
-    if echo "$output" | grep -qE "$pattern"; then
+    # Require a clean exit before trusting the regex. A crashing tool can
+    # still emit the expected substring on stdout before dying, and the
+    # earlier "regex match alone passes" behavior would have reported
+    # that as OK -- the same silent-skip shape that motivated the
+    # tightening of tests/driver.sh evaluate_result.
+    if [ "$rc" -ne 0 ]; then
+        test_report fail "$label" " (exit $rc)"
+        test_excerpt "$output"
+        fail=$((fail + 1))
+    elif echo "$output" | grep -qE "$pattern"; then
         test_report ok "$label"
         pass=$((pass + 1))
     else
-        test_report fail "$label" " (exit $rc)"
+        test_report fail "$label" " (pattern '$pattern' not found, rc=$rc)"
         test_excerpt "$output"
         fail=$((fail + 1))
     fi
@@ -295,11 +331,19 @@ test_pipe()
         report_timeout "$label"
         return
     fi
-    if echo "$output" | grep -qE "$pattern"; then
+    # See test_check for the rc=0 precondition rationale: a non-zero
+    # exit must surface as FAIL even when the regex matches, otherwise
+    # a crashing pipeline that happens to print the expected substring
+    # would be reported OK.
+    if [ "$rc" -ne 0 ]; then
+        test_report fail "$label" " (exit $rc)"
+        test_excerpt "$output"
+        fail=$((fail + 1))
+    elif echo "$output" | grep -qE "$pattern"; then
         test_report ok "$label"
         pass=$((pass + 1))
     else
-        test_report fail "$label" " (exit $rc)"
+        test_report fail "$label" " (pattern '$pattern' not found, rc=$rc)"
         test_excerpt "$output"
         fail=$((fail + 1))
     fi
@@ -438,16 +482,20 @@ run_coreutils_tests()
     test_rc "$runner" "timeout" 0 "$bindir/timeout" 5 "$bindir/true"
 
     printf "\nCoreutils encoding%s\n" "$_COREUTILS_SUFFIX"
-    if [ -e "$bindir/base32" ]; then
+    # The if/then form contains require_binary's exit status so missing
+    # binaries do not propagate as a function-exit-1 under `set -e`. The
+    # earlier `&& test_check` chain failed the matrix script outright
+    # whenever the LAST optional binary in a function was absent.
+    if require_binary "base32" "$bindir/base32"; then
         test_check "$runner" "base32" "NBSWY" "$bindir/base32" "$TEST_TMPDIR/hello.txt"
     fi
     test_check "$runner" "sha1sum" "hello.txt" "$bindir/sha1sum" "$TEST_TMPDIR/hello.txt"
     test_check "$runner" "sha512sum" "hello.txt" "$bindir/sha512sum" "$TEST_TMPDIR/hello.txt"
-    if [ -e "$bindir/b2sum" ]; then
+    if require_binary "b2sum" "$bindir/b2sum"; then
         test_check "$runner" "b2sum" "hello.txt" "$bindir/b2sum" "$TEST_TMPDIR/hello.txt"
     fi
     test_check "$runner" "cksum" "hello.txt" "$bindir/cksum" "$TEST_TMPDIR/hello.txt"
-    if [ -e "$bindir/numfmt" ]; then
+    if require_binary "numfmt" "$bindir/numfmt"; then
         test_check "$runner" "numfmt" "1\\.0[kK]" "$bindir/numfmt" --to=si 1000
     fi
 }
@@ -500,45 +548,49 @@ run_static_tests()
 
     printf "Static bins\n"
 
-    if [ -e "$bindir/dash" ]; then
+    if require_binary "dash" "$bindir/dash"; then
         test_check "$runner" "dash echo" "hello" "$bindir/dash" -c "echo hello"
         test_check "$runner" "dash arithmetic" "2\\+3=5" "$bindir/dash" -c 'echo "2+3=$((2+3))"'
     fi
-    if [ -e "$bindir/bash" ]; then
+    if require_binary "bash" "$bindir/bash"; then
         test_check "$runner" "bash echo" "hello" "$bindir/bash" -c "echo hello"
         test_pipe "$runner" "bash subshell" "sub=25" "" "$bindir/bash" -c 'echo "sub=$(echo $((5*5)))"'
     fi
+    # lua has two acceptable names; prefer 5.4, then fall back to plain lua,
+    # and skip with accounting if neither is present.
     if [ -e "$bindir/lua5.4" ]; then
         test_check "$runner" "lua hello" "Hello" "$bindir/lua5.4" -e 'print("Hello from " .. _VERSION)'
         test_check "$runner" "lua fib(30)" "832040" "$bindir/lua5.4" -e 'local function f(n) if n<2 then return n end; return f(n-1)+f(n-2) end; print(f(30))'
     elif [ -e "$bindir/lua" ]; then
         test_check "$runner" "lua hello" "Hello" "$bindir/lua" -e 'print("Hello from " .. _VERSION)'
         test_check "$runner" "lua fib(30)" "832040" "$bindir/lua" -e 'local function f(n) if n<2 then return n end; return f(n-1)+f(n-2) end; print(f(30))'
+    else
+        skip_suite "lua" "neither lua5.4 nor lua under $bindir"
     fi
-    if [ -e "$bindir/gawk" ]; then
+    if require_binary "gawk" "$bindir/gawk"; then
         test_pipe "$runner" "gawk field" "world" "hello world" "$bindir/gawk" '{print $2}'
     fi
-    if [ -e "$bindir/grep" ]; then
+    if require_binary "grep" "$bindir/grep"; then
         test_pipe "$runner" "grep basic" "hello" "hello world" "$bindir/grep" hello
     fi
-    if [ -e "$bindir/sed" ]; then
+    if require_binary "sed" "$bindir/sed"; then
         test_pipe "$runner" "sed subst" "HELLO" "hello" "$bindir/sed" 's/hello/HELLO/'
     fi
-    if [ -e "$bindir/jq" ]; then
+    if require_binary "jq" "$bindir/jq"; then
         test_pipe "$runner" "jq simple" "^1$" '{"a":1}' "$bindir/jq" '.a'
         test_pipe "$runner" "jq filter" "Alice" '{"users":[{"name":"Alice","age":30},{"name":"Bob","age":25}]}' "$bindir/jq" '.users[] | select(.age > 28) | .name'
     fi
-    if [ -e "$bindir/sqlite3" ]; then
+    if require_binary "sqlite3" "$bindir/sqlite3"; then
         test_check "$runner" "sqlite version" "^3\\." "$bindir/sqlite3" ":memory:" "SELECT sqlite_version();"
         test_check "$runner" "sqlite arith" "^42$" "$bindir/sqlite3" ":memory:" "SELECT 6 * 7;"
     fi
-    if [ -e "$bindir/tree" ]; then
+    if require_binary "tree" "$bindir/tree"; then
         test_check "$runner" "tree" "director" "$bindir/tree" "$TEST_TMPDIR"
     fi
-    if [ -e "$bindir/find" ]; then
+    if require_binary "find" "$bindir/find"; then
         test_check "$runner" "find" "hello.txt" "$bindir/find" "$TEST_TMPDIR" -name "hello.txt"
     fi
-    if [ -e "$bindir/diff" ]; then
+    if require_binary "diff" "$bindir/diff"; then
         test_rc "$runner" "diff identical" 0 "$bindir/diff" "$TEST_TMPDIR/hello.txt" "$TEST_TMPDIR/hello.txt"
     fi
 }
@@ -587,29 +639,38 @@ run_suite()
 
     if [ -d "$GUEST_STATIC_BINS" ]; then
         run_static_tests "$runner" "$GUEST_STATIC_BINS"
+    else
+        skip_suite "static-bins" "no $GUEST_STATIC_BINS"
     fi
 
-    # Dynamic-musl coreutils — elfuse needs --sysroot, qemu just runs natively.
+    # Dynamic-musl coreutils: elfuse needs --sysroot, qemu runs natively.
+    # The skip line always increments the counter so a partial fixture
+    # set surfaces in the per-mode summary instead of looking like a
+    # full pass.
     if [ -d "$GUEST_DYNAMIC_COREUTILS" ]; then
         if [ "$mode" = "elfuse-aarch64" ] && [ -z "$GUEST_SYSROOT" ]; then
-            printf "\nDynamic coreutils (musl) — SKIP (no GUEST_SYSROOT)\n"
+            skip_suite "dyn-coreutils (musl)" "no GUEST_SYSROOT"
         else
             _COREUTILS_SUFFIX=" (musl dyn)"
             _SYSROOT="$GUEST_SYSROOT"
             run_coreutils_tests "$dyn_runner" "$GUEST_DYNAMIC_COREUTILS"
             _COREUTILS_SUFFIX=""
         fi
+    else
+        skip_suite "dyn-coreutils (musl)" "no $GUEST_DYNAMIC_COREUTILS"
     fi
 
     if [ -n "$GUEST_GLIBC_DYNAMIC_COREUTILS" ] && [ -d "$GUEST_GLIBC_DYNAMIC_COREUTILS" ]; then
         if [ "$mode" = "elfuse-aarch64" ] && [ -z "$GUEST_GLIBC_SYSROOT" ]; then
-            printf "\nDynamic coreutils (glibc) — SKIP (no GUEST_GLIBC_SYSROOT)\n"
+            skip_suite "dyn-coreutils (glibc)" "no GUEST_GLIBC_SYSROOT"
         else
             _COREUTILS_SUFFIX=" (glibc dyn)"
             _SYSROOT="$GUEST_GLIBC_SYSROOT"
             run_coreutils_tests "$dyn_runner" "$GUEST_GLIBC_DYNAMIC_COREUTILS"
             _COREUTILS_SUFFIX=""
         fi
+    else
+        skip_suite "dyn-coreutils (glibc)" "no GUEST_GLIBC_DYNAMIC_COREUTILS"
     fi
 
     _SYSROOT=""

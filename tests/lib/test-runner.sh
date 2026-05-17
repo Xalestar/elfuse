@@ -45,6 +45,21 @@ elif ! command -v timeout > /dev/null 2>&1; then
     unset _timeout_bin _candidate
 fi
 
+# Convert bash $EPOCHREALTIME (seconds.microseconds) to integer microseconds.
+# run() uses this to disambiguate guest timeout(1) returning rc=124 from a
+# harness watchdog firing at TEST_TIMEOUT; SECONDS resolution would mistake
+# either case at short caps. Requires bash 5.0+, already assumed elsewhere
+# (e.g. tests/test-perf.sh epoch_us).
+_test_runner_epoch_us()
+{
+    local t="$EPOCHREALTIME"
+    local sec="${t%%.*}"
+    local frac="${t##*.}"
+    frac="${frac}000000"
+    frac="${frac:0:6}"
+    printf '%s' "$((sec * 1000000 + 10#$frac))"
+}
+
 if [ -t 1 ]; then
     # Use ANSI-C quoting so the variables hold real ESC bytes, not the literal
     # 4-char "\033" sequence. Without this, callers that pass colors as printf
@@ -122,17 +137,50 @@ run()
         return
     fi
 
-    if output=$("${TEST_RUNNER[@]}" "$(test_tool_path "$tool")" "$@" 2>&1); then
+    # Wrap every invocation in `timeout` so a hanging guest tool cannot
+    # freeze the entire suite. run_pipe and run_timeout already do this;
+    # the omission here used to let a deadlocked elfuse syscall path
+    # hang make check forever.
+    #
+    # GNU timeout reports rc=124 on its own timeout, but coreutils-suite
+    # also runs the guest's own timeout(1) with expect_rc=124. Exit code
+    # alone cannot tell the two apart, so wall-clock elapsed time is
+    # used as an out-of-band marker: a harness firing means elapsed is
+    # at or above TEST_TIMEOUT, while the guest case completes well
+    # under it. EPOCHREALTIME (bash 5.0+, already required elsewhere in
+    # this suite) is microsecond-resolution; comparing seconds alone
+    # via SECONDS could undercount by almost a full second and let a
+    # real harness timeout slip through as a guest-OK at small
+    # TEST_TIMEOUT values.
+    local start_us end_us elapsed_us limit_us
+    start_us=$(_test_runner_epoch_us)
+    if output=$(timeout "$TEST_TIMEOUT" "${TEST_RUNNER[@]}" \
+        "$(test_tool_path "$tool")" "$@" 2>&1); then
         rc=0
     else
         rc=$?
     fi
+    end_us=$(_test_runner_epoch_us)
+    elapsed_us=$((end_us - start_us))
+    limit_us=$((TEST_TIMEOUT * 1000000))
+    local harness_timed_out=0
+    if [ "$rc" -eq 124 ] && [ "$elapsed_us" -ge "$limit_us" ]; then
+        harness_timed_out=1
+    fi
 
-    if [ "$rc" = "$expect_rc" ]; then
+    if [ "$harness_timed_out" -eq 1 ]; then
+        test_report fail "$tool" " (timeout after ${TEST_TIMEOUT}s)"
+        test_excerpt "$output"
+        fail=$((fail + 1))
+    elif [ "$rc" = "$expect_rc" ]; then
         detail=""
         [ "$expect_rc" -ne 0 ] && detail=" (exit $rc)"
         test_report ok "$tool" "$detail"
         pass=$((pass + 1))
+    elif [ "$rc" -eq 124 ]; then
+        test_report fail "$tool" " (timeout after ${TEST_TIMEOUT}s)"
+        test_excerpt "$output"
+        fail=$((fail + 1))
     else
         test_report fail "$tool" " (got $rc, expected $expect_rc)"
         test_excerpt "$output"
@@ -152,13 +200,21 @@ run_check()
         return
     fi
 
-    if output=$("${TEST_RUNNER[@]}" "$(test_tool_path "$tool")" "$@" 2>&1); then
+    # See run() for the timeout-vs-expected ordering rationale. run_check
+    # has no explicit expect_rc parameter (zero is implied), so any rc=124
+    # here is treated as a harness timeout.
+    if output=$(timeout "$TEST_TIMEOUT" "${TEST_RUNNER[@]}" \
+        "$(test_tool_path "$tool")" "$@" 2>&1); then
         rc=0
     else
         rc=$?
     fi
 
-    if [ "$rc" -ne 0 ]; then
+    if [ "$rc" -eq 124 ]; then
+        test_report fail "$tool" " (timeout after ${TEST_TIMEOUT}s)"
+        test_excerpt "$output"
+        fail=$((fail + 1))
+    elif [ "$rc" -ne 0 ]; then
         test_report fail "$tool" " (exit rc=$rc)"
         test_excerpt "$output"
         fail=$((fail + 1))

@@ -7,7 +7,7 @@
         test-matrix test-matrix-elfuse-aarch64 test-matrix-qemu-aarch64 \
         test-full test-multi-vcpu test-rwx test-sysroot-rename \
         test-case-collision test-case-collision-fallback test-sysroot-create-paths \
-        test-proctitle-low-stack \
+        test-proctitle-host test-proctitle-low-stack \
         test-sysroot-procfs-exec test-timeout-disable test-fuse-alpine \
         test-sysroot-nofollow test-sysroot-chdir perf
 
@@ -23,6 +23,8 @@ check-syscall-coverage:
 ## Run the unit test suite plus busybox applet validation
 check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage
 	@bash tests/driver.sh -e $(ELFUSE_BIN) -d $(TEST_DIR) -v
+	@printf "\n$(BLUE)━━━ proctitle argv-tail regression ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-proctitle-host
 	@printf "\n$(BLUE)━━━ proctitle low-stack regression ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-proctitle-low-stack
 	@printf "\n$(BLUE)━━━ busybox applet validation ━━━$(RESET)\n"
@@ -35,7 +37,8 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage
 	@$(MAKE) --no-print-directory test-timeout-disable
 
 test-sysroot-rename: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-rename
-	@tmpdir=$$(mktemp -d); \
+	@set -e; \
+	tmpdir=$$(mktemp -d); \
 	trap 'rm -rf "$$tmpdir"; rm -f /tmp/elfuse-sysroot-rename-dst.txt' EXIT; \
 	mkdir -p "$$tmpdir/tmp"; \
 	printf 'inside-sysroot\n' > "$$tmpdir/tmp/elfuse-sysroot-rename-src.txt"; \
@@ -74,7 +77,8 @@ test-case-collision-fallback: $(ELFUSE_BIN) $(BUILD_DIR)/test-case-collision
 	$(ELFUSE_BIN) --sysroot "$$tmpdir" $(BUILD_DIR)/test-case-collision
 
 test-sysroot-create-paths: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-create-paths
-	@tmpdir=$$(mktemp -d); \
+	@set -e; \
+	tmpdir=$$(mktemp -d); \
 	guest_tmp="/tmp/elfuse-sysroot-create-paths/file.txt"; \
 	mounted_tmp="$$tmpdir/case-sysroot/tmp/elfuse-sysroot-create-paths/file.txt"; \
 	host_out_dir="$$tmpdir/host-out"; \
@@ -113,8 +117,7 @@ test-gdbstub: $(ELFUSE_BIN) $(TEST_DIR)/test-hello
 ## Alias for check (backward compat)
 test-all: check
 
-# ── Coreutils integration test ───────────────────────────────────
-
+# Coreutils integration test
 FIXTURES_DIR ?= $(CURDIR)/externals/test-fixtures
 
 ifeq ($(origin GUEST_COREUTILS), undefined)
@@ -171,8 +174,7 @@ test-coreutils: $(ELFUSE_BIN)
 		bash tests/test-coreutils.sh $(ELFUSE_BIN) $(COREUTILS_BIN); \
 	fi
 
-# ── Busybox integration test ─────────────────────────────────────
-
+# Busybox integration test
 ifneq ($(wildcard $(BUILD_DIR)/busybox),)
   BUSYBOX_BIN ?= $(BUILD_DIR)/busybox
 else ifdef GUEST_BUSYBOX
@@ -256,8 +258,7 @@ test-proctitle-low-stack: $(ELFUSE_BIN) $(BUSYBOX_DEPS)
 	fi
 	@bash tests/test-proctitle-low-stack.sh $(ELFUSE_BIN) $(BUSYBOX_BIN)
 
-# ── Static binary integration tests ──────────────────────────────
-
+# Static binary integration tests
 ifdef GUEST_STATIC_BINS
   ifneq ($(wildcard $(GUEST_STATIC_BINS)/bin),)
     STATIC_BINS_DIR ?= $(GUEST_STATIC_BINS)/bin
@@ -278,8 +279,7 @@ test-static-bins: $(ELFUSE_BIN)
 		bash tests/test-static-bins.sh $(ELFUSE_BIN) $(STATIC_BINS_DIR); \
 	fi
 
-# ── Dynamic linking tests ────────────────────────────────────────
-
+# Dynamic linking tests
 # Musl sysroot with dynamic linker + libc.so.
 SYSROOT_DIR ?= $(GUEST_SYSROOT)
 ifdef GUEST_DYNAMIC_COREUTILS
@@ -299,13 +299,24 @@ test-dynamic: $(ELFUSE_BIN)
 	@printf "$(BLUE)▸ Running$(RESET) dynamic hello-dynamic (--sysroot)\n"
 	$(ELFUSE_BIN) --sysroot $(SYSROOT_DIR) $(GUEST_DYNAMIC_TESTS)/bin/hello-dynamic
 
-## Run guest FUSE validation against the Alpine musl sysroot
+## Run guest FUSE validation
+# test-fuse-basic is statically linked and accesses exactly one host path:
+# /mnt/fuse (open + access). /dev/fuse is intercepted by elfuse internally.
+# A minimal sysroot under build/ that contains only /mnt/fuse is therefore
+# sufficient coverage; the earlier dependency on the full Alpine fixture
+# tree was incidental and broke `make distclean && make check` whenever
+# the Alpine CDN pruned a pinned package version.
+#
+# An explicit SYSROOT_DIR override is still honored for users who want
+# the test to run against their own sysroot (e.g. the Alpine fixtures
+# fetched separately for the broader matrix runner).
 test-fuse-alpine: $(ELFUSE_BIN) $(BUILD_DIR)/test-fuse-basic
-	@if [ -z "$(SYSROOT_DIR)" ] || [ ! -d "$(SYSROOT_DIR)" ]; then \
-		printf "$(YELLOW)SKIP$(RESET) Alpine sysroot not found. Set SYSROOT_DIR=/path/to/sysroot or run tests/fetch-fixtures.sh.\n"; \
-		exit 0; \
-	fi
-	@bash tests/test-fuse-alpine.sh $(ELFUSE_BIN) $(SYSROOT_DIR) $(BUILD_DIR)/test-fuse-basic
+	@sysroot="$(SYSROOT_DIR)"; \
+	if [ -z "$$sysroot" ] || [ ! -d "$$sysroot" ]; then \
+		sysroot="$(BUILD_DIR)/fuse-scratch-sysroot"; \
+		mkdir -p "$$sysroot/mnt/fuse"; \
+	fi; \
+	bash tests/test-fuse-alpine.sh $(ELFUSE_BIN) "$$sysroot" $(BUILD_DIR)/test-fuse-basic
 
 ## Run dynamically-linked coreutils tests (--sysroot)
 test-dynamic-coreutils: $(ELFUSE_BIN)
@@ -323,8 +334,7 @@ test-dynamic-coreutils: $(ELFUSE_BIN)
 		bash tests/test-dynamic-coreutils.sh $(ELFUSE_BIN) $(SYSROOT_DIR) $(DYNAMIC_COREUTILS_BIN); \
 	fi
 
-# ── glibc dynamic linking tests ───────────────────────────────────
-
+# glibc dynamic linking tests
 # glibc sysroot with dynamic linker + libc.so.
 GLIBC_SYSROOT_DIR ?= $(GUEST_GLIBC_SYSROOT)
 ifdef GUEST_GLIBC_DYNAMIC_COREUTILS
@@ -358,8 +368,7 @@ test-glibc-coreutils: $(ELFUSE_BIN)
 	    SUITE_SUMMARY="glibc results" \
 	    bash tests/test-dynamic-coreutils.sh $(ELFUSE_BIN) $(GLIBC_SYSROOT_DIR) $(GLIBC_DYNAMIC_COREUTILS_BIN)
 
-# ── Performance benchmark ─────────────────────────────────────────
-
+# Performance benchmark
 ifneq ($(wildcard $(BUILD_DIR)/busybox),)
   PERF_BIN ?= $(BUILD_DIR)/perf-bin
   PERF_DEPS := $(addprefix $(PERF_BIN)/,grep wc cat sort)
@@ -385,8 +394,7 @@ test-perf: $(ELFUSE_BIN) $(PERF_DEPS)
 ## Alias for test-perf
 perf: test-perf
 
-# ── Test matrix (elfuse + qemu, aarch64) ────────────────────────────────
-
+# Test matrix (elfuse + qemu, aarch64)
 ## Run full test matrix (all modes: elfuse + qemu, aarch64)
 test-matrix: $(ELFUSE_BIN) $(TEST_DEPS)
 	@bash tests/test-matrix.sh all
@@ -399,8 +407,7 @@ test-matrix-elfuse-aarch64: $(ELFUSE_BIN) $(TEST_DEPS)
 test-matrix-qemu-aarch64: $(ELFUSE_BIN) $(TEST_DEPS)
 	@bash tests/test-matrix.sh qemu-aarch64
 
-# ── Full test suite ──────────────────────────────────────────────────
-
+# Full test suite
 ## Run the complete test suite (aarch64: unit + busybox + gdbstub + coreutils + static + dynamic)
 test-full: $(ELFUSE_BIN)
 	@printf "\n$(CYAN)╔══════════════════════════════════════════════════════╗$(RESET)\n"
@@ -438,15 +445,19 @@ test-full: $(ELFUSE_BIN)
 	printf "$(CYAN)╚══════════════════════════════════════════════════════╝$(RESET)\n"; \
 	[ "$$fail" -eq 0 ]
 
-# ── Multi-vCPU validation test ─────────────────────────────────────
+# Multi-vCPU validation test
 # Build rules in top-level Makefile; these are just run targets.
 
 ## Run multi-vCPU validation tests (5 tests)
 test-multi-vcpu: $(BUILD_DIR)/test-multi-vcpu
 	$(BUILD_DIR)/test-multi-vcpu
 
-# ── RWX page table entry test ───────────────────────────────────
-
+# RWX page table entry test
 ## Run RWX page table entry test (does HVF allow W+X?)
 test-rwx: $(BUILD_DIR)/test-rwx
 	$(BUILD_DIR)/test-rwx
+
+# Proctitle argv-tail regression
+## Run the deterministic argv-tail overshoot guard test
+test-proctitle-host: $(BUILD_DIR)/test-proctitle-host
+	$(BUILD_DIR)/test-proctitle-host

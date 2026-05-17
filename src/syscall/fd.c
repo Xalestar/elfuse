@@ -1028,7 +1028,7 @@ retry:
             if (written == 0) {
                 /* No bytes transferred: surface EFAULT, leave the queue
                  * untouched so the signal is not lost. Matches the elfuse
-                 * promise locked in by tests/test-tier-b's
+                 * promise locked in by tests/test-fd-family's
                  * test_signalfd_efault_preserves_pending.
                  */
                 if (pending != pending_stack)

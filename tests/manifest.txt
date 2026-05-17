@@ -1,4 +1,4 @@
-# manifest.txt — Declarative test list for elfuse test driver
+# manifest.txt -- Declarative test list for elfuse test driver
 #
 # Copyright 2026 elfuse contributors
 # Copyright 2025 Moritz Angermann, zw3rk pte. ltd.
@@ -171,8 +171,14 @@ test-ancillary
 [section] Tier A compatibility tests
 test-tier-a                        # diff=skip
 
-[section] Tier B correctness tests
-test-tier-b                        # diff=skip
+[section] /proc fidelity tests
+test-proc-fidelity                 # diff=skip
+
+[section] Linux syscall fidelity tests
+test-syscall-fidelity              # diff=skip
+
+[section] fd-family tests
+test-fd-family                     # diff=skip
 
 [section] SCM_CREDENTIALS tests
 test-scm-creds                     # diff=skip

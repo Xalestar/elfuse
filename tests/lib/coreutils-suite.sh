@@ -47,30 +47,24 @@ coreutils_suite_extended_text()
 coreutils_suite_basic_encoding()
 {
     coreutils_print_section "Encoding / hashing"
-    if [ -e "$BIN/base32" ]; then
-        run_check base32 "NBSWY" "$TMPDIR/hello.txt"
-    fi
+    # Optional binaries (base32/basenc/sha224sum/sha384sum/b2sum/sum) are
+    # gated by test_skip_missing_tool inside run_check: when the wrapper
+    # sets TEST_SKIP_MISSING_TOOLS=1 they report SKIP with accounting,
+    # otherwise the missing binary surfaces as a hard FAIL. The previous
+    # raw "if [ -e ... ]; then" blocks bypassed both paths, silently
+    # erasing assertions whenever the binary was absent.
+    run_check base32 "NBSWY" "$TMPDIR/hello.txt"
     run_check base64 "aGVsbG8" "$TMPDIR/hello.txt"
-    if [ -e "$BIN/basenc" ]; then
-        run_check basenc "aGVsbG8" "--base64" "$TMPDIR/hello.txt"
-    fi
+    run_check basenc "aGVsbG8" "--base64" "$TMPDIR/hello.txt"
     run_check md5sum "hello.txt" "$TMPDIR/hello.txt"
     run_check sha1sum "hello.txt" "$TMPDIR/hello.txt"
-    if [ -e "$BIN/sha224sum" ]; then
-        run_check sha224sum "95041d" "$TMPDIR/hello.txt"
-    fi
+    run_check sha224sum "95041d" "$TMPDIR/hello.txt"
     run_check sha256sum "hello.txt" "$TMPDIR/hello.txt"
-    if [ -e "$BIN/sha384sum" ]; then
-        run_check sha384sum "6b3b69" "$TMPDIR/hello.txt"
-    fi
+    run_check sha384sum "6b3b69" "$TMPDIR/hello.txt"
     run_check sha512sum "hello.txt" "$TMPDIR/hello.txt"
-    if [ -e "$BIN/b2sum" ]; then
-        run_check b2sum "hello.txt" "$TMPDIR/hello.txt"
-    fi
+    run_check b2sum "hello.txt" "$TMPDIR/hello.txt"
     run_check cksum "hello.txt" "$TMPDIR/hello.txt"
-    if [ -e "$BIN/sum" ]; then
-        run_check sum "[0-9]" "$TMPDIR/hello.txt"
-    fi
+    run_check sum "[0-9]" "$TMPDIR/hello.txt"
 }
 
 coreutils_suite_basic_files()
@@ -164,9 +158,10 @@ coreutils_suite_basic_math()
     run_check seq "5" "1" "5"
     run_check expr "3" "1" "+" "2"
     run_check factor "2 2 3" "12"
-    if [ -e "$BIN/numfmt" ]; then
-        run_check numfmt "1\\.0[kK]" "--to=si" "1000"
-    fi
+    # numfmt is optional in some packages; rely on test_skip_missing_tool
+    # so absence becomes a SKIP under TEST_SKIP_MISSING_TOOLS=1 and a FAIL
+    # otherwise, rather than a silent omission.
+    run_check numfmt "1\\.0[kK]" "--to=si" "1000"
 }
 
 coreutils_suite_basic_sysinfo()
