@@ -82,6 +82,18 @@ void proc_set_elfuse_path(const char *path);
 /* Get the stored elfuse binary path. Returns NULL if not set. */
 const char *proc_get_elfuse_path(void);
 
+/* Process-wide feature gate for x86_64-via-Rosetta support. */
+void proc_set_rosetta_enabled(bool enabled);
+bool proc_rosetta_enabled(void);
+
+/* Runtime indicator: true once the guest_t has been initialised in rosetta
+ * mode. Distinct from proc_rosetta_enabled which reflects the user opt-in.
+ * Code paths that lack direct guest_t access (proc_intercept_readlink) can
+ * branch on the runtime state without threading g through every signature.
+ */
+void proc_set_rosetta_active(bool active);
+bool proc_rosetta_active(void);
+
 /* Store the guest command line for /proc/self/cmdline emulation.
  * argv is a NULL-terminated array of strings.
  */

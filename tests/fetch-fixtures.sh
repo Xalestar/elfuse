@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# fetch-fixtures.sh — Download Alpine packages and assemble a qemu/elfuse
+# fetch-fixtures.sh -- Download Alpine packages and assemble a qemu/elfuse
 # test fixture tree under externals/test-fixtures/.
 #
 # Idempotent: re-runs are no-ops once everything is in place.  Re-execute
@@ -8,12 +8,25 @@
 # Layout:
 #   externals/test-fixtures/
 #     cache/                       # downloaded .apk + .tar.gz
+#     cache/x86_64/                # x86_64 .apk + .tar.gz (when enabled)
 #     kernel/vmlinuz-virt          # extracted aarch64 kernel image
-#     rootfs/                      # extracted minirootfs + overlays
-#     initramfs.cpio.gz            # built from rootfs/
+#     rootfs/                      # extracted aarch64 minirootfs + overlays
+#     initramfs.cpio.gz            # built from rootfs/ (qemu boot image)
 #     keys/{ssh_key,ssh_key.pub}   # generated ssh keypair
 #     aarch64-musl/
 #       staticbin/bin/             # busybox-static + applet symlinks
+#       dyn-bin/                   # relative symlinks into rootfs
+#     x86_64-musl/                 # only when INCLUDE_X86_64=1
+#       rootfs/                    # x86_64 minirootfs + apk overlays
+#       staticbin/bin/             # x86_64 busybox-static + applets
+#       dyn-bin/                   # x86_64 dyn-bin aggregate
+#
+# Environment:
+#   FORCE=1            Rebuild every stage from scratch.
+#   INCLUDE_X86_64=1   Also fetch x86_64 userspace for the elfuse-x86_64
+#                      test-matrix mode. Default off; adds ~80 MiB of
+#                      downloads but reuses the same Alpine version pin
+#                      so the package set stays aligned across arches.
 #
 # SPDX-License-Identifier: Apache-2.0
 
@@ -40,7 +53,7 @@ INITRAMFS="${FIXTURES}/initramfs.cpio.gz"
 # Pinned package versions (Alpine 3.21).  When bumping ALPINE_VERSION, refresh
 # these by querying the repo's APKINDEX.
 declare -A PKGS=(
-    ["main:linux-virt"]="6.12.85-r0"
+    ["main:linux-virt"]="6.12.90-r0"
     ["main:busybox-static"]="1.37.0-r14"
     ["main:dropbear"]="2024.86-r0"
     ["main:zlib"]="1.3.2-r0"
@@ -338,12 +351,99 @@ EOF
     fi
     ok "static-bin: ${STATICBIN}/busybox + ${#STATIC_APPLETS[@]} applets"
 
+    if [ "${INCLUDE_X86_64:-0}" = "1" ]; then
+        fetch_x86_64_userspace
+    fi
+
     printf '\n%s\n' "$(c_yellow 'Fixtures ready.')"
     printf 'rootfs/sysroot:  %s\n' "$ROOTFS"
     printf 'kernel:          %s\n' "${KERNEL_DIR}/vmlinuz-virt"
     printf 'initramfs:       %s\n' "$INITRAMFS"
     printf 'ssh key:         %s\n' "${KEYS_DIR}/ssh_key"
     printf 'static bin tree: %s\n' "$STATICBIN"
+    if [ "${INCLUDE_X86_64:-0}" = "1" ]; then
+        printf 'x86_64 rootfs:   %s\n' "${FIXTURES}/x86_64-musl/rootfs"
+        printf 'x86_64 staticbin:%s\n' "${FIXTURES}/x86_64-musl/staticbin/bin"
+    fi
+}
+
+# Fetch just enough Alpine x86_64 packages to drive the elfuse-x86_64 test
+# matrix mode through rosetta. Userspace only: no kernel or initramfs is
+# built because elfuse runs x86_64 binaries directly. Pinned to the same
+# Alpine release as the aarch64 corpus so busybox / coreutils versions match
+# and the per-mode expected-count table stays consistent.
+fetch_x86_64_userspace()
+{
+    local x86_cache="${FIXTURES}/cache/x86_64"
+    local x86_rootfs="${FIXTURES}/x86_64-musl/rootfs"
+    local x86_staticbin="${FIXTURES}/x86_64-musl/staticbin/bin"
+    local x86_dynbin="${FIXTURES}/x86_64-musl/dyn-bin"
+    mkdir -p "$x86_cache" "$x86_rootfs" "$x86_staticbin" "$x86_dynbin"
+
+    local x86_main="${CDN_BASE}/main/x86_64"
+    local x86_releases="${CDN_BASE}/releases/x86_64"
+    local x86_minirootfs="alpine-minirootfs-${ALPINE_PATCH}-x86_64.tar.gz"
+
+    log "x86_64: fetch packages"
+    for key in "${!PKGS[@]}"; do
+        local repo="${key%%:*}" name="${key##*:}" version="${PKGS[$key]}"
+        [ "$repo" = "main" ] || continue
+        local x86_url="${x86_main}/${name}-${version}.apk"
+        local x86_dest="${x86_cache}/${name}-${version}.apk"
+        fetch "$x86_url" "$x86_dest"
+    done
+    fetch "${x86_releases}/${x86_minirootfs}" "${x86_cache}/${x86_minirootfs}"
+
+    if [ "${FORCE:-0}" = "1" ] || [ ! -e "${x86_rootfs}/.staged" ]; then
+        log "x86_64: stage rootfs"
+        rm -rf "$x86_rootfs"
+        mkdir -p "$x86_rootfs"
+        tar xzf "${x86_cache}/${x86_minirootfs}" -C "$x86_rootfs" 2> /dev/null
+        for key in "${!PKGS[@]}"; do
+            local repo="${key%%:*}" name="${key##*:}" version="${PKGS[$key]}"
+            [ "$repo" = "main" ] || continue
+            [ "$name" = "linux-virt" ] && continue
+            extract_apk_to "${x86_cache}/${name}-${version}.apk" "$x86_rootfs"
+        done
+        touch "${x86_rootfs}/.staged"
+    fi
+    ok "x86_64 rootfs ($(du -sh "$x86_rootfs" 2> /dev/null | cut -f1))"
+
+    if [ ! -s "${x86_staticbin}/busybox" ] || [ "${FORCE:-0}" = "1" ]; then
+        log "x86_64: stage static-bin tree"
+        rm -rf "$x86_staticbin"
+        mkdir -p "$x86_staticbin"
+        local stage
+        stage="$(mktemp -d)"
+        tar xzf "${x86_cache}/busybox-static-${PKGS["main:busybox-static"]}.apk" \
+            -C "$stage" 2> /dev/null
+        mv "${stage}/bin/busybox.static" "${x86_staticbin}/busybox"
+        chmod 755 "${x86_staticbin}/busybox"
+        rm -rf "$stage"
+        for applet in "${STATIC_APPLETS[@]}"; do
+            ln -sfn busybox "${x86_staticbin}/${applet}"
+        done
+    fi
+    ok "x86_64 static-bin: ${x86_staticbin}/busybox + ${#STATIC_APPLETS[@]} applets"
+
+    if [ ! -d "$x86_dynbin" ] || [ -z "$(ls -A "$x86_dynbin" 2> /dev/null)" ] \
+        || [ "${FORCE:-0}" = "1" ]; then
+        log "x86_64: stage dyn-bin aggregate"
+        rm -rf "$x86_dynbin"
+        mkdir -p "$x86_dynbin"
+        for sub in bin usr/bin; do
+            [ -d "${x86_rootfs}/${sub}" ] || continue
+            for src in "${x86_rootfs}/${sub}"/*; do
+                [ -e "$src" ] || continue
+                local name
+                name="$(basename "$src")"
+                [ -e "${x86_dynbin}/${name}" ] && continue
+                ln -sfn "../rootfs/${sub}/${name}" "${x86_dynbin}/${name}"
+            done
+        done
+    fi
+    ok "x86_64 dyn-bin: $(find "$x86_dynbin" -maxdepth 1 -type l 2> /dev/null \
+        | wc -l | tr -d ' ') entries"
 }
 
 main "$@"

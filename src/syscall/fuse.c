@@ -1970,6 +1970,28 @@ static void fuse_file_release(fuse_file_snap_t *snap)
     pthread_mutex_unlock(&fuse_lock);
 }
 
+int fuse_materialize_fd(int fd, char *out_path, size_t outsz)
+{
+    fuse_file_snap_t snap;
+    int rc = fuse_file_acquire(fd, false, false, &snap);
+    if (rc < 0)
+        return rc;
+
+    if (snap.path_only) {
+        char path[LINUX_PATH_MAX];
+        str_copy_trunc(path, snap.file->path, sizeof(path));
+        fuse_file_release(&snap);
+        return fuse_materialize_path(path, out_path, outsz);
+    }
+
+    pthread_mutex_lock(&snap.session->lock);
+    rc = fuse_materialize_open_file_locked(snap.session, snap.nodeid, snap.fh,
+                                           LINUX_O_RDONLY, out_path, outsz);
+    pthread_mutex_unlock(&snap.session->lock);
+    fuse_file_release(&snap);
+    return rc;
+}
+
 /* Read up to count bytes from a FUSE-backed file or directory at offset.
  * Writes the daemon's reply into the guest buffer at buf_gva. Updates the
  * stream offset on success when advance_offset is true and the fd still

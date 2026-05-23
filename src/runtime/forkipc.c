@@ -121,9 +121,12 @@ int fork_child_main(int ipc_fd,
      * (size - 8 GiB) and interp_base (size - 4 GiB) plus the 4 MiB infra
      * reserve below it. 8 GiB satisfies all three with margin.
      * Upper bound: guest_size must fit in the negotiated IPA width.
-     * IPA bits: 36 (Apple M2) and 40 (M3+) are the supported widths.
+     * IPA bits: 36 (M1/M2) and 40 (M3+) for native aarch64; 48 for
+     * Rosetta guests, which need the wider Stage-2 width for high VAs
+     * (image at 128 TiB) even though their primary slab stays under
+     * 40-bit. Reject anything outside [36, 48].
      */
-    if (hdr.ipa_bits < 36 || hdr.ipa_bits > 40) {
+    if (hdr.ipa_bits < 36 || hdr.ipa_bits > 48) {
         log_error("fork-child: invalid ipa_bits %u", (unsigned) hdr.ipa_bits);
         close(ipc_fd);
         return 1;
@@ -210,6 +213,22 @@ int fork_child_main(int ipc_fd,
     g.ttbr0 = hdr.ttbr0;
     g.mmap_rx_next = hdr.mmap_rx_next;
     g.mmap_rx_end = hdr.mmap_rx_end;
+    /* Restore rosetta placement so the non-identity page-table entries that
+     * came across in the memory transfer continue to resolve. ttbr1 points
+     * at the L0 page the parent's PT pool emitted; that page sits inside
+     * the primary buffer and is copied by the region transfer below, so the
+     * child can reuse it without rebuilding the tree.
+     */
+    g.is_rosetta = (hdr.is_rosetta != 0);
+    proc_set_rosetta_active(g.is_rosetta);
+    g.rosetta_guest_base = hdr.rosetta_guest_base;
+    g.rosetta_va_base = hdr.rosetta_va_base;
+    g.rosetta_size = hdr.rosetta_size;
+    g.rosetta_entry = hdr.rosetta_entry;
+    g.kbuf_gpa = hdr.kbuf_gpa;
+    g.ttbr1 = hdr.ttbr1;
+    if (g.is_rosetta && g.kbuf_gpa)
+        g.kbuf_base = (uint8_t *) g.host_base + g.kbuf_gpa;
 
     /* Register state is the fork return frame captured from the parent vCPU. */
     ipc_registers_t regs;
@@ -274,6 +293,7 @@ int fork_child_main(int ipc_fd,
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_MAIR_EL1, regs.mair_el1));
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TCR_EL1, regs.tcr_el1));
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TTBR0_EL1, regs.ttbr0_el1));
+    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TTBR1_EL1, regs.ttbr1_el1));
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_CPACR_EL1, regs.cpacr_el1));
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SP_EL0, regs.sp_el0));
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SP_EL1, regs.sp_el1));
@@ -1056,6 +1076,15 @@ int64_t sys_clone(hv_vcpu_t vcpu,
                                 verbose);
     }
 
+    /* Rosetta fork takes the helper-process IPC path. The CoW shm fast-path
+     * is gated off in use_shm because HVF caches VA->PA at hv_vm_map time and
+     * the parent's MAP_SHARED mapping cannot be safely remapped under the
+     * running vCPU. The TTBR1 kbuf tree, translator image, and kbuf bytes
+     * ride along as primary-buffer used regions; the child restores
+     * TCR_EL1 / TTBR1_EL1 from ipc_registers_t and recomputes kbuf_base
+     * from kbuf_gpa.
+     */
+
     /* elfuse only supports fork-like clone (SIGCHLD) and posix_spawn-like
      * clone (CLONE_VM|CLONE_VFORK|SIGCHLD)
      */
@@ -1117,6 +1146,13 @@ int64_t sys_clone(hv_vcpu_t vcpu,
     child_argv[ci++] = self_path;
     if (verbose)
         child_argv[ci++] = "--verbose";
+    /* Rosetta is on by default; only propagate the opt-out flag when the
+     * parent explicitly disabled it. The child re-reads ELFUSE_NO_ROSETTA
+     * from the environment too, so an env-based opt-out is preserved
+     * across fork without an explicit argv entry.
+     */
+    if (!proc_rosetta_enabled())
+        child_argv[ci++] = "--no-rosetta";
     child_argv[ci++] = "--fork-child";
     child_argv[ci++] = fd_str;
     if (is_vfork) {
@@ -1207,9 +1243,13 @@ int64_t sys_clone(hv_vcpu_t vcpu,
     /* Determine if elfuse can use the CoW (shm) fast path.
      * If shm_fd >= 0, elfuse freezes a snapshot via MAP_PRIVATE and sends the
      * shm fd to the child. Otherwise fall back to region-by-region copy.
+     *
+     * Rosetta guests are excluded from CoW even when shm-backed: rosetta's
+     * JIT state (TLS slabs, code caches, indirect-call tables, block lists)
+     * is process-local and corrupts when COW-shared. The legacy region-copy
+     * path preserves the parent's JIT state independently per child.
      */
-    /* Use CoW fork when the guest has file-backed shared memory. */
-    bool use_shm = (g->shm_fd >= 0);
+    bool use_shm = (g->shm_fd >= 0) && !g->is_rosetta;
 
     /* elfuse does not remap the parent to MAP_PRIVATE here. The parent
      * stays on MAP_SHARED; its vCPU continues writing to the shared file.
@@ -1260,6 +1300,13 @@ int64_t sys_clone(hv_vcpu_t vcpu,
         .absock_namespace_id = absock_get_namespace_id(),
         .sid = proc_get_sid(),
         .pgid = proc_get_pgid(),
+        .is_rosetta = g->is_rosetta ? 1 : 0,
+        .rosetta_guest_base = g->rosetta_guest_base,
+        .rosetta_va_base = g->rosetta_va_base,
+        .rosetta_size = g->rosetta_size,
+        .rosetta_entry = g->rosetta_entry,
+        .kbuf_gpa = g->kbuf_gpa,
+        .ttbr1 = g->ttbr1,
     };
     if (fork_ipc_write_all(ipc_sock, &hdr, sizeof(hdr)) < 0) {
         log_error("clone: failed to send header");
@@ -1320,6 +1367,7 @@ int64_t sys_clone(hv_vcpu_t vcpu,
     regs.spsr_el1 = vcpu_get_sysreg(vcpu, HV_SYS_REG_SPSR_EL1);
     regs.vbar_el1 = vcpu_get_sysreg(vcpu, HV_SYS_REG_VBAR_EL1);
     regs.ttbr0_el1 = vcpu_get_sysreg(vcpu, HV_SYS_REG_TTBR0_EL1);
+    regs.ttbr1_el1 = vcpu_get_sysreg(vcpu, HV_SYS_REG_TTBR1_EL1);
     regs.sctlr_el1 = vcpu_get_sysreg(vcpu, HV_SYS_REG_SCTLR_EL1);
     regs.tcr_el1 = vcpu_get_sysreg(vcpu, HV_SYS_REG_TCR_EL1);
     regs.mair_el1 = vcpu_get_sysreg(vcpu, HV_SYS_REG_MAIR_EL1);

@@ -19,13 +19,16 @@
 #include "utils.h"
 
 #include "core/bootstrap.h"
+#include "core/rosetta.h"
 #include "core/stack.h"
 #include "core/vdso.h"
 
 #include "runtime/thread.h"
 
 #include "syscall/abi.h"
+#include "syscall/fuse.h"
 #include "syscall/internal.h"
+#include "syscall/path.h"
 #include "syscall/proc.h"
 
 #include "debug/log.h"
@@ -48,6 +51,104 @@ static bool append_boot_region(mem_region_t *regions,
         .gpa_start = gpa_start, .gpa_end = gpa_end, .perms = perms};
     (*nregions)++;
     return true;
+}
+
+/* Emit one mem_region_t per PT_LOAD segment of an ELF image, offset by the
+ * caller-supplied load base. Returns false if the boot region array fills up.
+ */
+static bool append_elf_segment_regions(mem_region_t *regions,
+                                       int *nregions,
+                                       const elf_info_t *info,
+                                       uint64_t load_base)
+{
+    for (int i = 0; i < info->num_segments; i++) {
+        uint64_t seg_start = info->segments[i].gpa + load_base;
+        uint64_t seg_end = seg_start + info->segments[i].memsz;
+        if (!append_boot_region(regions, nregions, seg_start, seg_end,
+                                elf_pf_to_prot(info->segments[i].flags))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Register one semantic guest_region_t per PT_LOAD segment of an ELF image.
+ * va_load_base controls the guest-visible range, gpa_load_base controls the
+ * backing GPA recorded in region metadata, and path is used for
+ * /proc/self/maps reporting.
+ */
+static void register_elf_segment_regions(guest_t *g,
+                                         const elf_info_t *info,
+                                         uint64_t va_load_base,
+                                         uint64_t gpa_load_base,
+                                         const char *path)
+{
+    for (int i = 0; i < info->num_segments; i++) {
+        uint64_t seg_start = info->segments[i].gpa + va_load_base;
+        uint64_t seg_end = seg_start + info->segments[i].memsz;
+        uint64_t seg_gpa = info->segments[i].gpa + gpa_load_base;
+        guest_region_add_ex_gpa(g, seg_start, seg_end, seg_gpa,
+                                elf_pf_to_prot(info->segments[i].flags),
+                                LINUX_MAP_PRIVATE, info->segments[i].offset,
+                                path, -1);
+    }
+}
+
+/* Publish shim, shim-data, heap, stack-guard, and stack regions to the
+ * /proc/self/maps view, and invalidate the null page and stack-guard PTEs.
+ * Shared by guest_bootstrap_prepare and guest_bootstrap_rosetta_post_reset;
+ * the caller registers ELF or rosetta segments separately because those
+ * differ between aarch64 and rosetta guests.
+ */
+static void register_runtime_regions(guest_t *g, size_t shim_bin_len)
+{
+    guest_region_add(g, g->shim_base, g->shim_base + shim_bin_len,
+                     LINUX_PROT_READ | LINUX_PROT_EXEC, LINUX_MAP_PRIVATE, 0,
+                     "[shim]");
+    guest_region_add(g, g->shim_data_base, g->shim_data_base + BLOCK_2MIB,
+                     LINUX_PROT_READ | LINUX_PROT_WRITE, LINUX_MAP_PRIVATE, 0,
+                     "[shim-data]");
+
+    if (g->brk_base < g->brk_current) {
+        guest_region_add(g, g->brk_base, g->brk_current,
+                         LINUX_PROT_READ | LINUX_PROT_WRITE,
+                         LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS, 0, "[heap]");
+    }
+
+    guest_invalidate_ptes(g, g->stack_base, g->stack_base + STACK_GUARD_SIZE);
+    guest_region_add(g, g->stack_base, g->stack_base + STACK_GUARD_SIZE,
+                     LINUX_PROT_NONE, LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
+                     0, "[stack-guard]");
+    guest_region_add(g, g->stack_base + STACK_GUARD_SIZE, g->stack_top,
+                     LINUX_PROT_READ | LINUX_PROT_WRITE,
+                     LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS, 0, "[stack]");
+    guest_invalidate_ptes(g, 0, 0x1000);
+}
+
+int guest_bootstrap_probe_elf(const char *elf_path, elf_info_t *info)
+{
+    memset(info, 0, sizeof(*info));
+
+    FILE *f = fopen(elf_path, "rb");
+    if (!f)
+        return -1;
+
+    elf64_ehdr_t ehdr;
+    size_t nread = fread(&ehdr, 1, sizeof(ehdr), f);
+    fclose(f);
+    if (nread < sizeof(ehdr))
+        return -1;
+
+    if (ehdr.e_ident[0] != ELFMAG0 || ehdr.e_ident[1] != ELFMAG1 ||
+        ehdr.e_ident[2] != ELFMAG2 || ehdr.e_ident[3] != ELFMAG3)
+        return -1;
+    if (ehdr.e_ident[EI_CLASS] != ELFCLASS64 ||
+        ehdr.e_ident[EI_DATA] != ELFDATA2LSB)
+        return -1;
+
+    info->e_machine = ehdr.e_machine;
+    info->e_type = ehdr.e_type;
+    return 0;
 }
 
 static void invalidate_exec_segments(const elf_info_t *info,
@@ -93,18 +194,54 @@ static bool load_interpreter(guest_t *g,
     if (boot->elf_info.interp_path[0] == '\0')
         return true;
 
+    bool interp_host_temp = false;
+    char interp_host_candidate[LINUX_PATH_MAX];
     elf_resolve_interp(sysroot, boot->elf_info.interp_path,
-                       boot->interp_resolved, sizeof(boot->interp_resolved));
+                       interp_host_candidate, sizeof(interp_host_candidate));
+    if (strcmp(interp_host_candidate, boot->elf_info.interp_path) == 0) {
+        path_translation_t tx;
+        if (path_translate_at(LINUX_AT_FDCWD, boot->elf_info.interp_path,
+                              PATH_TR_NONE, &tx) < 0) {
+            log_error("failed to resolve interpreter: %s",
+                      boot->elf_info.interp_path);
+            return false;
+        }
+        if (tx.fuse_path) {
+            int rc =
+                fuse_materialize_path(tx.intercept_path, boot->interp_resolved,
+                                      sizeof(boot->interp_resolved));
+            if (rc < 0) {
+                log_error("failed to materialize interpreter: %s",
+                          boot->elf_info.interp_path);
+                return false;
+            }
+            interp_host_temp = true;
+        } else {
+            str_copy_trunc(boot->interp_resolved, tx.host_path,
+                           sizeof(boot->interp_resolved));
+        }
+    } else {
+        str_copy_trunc(boot->interp_resolved, interp_host_candidate,
+                       sizeof(boot->interp_resolved));
+    }
+    str_copy_trunc(
+        boot->interp_display_path,
+        interp_host_temp ? boot->elf_info.interp_path : boot->interp_resolved,
+        sizeof(boot->interp_display_path));
     log_debug("loading interpreter: %s", boot->interp_resolved);
 
     if (elf_load(boot->interp_resolved, &boot->interp_info) < 0) {
         log_error("failed to load interpreter: %s", boot->interp_resolved);
+        if (interp_host_temp)
+            unlink(boot->interp_resolved);
         return false;
     }
 
     if (boot->interp_info.e_machine != EM_AARCH64) {
         log_error("interpreter has unsupported machine type %u: %s",
                   boot->interp_info.e_machine, boot->interp_resolved);
+        if (interp_host_temp)
+            unlink(boot->interp_resolved);
         return false;
     }
 
@@ -112,8 +249,12 @@ static bool load_interpreter(guest_t *g,
     if (elf_map_segments(&boot->interp_info, boot->interp_resolved,
                          g->host_base, g->guest_size, boot->interp_base) < 0) {
         log_error("failed to map interpreter segments");
+        if (interp_host_temp)
+            unlink(boot->interp_resolved);
         return false;
     }
+    if (interp_host_temp)
+        unlink(boot->interp_resolved);
 
     log_debug(
         "interpreter loaded at base=0x%llx, entry=0x%llx, %d segments",
@@ -143,24 +284,19 @@ static bool build_boot_regions(mem_region_t *regions,
         return false;
     }
 
-    for (int i = 0; i < boot->elf_info.num_segments; i++) {
-        if (!append_boot_region(
-                regions, nregions,
-                boot->elf_info.segments[i].gpa + boot->elf_load_base,
-                boot->elf_info.segments[i].gpa +
-                    boot->elf_info.segments[i].memsz + boot->elf_load_base,
-                elf_pf_to_prot(boot->elf_info.segments[i].flags))) {
-            return false;
-        }
-    }
-
-    for (int i = 0; i < boot->interp_info.num_segments; i++) {
-        if (!append_boot_region(
-                regions, nregions,
-                boot->interp_info.segments[i].gpa + boot->interp_base,
-                boot->interp_info.segments[i].gpa +
-                    boot->interp_info.segments[i].memsz + boot->interp_base,
-                elf_pf_to_prot(boot->interp_info.segments[i].flags))) {
+    /* Rosetta guests never load the x86_64 ELF or its interpreter into
+     * guest memory; rosetta itself reads the target via fd 3 once it is
+     * running. Adding those segments to the page-table builder would emit
+     * ghost L2/L3 entries at the binary's x86_64 link address (typically
+     * 0x400000) pointing into uninitialised primary-buffer GPAs. The
+     * rosetta image's own segments are registered by rosetta_prepare's
+     * separate region append in the bootstrap caller.
+     */
+    if (!g->is_rosetta) {
+        if (!append_elf_segment_regions(regions, nregions, &boot->elf_info,
+                                        boot->elf_load_base) ||
+            !append_elf_segment_regions(regions, nregions, &boot->interp_info,
+                                        boot->interp_base)) {
             return false;
         }
     }
@@ -182,7 +318,9 @@ static bool build_boot_regions(mem_region_t *regions,
 }
 
 int guest_bootstrap_prepare(guest_t *g,
-                            const char *elf_path,
+                            const char *elf_host_path,
+                            bool elf_host_path_temp,
+                            const char *elf_guest_path,
                             const char *sysroot,
                             int guest_argc,
                             const char **guest_argv,
@@ -200,57 +338,98 @@ int guest_bootstrap_prepare(guest_t *g,
     memset(boot, 0, sizeof(*boot));
     *guest_initialized = false;
 
-    if (elf_load(elf_path, &boot->elf_info) < 0) {
-        log_error("failed to load ELF: %s", elf_path);
+    if (elf_load(elf_host_path, &boot->elf_info) < 0) {
+        log_error("failed to load ELF: %s", elf_host_path);
         return -1;
     }
 
-    if (boot->elf_info.e_machine != EM_AARCH64) {
-        log_error("unsupported ELF machine type %u (only aarch64 is supported)",
-                  boot->elf_info.e_machine);
+    bool want_rosetta = false;
+    if (boot->elf_info.e_machine == EM_X86_64) {
+        if (!proc_rosetta_enabled()) {
+            log_error(
+                "x86_64 ELF rejected by --no-rosetta "
+                "(or ELFUSE_NO_ROSETTA=1): %s",
+                elf_guest_path);
+            return -1;
+        }
+        want_rosetta = true;
+    } else if (boot->elf_info.e_machine != EM_AARCH64) {
+        log_error("unsupported ELF machine type %u", boot->elf_info.e_machine);
         return -1;
     }
 
     log_debug(
         "ELF entry=0x%llx, %d segments, load range [0x%llx, 0x%llx), "
-        "machine=aarch64",
+        "machine=%s",
         (unsigned long long) boot->elf_info.entry, boot->elf_info.num_segments,
         (unsigned long long) boot->elf_info.load_min,
-        (unsigned long long) boot->elf_info.load_max);
+        (unsigned long long) boot->elf_info.load_max,
+        want_rosetta ? "x86_64-via-rosetta" : "aarch64");
 
-    if (guest_init(g, 0, 0) < 0) {
+    /* Rosetta is statically linked at 0x800000000000 (128 TiB), beyond the
+     * 36 and 40-bit IPA ranges. Request 48-bit IPA up-front so the
+     * page-table builder can reach the rosetta segments. HVF clamps to its
+     * supported size; on M1 hosts the upstream hyper-linux audit confirms
+     * 48 is honoured even though the auto-detect default returns 36, so
+     * the request is non-fatal in either direction.
+     */
+    uint32_t req_ipa = want_rosetta ? 48 : 0;
+    if (guest_init(g, 0, req_ipa) < 0) {
         log_error("failed to initialize guest");
         return -1;
     }
     *guest_initialized = true;
+    g->is_rosetta = want_rosetta;
+    proc_set_rosetta_active(want_rosetta);
 
     log_debug("IPA size: %u bits (%llu GiB primary)", g->ipa_bits,
               (unsigned long long) (g->guest_size / (1024ULL * 1024 * 1024)));
 
-    boot->elf_load_base = (boot->elf_info.e_type == ET_DYN) ? PIE_LOAD_BASE : 0;
-    if (elf_map_segments(&boot->elf_info, elf_path, g->host_base, g->guest_size,
-                         boot->elf_load_base) < 0) {
-        log_error("failed to map ELF segments");
-        return -1;
-    }
+    rosetta_result_t rr;
+    memset(&rr, 0, sizeof(rr));
 
-    /* Track the lowest loaded ELF address so the legacy fork IPC path
-     * copies low-linked ET_EXECs (e.g. linked at 0x200000) in full.
-     */
-    g->elf_load_min = boot->elf_info.load_min + boot->elf_load_base;
-
-    g->brk_base = PAGE_ALIGN_UP(boot->elf_info.load_max + boot->elf_load_base);
-    if (g->brk_base < BRK_BASE_DEFAULT)
+    if (want_rosetta) {
+        /* Rosetta path: no x86_64 ELF segments are loaded into guest memory
+         * (rosetta itself does that lazily once it starts running). brk and
+         * stack use the same defaults the aarch64 path falls back to when
+         * the binary sits at low VAs; the x86_64 binary's load_max would be
+         * meaningless here because nothing of it actually lives in primary
+         * buffer GPA space.
+         */
+        boot->elf_load_base = 0;
+        g->elf_load_min = ELF_DEFAULT_BASE;
         g->brk_base = BRK_BASE_DEFAULT;
-    g->brk_current = g->brk_base;
-
-    g->stack_top = ALIGN_UP(g->brk_base, BLOCK_2MIB) + STACK_SIZE;
-    if (g->stack_top < STACK_TOP_DEFAULT)
+        g->brk_current = g->brk_base;
         g->stack_top = STACK_TOP_DEFAULT;
-    g->stack_base = g->stack_top - STACK_SIZE;
+        g->stack_base = g->stack_top - STACK_SIZE;
+    } else {
+        boot->elf_load_base =
+            (boot->elf_info.e_type == ET_DYN) ? PIE_LOAD_BASE : 0;
+        if (elf_map_segments(&boot->elf_info, elf_host_path, g->host_base,
+                             g->guest_size, boot->elf_load_base) < 0) {
+            log_error("failed to map ELF segments");
+            return -1;
+        }
 
-    if (!load_interpreter(g, sysroot, boot))
-        return -1;
+        /* Track the lowest loaded ELF address so the legacy fork IPC path
+         * copies low-linked ET_EXECs (e.g. linked at 0x200000) in full.
+         */
+        g->elf_load_min = boot->elf_info.load_min + boot->elf_load_base;
+
+        g->brk_base =
+            PAGE_ALIGN_UP(boot->elf_info.load_max + boot->elf_load_base);
+        if (g->brk_base < BRK_BASE_DEFAULT)
+            g->brk_base = BRK_BASE_DEFAULT;
+        g->brk_current = g->brk_base;
+
+        g->stack_top = ALIGN_UP(g->brk_base, BLOCK_2MIB) + STACK_SIZE;
+        if (g->stack_top < STACK_TOP_DEFAULT)
+            g->stack_top = STACK_TOP_DEFAULT;
+        g->stack_base = g->stack_top - STACK_SIZE;
+
+        if (!load_interpreter(g, sysroot, boot))
+            return -1;
+    }
 
     if (shim_bin_len > BLOCK_2MIB) {
         log_error("shim binary too large (%zu bytes)", shim_bin_len);
@@ -261,10 +440,12 @@ int guest_bootstrap_prepare(guest_t *g,
     log_debug("shim loaded at offset 0x%llx (%zu bytes)",
               (unsigned long long) g->shim_base, shim_bin_len);
 
-    invalidate_exec_segments(&boot->elf_info, g->host_base,
-                             boot->elf_load_base);
-    invalidate_exec_segments(&boot->interp_info, g->host_base,
-                             boot->interp_base);
+    if (!want_rosetta) {
+        invalidate_exec_segments(&boot->elf_info, g->host_base,
+                                 boot->elf_load_base);
+        invalidate_exec_segments(&boot->interp_info, g->host_base,
+                                 boot->interp_base);
+    }
     sys_icache_invalidate((uint8_t *) g->host_base + g->shim_base,
                           shim_bin_len);
 
@@ -272,6 +453,19 @@ int guest_bootstrap_prepare(guest_t *g,
         log_error("too many memory regions (%d >= %d)", nregions,
                   MAX_BOOT_REGIONS);
         return -1;
+    }
+
+    /* Rosetta path: append the rosetta image as a non-identity region so the
+     * page-table builder maps VA 0x800000000000 -> primary buffer GPA.
+     * rosetta_prepare also initialises the TTBR1 kbuf (page-table pages come
+     * from the same pool that guest_build_page_tables is about to consume).
+     */
+    if (want_rosetta) {
+        if (rosetta_prepare(g, elf_host_path, regions, &nregions,
+                            MAX_BOOT_REGIONS, verbose, &rr) < 0) {
+            log_error("rosetta_prepare failed for %s", elf_guest_path);
+            return -1;
+        }
     }
 
     boot->ttbr0 = guest_build_page_tables(g, regions, nregions);
@@ -285,55 +479,32 @@ int guest_bootstrap_prepare(guest_t *g,
      * whose slot is later consumed by an unrelated syscall.
      */
 
-    guest_region_add(g, g->shim_base, g->shim_base + shim_bin_len,
-                     LINUX_PROT_READ | LINUX_PROT_EXEC, LINUX_MAP_PRIVATE, 0,
-                     "[shim]");
-    guest_region_add(g, g->shim_data_base, g->shim_data_base + BLOCK_2MIB,
-                     LINUX_PROT_READ | LINUX_PROT_WRITE, LINUX_MAP_PRIVATE, 0,
-                     "[shim-data]");
-
-    {
+    if (want_rosetta) {
+        /* /proc/self/maps for a rosetta guest reports the rosetta translator
+         * as a single anonymous region covering [VA, VA+size). The original
+         * x86_64 binary is not loaded into guest memory; rosetta exposes it
+         * via fd 3 once rosetta_finalize pre-opens it.
+         */
+        register_elf_segment_regions(g, &rr.rosetta_info, 0,
+                                     g->rosetta_guest_base - g->rosetta_va_base,
+                                     ROSETTA_PATH);
+    } else {
         char elf_realpath[LINUX_PATH_MAX];
 
         memset(elf_realpath, 0, sizeof(elf_realpath));
-        if (!realpath(elf_path, elf_realpath))
-            str_copy_trunc(elf_realpath, elf_path, sizeof(elf_realpath));
+        if (elf_host_path_temp)
+            str_copy_trunc(elf_realpath, elf_guest_path, sizeof(elf_realpath));
+        else if (!realpath(elf_host_path, elf_realpath))
+            str_copy_trunc(elf_realpath, elf_host_path, sizeof(elf_realpath));
 
-        for (int i = 0; i < boot->elf_info.num_segments; i++) {
-            guest_region_add(
-                g, boot->elf_info.segments[i].gpa + boot->elf_load_base,
-                boot->elf_info.segments[i].gpa +
-                    boot->elf_info.segments[i].memsz + boot->elf_load_base,
-                elf_pf_to_prot(boot->elf_info.segments[i].flags),
-                LINUX_MAP_PRIVATE, boot->elf_info.segments[i].offset,
-                elf_realpath);
-        }
+        register_elf_segment_regions(g, &boot->elf_info, boot->elf_load_base,
+                                     boot->elf_load_base, elf_realpath);
+        register_elf_segment_regions(g, &boot->interp_info, boot->interp_base,
+                                     boot->interp_base,
+                                     boot->interp_display_path);
     }
 
-    for (int i = 0; i < boot->interp_info.num_segments; i++) {
-        guest_region_add(
-            g, boot->interp_info.segments[i].gpa + boot->interp_base,
-            boot->interp_info.segments[i].gpa +
-                boot->interp_info.segments[i].memsz + boot->interp_base,
-            elf_pf_to_prot(boot->interp_info.segments[i].flags),
-            LINUX_MAP_PRIVATE, boot->interp_info.segments[i].offset,
-            boot->interp_resolved);
-    }
-
-    if (g->brk_base < g->brk_current) {
-        guest_region_add(g, g->brk_base, g->brk_current,
-                         LINUX_PROT_READ | LINUX_PROT_WRITE,
-                         LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS, 0, "[heap]");
-    }
-
-    guest_invalidate_ptes(g, g->stack_base, g->stack_base + STACK_GUARD_SIZE);
-    guest_region_add(g, g->stack_base, g->stack_base + STACK_GUARD_SIZE,
-                     LINUX_PROT_NONE, LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS,
-                     0, "[stack-guard]");
-    guest_region_add(g, g->stack_base + STACK_GUARD_SIZE, g->stack_top,
-                     LINUX_PROT_READ | LINUX_PROT_WRITE,
-                     LINUX_MAP_PRIVATE | LINUX_MAP_ANONYMOUS, 0, "[stack]");
-    guest_invalidate_ptes(g, 0, 0x1000);
+    register_runtime_regions(g, shim_bin_len);
 
     log_debug("TTBR0=0x%llx, IPA base=0x%llx", (unsigned long long) boot->ttbr0,
               (unsigned long long) g->ipa_base);
@@ -352,32 +523,71 @@ int guest_bootstrap_prepare(guest_t *g,
     }
 
     proc_set_shim(shim_bin, (unsigned int) shim_bin_len);
-    proc_set_elf_path(elf_path);
+    proc_set_elf_path(elf_guest_path);
     if (sysroot)
         proc_set_sysroot(sysroot);
-    proc_set_cmdline(guest_argc, guest_argv);
+
+    /* rosetta_finalize pre-opens the x86_64 binary at fd 3, constructs the
+     * binfmt_misc argv ([ROSETTA_PATH, binary, original_argv[1..]]), refreshes
+     * /proc/self/cmdline, and installs the TTBR0 kbuf alias. The aarch64 path
+     * uses the caller's argv directly. The remaining Rosetta runtime blocker is
+     * high-VA mmap support for the translator's own slab and JIT allocations.
+     */
+    int rosetta_argc = 0;
+    const char **rosetta_argv = NULL;
+    if (want_rosetta) {
+        if (rosetta_finalize(g, 0, elf_host_path, elf_host_path_temp,
+                             elf_guest_path, guest_argc, guest_argv, &rr,
+                             verbose, &rosetta_argc, &rosetta_argv, NULL) < 0) {
+            log_error("rosetta_finalize failed");
+            return -1;
+        }
+    } else {
+        proc_set_cmdline(guest_argc, guest_argv);
+    }
     proc_set_environ((const char **) environ);
 
     native_vdso = vdso_build(g);
     linux_stack_auxv_t auxv;
+    const elf_info_t *stack_elf =
+        want_rosetta ? &rr.rosetta_info : &boot->elf_info;
+    uint64_t stack_elf_load_base = want_rosetta ? 0 : boot->elf_load_base;
+    uint64_t stack_interp_base = want_rosetta ? 0 : boot->interp_base;
+    int stack_argc = want_rosetta ? rosetta_argc : guest_argc;
+    const char **stack_argv = want_rosetta ? rosetta_argv : guest_argv;
     boot->stack_pointer = build_linux_stack(
-        g, g->stack_top, guest_argc, guest_argv, (const char **) environ,
-        &boot->elf_info, boot->elf_load_base, boot->interp_base, native_vdso,
-        -1, &auxv);
+        g, g->stack_top, stack_argc, stack_argv, (const char **) environ,
+        stack_elf, stack_elf_load_base, stack_interp_base, native_vdso, -1,
+        &auxv);
     if (boot->stack_pointer == 0) {
         log_error("failed to build initial stack");
+        free(rosetta_argv);
         return -1;
     }
+    /* rosetta_argv was copied into the guest stack; the host allocation is
+     * no longer needed. The strings themselves are constants (ROSETTA_PATH)
+     * or owned by the caller (binary_path, guest_argv entries) so freeing
+     * just the array is safe.
+     */
+    free(rosetta_argv);
 
     proc_set_auxv(auxv.words, auxv.nwords * sizeof(auxv.words[0]));
-    boot->entry_point = (boot->interp_base != 0)
-                            ? (boot->interp_info.entry + boot->interp_base)
-                            : (boot->elf_info.entry + boot->elf_load_base);
+    if (want_rosetta) {
+        boot->entry_point = rr.entry_point;
+    } else {
+        boot->entry_point = (boot->interp_base != 0)
+                                ? (boot->interp_info.entry + boot->interp_base)
+                                : (boot->elf_info.entry + boot->elf_load_base);
+    }
 
+    const char *entry_via = "";
+    if (want_rosetta)
+        entry_via = " (via rosetta)";
+    else if (boot->interp_base)
+        entry_via = " (via interpreter)";
     log_debug("SP=0x%llx, entry=0x%llx%s",
               (unsigned long long) boot->stack_pointer,
-              (unsigned long long) boot->entry_point,
-              boot->interp_base ? " (via interpreter)" : "");
+              (unsigned long long) boot->entry_point, entry_via);
     return 0;
 }
 
@@ -389,7 +599,13 @@ int guest_bootstrap_create_vcpu(guest_t *g,
 {
     uint64_t sctlr;
     uint64_t sctlr_with_mmu;
-    uint64_t tcr_value = TCR_EL1_VALUE;
+    /* Rosetta needs TTBR1 walks enabled and TBI1=1 so the kbuf window at
+     * KBUF_VA_BASE (bits-63-set) resolves and TaggedPointer extraction keeps
+     * working. Aarch64 guests stay on the EPD1=1 variant which keeps the
+     * upper VA range fault-clean.
+     */
+    uint64_t tcr_value = g->is_rosetta ? TCR_EL1_VALUE_KBUF : TCR_EL1_VALUE;
+    uint64_t ttbr1_value = g->is_rosetta ? g->ttbr1 : 0;
     uint64_t shim_ipa = guest_ipa(g, g->shim_base);
     uint64_t entry_ipa = guest_ipa(g, boot->entry_point);
     uint64_t sp_ipa = guest_ipa(g, boot->stack_pointer);
@@ -409,7 +625,7 @@ int guest_bootstrap_create_vcpu(guest_t *g,
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_MAIR_EL1, 0xFF00));
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TCR_EL1, tcr_value));
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TTBR0_EL1, boot->ttbr0));
-    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TTBR1_EL1, 0));
+    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TTBR1_EL1, ttbr1_value));
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_CPACR_EL1, 3ULL << 20));
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, entry_ipa));
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SPSR_EL1, 0x0));
@@ -453,5 +669,101 @@ int guest_bootstrap_create_vcpu(guest_t *g,
      */
     tlbi_request_clear();
 
+    return 0;
+}
+
+int guest_bootstrap_rosetta_post_reset(guest_t *g,
+                                       const char *elf_host_path,
+                                       bool elf_host_path_temp,
+                                       const char *elf_guest_path,
+                                       int guest_argc,
+                                       const char **guest_argv,
+                                       char **environ,
+                                       size_t shim_bin_len,
+                                       bool verbose,
+                                       uint64_t *out_entry_point,
+                                       uint64_t *out_stack_pointer,
+                                       uint64_t *out_ttbr0)
+{
+    if (!g || !elf_host_path || !elf_guest_path || !out_entry_point ||
+        !out_stack_pointer || !out_ttbr0)
+        return -1;
+
+    /* Re-anchor brk/stack to the Rosetta defaults. guest_reset already
+     * restored mmap_next/mmap_end/mmap_rx_* to their initial values, but
+     * brk/stack were tuned for the previous image, so reset them here.
+     * The x86_64 target binary lives behind fd 3, not in guest memory,
+     * so brk_base does not move with the target's load_max.
+     */
+    g->elf_load_min = ELF_DEFAULT_BASE;
+    g->brk_base = BRK_BASE_DEFAULT;
+    g->brk_current = g->brk_base;
+    g->stack_top = STACK_TOP_DEFAULT;
+    g->stack_base = g->stack_top - STACK_SIZE;
+
+    mem_region_t regions[MAX_BOOT_REGIONS];
+    int nregions = 0;
+    rosetta_result_t rr;
+
+    if (rosetta_prepare(g, elf_host_path, regions, &nregions, MAX_BOOT_REGIONS,
+                        verbose, &rr) < 0) {
+        log_error("rosetta_prepare failed during exec re-bootstrap");
+        return -1;
+    }
+
+    /* build_boot_regions skips ELF segments when g->is_rosetta is set, so a
+     * zero-initialised guest_bootstrap_t is enough to drive it here.
+     */
+    guest_bootstrap_t boot_stub;
+    memset(&boot_stub, 0, sizeof(boot_stub));
+    if (!build_boot_regions(regions, &nregions, g, &boot_stub, shim_bin_len)) {
+        log_error("too many boot regions for rosetta exec re-bootstrap");
+        return -1;
+    }
+
+    uint64_t ttbr0 = guest_build_page_tables(g, regions, nregions);
+    if (!ttbr0) {
+        log_error(
+            "guest_build_page_tables failed in rosetta exec re-bootstrap");
+        return -1;
+    }
+    g->ttbr0 = ttbr0;
+
+    /* Re-publish /proc/self/maps style metadata. Mirrors the bootstrap path
+     * so the post-exec view reports rosetta-as-anonymous-mapping plus the
+     * heap, stack, stack-guard, shim, and shim-data.
+     */
+    register_elf_segment_regions(g, &rr.rosetta_info, 0,
+                                 g->rosetta_guest_base - g->rosetta_va_base,
+                                 ROSETTA_PATH);
+    register_runtime_regions(g, shim_bin_len);
+
+    int rosetta_argc = 0;
+    const char **rosetta_argv = NULL;
+    if (rosetta_finalize(g, 0, elf_host_path, elf_host_path_temp,
+                         elf_guest_path, guest_argc, guest_argv, &rr, verbose,
+                         &rosetta_argc, &rosetta_argv, NULL) < 0) {
+        log_error("rosetta_finalize failed during exec re-bootstrap");
+        return -1;
+    }
+
+    proc_set_elf_path(elf_guest_path);
+    proc_set_environ((const char **) environ);
+
+    uint64_t native_vdso = vdso_build(g);
+    linux_stack_auxv_t auxv;
+    uint64_t sp = build_linux_stack(
+        g, g->stack_top, rosetta_argc, rosetta_argv, (const char **) environ,
+        &rr.rosetta_info, 0, 0, native_vdso, -1 /* AT_EXECFD absent */, &auxv);
+    free(rosetta_argv);
+    if (sp == 0) {
+        log_error("build_linux_stack failed during exec re-bootstrap");
+        return -1;
+    }
+    proc_set_auxv(auxv.words, auxv.nwords * sizeof(auxv.words[0]));
+
+    *out_entry_point = rr.entry_point;
+    *out_stack_pointer = sp;
+    *out_ttbr0 = ttbr0;
     return 0;
 }

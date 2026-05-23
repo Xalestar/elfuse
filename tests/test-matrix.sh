@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
-# test-matrix.sh -- Run aarch64 test suites under both elfuse and self-contained
-# qemu-system-aarch64 reference VM.
+#
+# Run aarch64 test suites under both elfuse and self-contained QEMU.
+#
+# Copyright 2026 elfuse contributors
+# SPDX-License-Identifier: Apache-2.0
 #
 # Modes:
-#   elfuse-aarch64  -- run binaries on macOS via build/elfuse
-#   qemu-aarch64    -- run binaries natively inside qemu-system-aarch64
-#                     (boots an Alpine minirootfs initramfs that the
-#                     fixture script downloads on demand)
-#   all             -- run both modes back-to-back
+#   elfuse-aarch64 : run binaries on macOS via build/elfuse
+#   qemu-aarch64   : run binaries natively inside qemu-system-aarch64 (boots an
+#                    Alpine minirootfs initramfs that the fixture script
+#                    downloads on demand)
+#   all            : run both modes back-to-back
 #
 # Environment overrides (defaults point at externals/test-fixtures/):
 #   GUEST_TEST_BINARIES        dir of internal test binaries (build/ by default)
@@ -16,16 +19,13 @@
 #   GUEST_STATIC_BINS          dir of dash/bash/lua/jq/etc. (optional)
 #   GUEST_SYSROOT              musl sysroot for elfuse --sysroot dynamic mode
 #   GUEST_DYNAMIC_COREUTILS    dir of dynamic coreutils binaries (musl)
-#
-# Copyright 2026 elfuse contributors
-# SPDX-License-Identifier: Apache-2.0
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 FIXTURES="${REPO_ROOT}/externals/test-fixtures"
 
-MODE="${1:?Usage: $0 <elfuse-aarch64|qemu-aarch64|all>}"
+MODE="${1:?Usage: $0 <elfuse-aarch64|qemu-aarch64|elfuse-x86_64|all>}"
 
 # Tool paths.
 ELFUSE="${ELFUSE:-${REPO_ROOT}/build/elfuse}"
@@ -41,6 +41,18 @@ ELFUSE="${ELFUSE:-${REPO_ROOT}/build/elfuse}"
 : "${GUEST_DYNAMIC_COREUTILS:=${FIXTURES}/aarch64-musl/dyn-bin}"
 : "${GUEST_GLIBC_SYSROOT:=}"
 : "${GUEST_GLIBC_DYNAMIC_COREUTILS:=}"
+
+# x86_64-via-Rosetta fixture roots. Populated by scripts/fetch-fixtures.sh
+# once the x86_64 corpus lands. Empty defaults make the suite skip cleanly
+# on hosts where the fixtures are not yet present.
+: "${GUEST_X86_64_TEST_BINARIES:=${FIXTURES}/x86_64-musl/test-bin}"
+: "${GUEST_X86_64_COREUTILS:=${FIXTURES}/x86_64-musl/staticbin/bin}"
+: "${GUEST_X86_64_BUSYBOX:=${FIXTURES}/x86_64-musl/staticbin/bin/busybox}"
+: "${GUEST_X86_64_STATIC_BINS:=${FIXTURES}/x86_64-musl/dyn-bin}"
+: "${GUEST_X86_64_DYNAMIC_COREUTILS:=${FIXTURES}/x86_64-musl/dyn-bin}"
+: "${GUEST_X86_64_SYSROOT:=${FIXTURES}/x86_64-musl/rootfs}"
+: "${GUEST_X86_64_GLIBC_SYSROOT:=}"
+: "${GUEST_X86_64_GLIBC_DYNAMIC_COREUTILS:=}"
 
 # Reuse the shared per-test reporter so the output matches `make check`
 # (which drives tests through tests/driver.sh). TEST_LABEL_WIDTH controls the
@@ -618,6 +630,14 @@ run_suite()
             runner="run_qemu"
             dyn_runner="run_qemu"
             ;;
+        elfuse-x86_64)
+            printf "Unsupported %s: x86_64-via-Rosetta matrix is not runnable yet\n" \
+                "$mode"
+            printf "Current runtime still hard-disables Rosetta process syscalls "
+            printf "(fork/exec paths) and the x86_64 test-bin corpus is not "
+            printf "staged by fetch-fixtures.\n\n"
+            return 2
+            ;;
         *)
             echo "Unknown mode: $mode"
             return 2
@@ -648,7 +668,10 @@ run_suite()
     # set surfaces in the per-mode summary instead of looking like a
     # full pass.
     if [ -d "$GUEST_DYNAMIC_COREUTILS" ]; then
-        if [ "$mode" = "elfuse-aarch64" ] && [ -z "$GUEST_SYSROOT" ]; then
+        if {
+            [ "$mode" = "elfuse-aarch64" ] || [ "$mode" = "elfuse-x86_64" ]
+        } \
+            && [ -z "$GUEST_SYSROOT" ]; then
             skip_suite "dyn-coreutils (musl)" "no GUEST_SYSROOT"
         else
             _COREUTILS_SUFFIX=" (musl dyn)"
@@ -661,7 +684,10 @@ run_suite()
     fi
 
     if [ -n "$GUEST_GLIBC_DYNAMIC_COREUTILS" ] && [ -d "$GUEST_GLIBC_DYNAMIC_COREUTILS" ]; then
-        if [ "$mode" = "elfuse-aarch64" ] && [ -z "$GUEST_GLIBC_SYSROOT" ]; then
+        if {
+            [ "$mode" = "elfuse-aarch64" ] || [ "$mode" = "elfuse-x86_64" ]
+        } \
+            && [ -z "$GUEST_GLIBC_SYSROOT" ]; then
             skip_suite "dyn-coreutils (glibc)" "no GUEST_GLIBC_SYSROOT"
         else
             _COREUTILS_SUFFIX=" (glibc dyn)"
@@ -686,11 +712,85 @@ run_suite()
     cleanup_fixtures
     cleanup_qemu
 
-    return "$fail"
+    # Compare against the per-mode expected outcome. Return its verdict
+    # rather than the raw fail count so modes with recorded known-failure
+    # baselines still exit 0 when their observed results match the table.
+    verify_expected_counts "$mode"
+    return $?
 }
 
-# Main entry point.
-ensure_fixtures
+# Per-mode expected outcome envelope. Each mode lists the minimum pass count
+# and the exact failure count the matrix is allowed to report. Skip counts
+# are advisory because some skips depend on the host environment (qemu
+# running on Apple Silicon vs Linux, x86_64 fixtures present or not). When
+# the runtime advances, bump these counts in the same commit that changes
+# behaviour so reviewers see the new headline numbers explicitly.
+declare -A EXPECTED_MIN_PASS=(
+    [elfuse - aarch64]=180
+    [qemu - aarch64]=180
+    [elfuse - x86_64]=0
+)
+declare -A EXPECTED_FAIL=(
+    [elfuse - aarch64]=0
+    [qemu - aarch64]=1
+    [elfuse - x86_64]=0
+)
+
+# Known-failure annotations. These are tests that fail by design under a
+# given mode and are tracked here so the matrix runner can distinguish them
+# from real regressions in surface output. The matrix does not yet rewrite
+# their pass/fail accounting (the underlying drivers would need richer
+# reporting), but this list is the canonical reference for "expected to
+# fail" in code review and CI triage.
+#
+# qemu-aarch64: test-poll diverges only inside the qemu reference VM.
+KNOWN_FAILURES_QEMU_AARCH64="test-poll"
+# elfuse-x86_64: rosetta limitations documented in the upstream hyper-linux
+# audit. test-signal-thread fails because rosetta shadows signal state
+# internally (SA_RESETHAND not reset); test-thread / test-stress hang on
+# rosetta's TLS=0 corner case.
+KNOWN_FAILURES_ELFUSE_X86_64="test-signal-thread test-thread test-stress"
+
+verify_expected_counts()
+{
+    local mode="$1"
+    local exp_min="${EXPECTED_MIN_PASS[$mode]:-}"
+    local exp_fail="${EXPECTED_FAIL[$mode]:-}"
+    if [ -z "$exp_min" ] || [ -z "$exp_fail" ]; then
+        # Mode without a recorded baseline (e.g. an experimental local mode).
+        # Stay silent so the matrix runner is still usable as a smoke probe.
+        return 0
+    fi
+
+    local err=0
+    if [ "$pass" -lt "$exp_min" ]; then
+        printf "  Expected-pass deviation: %s saw %d pass, baseline %d.\n" \
+            "$mode" "$pass" "$exp_min"
+        err=1
+    fi
+    if [ "$fail" -ne "$exp_fail" ]; then
+        printf "  Expected-fail deviation: %s saw %d fail, baseline %d.\n" \
+            "$mode" "$fail" "$exp_fail"
+        err=1
+    fi
+    if [ "$err" -eq 0 ]; then
+        printf "  Expected: %s within baseline (>= %d pass, exactly %d fail).\n\n" \
+            "$mode" "$exp_min" "$exp_fail"
+    else
+        printf "  Bump the EXPECTED_* table in tests/test-matrix.sh if this\n"
+        printf "  shift is intentional.\n\n"
+    fi
+    return "$err"
+}
+
+# Main entry point. The aarch64 fixture fetch only matters for modes that
+# actually consume those binaries; running elfuse-x86_64 in isolation lets
+# the user iterate before the x86_64 corpus exists, without pulling the
+# aarch64 musl rootfs and qemu kernel they will not use.
+case "$MODE" in
+    elfuse-x86_64) ;;
+    *) ensure_fixtures ;;
+esac
 
 total_fail=0
 if [ "$MODE" = "all" ]; then

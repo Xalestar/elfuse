@@ -54,6 +54,19 @@ static _Atomic uint64_t wxcount_to_rx = 0; /* RW->RX (exec fault) */
 static _Atomic uint64_t wxcount_to_rw = 0; /* RX->RW (write fault) */
 static _Atomic uint64_t sysreg_write_count =
     0; /* EC=0x18 Dir=0 (DC CVAU, IC IVAU, etc.) */
+/* x86_64-via-Rosetta is on by default: the architecture is auto-detected
+ * from the ELF header (EM_X86_64), and rosetta is the only viable path for
+ * those binaries on Apple Silicon. The --no-rosetta CLI flag (or
+ * ELFUSE_NO_ROSETTA=1) disables it; without rosetta installed, the rosetta
+ * loader fails its access() check and surfaces an install hint regardless.
+ */
+static _Atomic bool rosetta_enabled = true;
+/* Runtime indicator: distinct from rosetta_enabled (user opt-in). Set when
+ * the active guest_t is actually running under rosetta, so callers without
+ * direct guest_t access (proc_intercept_readlink, log paths) can branch on
+ * runtime state without threading g through every signature.
+ */
+static _Atomic bool rosetta_active = false;
 
 /* Process table for tracking fork children */
 static proc_entry_t proc_table[PROC_TABLE_SIZE];
@@ -81,6 +94,26 @@ void proc_init(void)
     proc_state_init();
     thread_init();
     futex_init();
+}
+
+void proc_set_rosetta_enabled(bool enabled)
+{
+    atomic_store(&rosetta_enabled, enabled);
+}
+
+bool proc_rosetta_enabled(void)
+{
+    return atomic_load(&rosetta_enabled);
+}
+
+void proc_set_rosetta_active(bool active)
+{
+    atomic_store(&rosetta_active, active);
+}
+
+bool proc_rosetta_active(void)
+{
+    return atomic_load(&rosetta_active);
 }
 
 void proc_request_exit_group(int code)

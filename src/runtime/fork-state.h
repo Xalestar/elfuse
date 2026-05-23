@@ -18,7 +18,11 @@
 /* Magic values for IPC frame delimiters */
 #define IPC_MAGIC_HEADER 0x454C464BU   /* "ELFK" */
 #define IPC_MAGIC_SENTINEL 0x454C4F4BU /* "ELOK" */
-#define IPC_VERSION 9                  /* v9: preserve elf_load_min */
+/* Bumped to 10 when the rosetta placement / kbuf / ttbr1 tuple was added so
+ * a rosetta-aware child rejects an older parent's header instead of trying
+ * to interpret unknown trailing fields.
+ */
+#define IPC_VERSION 10
 
 typedef struct {
     uint32_t magic;
@@ -39,12 +43,34 @@ typedef struct {
     uint32_t _pad;
     uint64_t absock_namespace_id;
     int64_t sid, pgid;
+    /* Rosetta placement fields. All zero for aarch64 guests; populated when
+     * the parent is_rosetta. The child rebuilds the TTBR1 kbuf tree from the
+     * PT pool that came across in the memory transfer; rosetta_guest_base /
+     * va_base / size pin the segments at the same primary-buffer location so
+     * the non-identity page-table mapping remains coherent across the fork.
+     */
+    uint32_t is_rosetta;
+    uint32_t _rosetta_pad;
+    uint64_t rosetta_guest_base;
+    uint64_t rosetta_va_base;
+    uint64_t rosetta_size;
+    uint64_t rosetta_entry;
+    uint64_t kbuf_gpa;
+    uint64_t ttbr1;
 } ipc_header_t;
 
 typedef struct {
     uint64_t elr_el1, sp_el0;
     uint64_t spsr_el1, vbar_el1;
     uint64_t ttbr0_el1;
+    /* TTBR1_EL1 is zero for aarch64 guests and carries the rosetta kbuf
+     * page-table root for is_rosetta guests. The parent captures the live
+     * sysreg so a forked child resumes with the same TTBR1 the parent had
+     * after bootstrap_create_vcpu set it; without this the child comes up
+     * with TTBR1=0 even though TCR_EL1.EPD1 is cleared, and the first
+     * kernel-VA access faults.
+     */
+    uint64_t ttbr1_el1;
     uint64_t sctlr_el1, tcr_el1, mair_el1, cpacr_el1, tpidr_el0, sp_el1;
     uint64_t x[31];
     vcpu_simd_state_t simd_state;

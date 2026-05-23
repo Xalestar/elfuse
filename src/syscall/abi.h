@@ -672,6 +672,12 @@ enum {
     SOCK_OPT_TCP_KEEPINTVL,
     SOCK_OPT_IPV6_V6ONLY,
     SOCK_OPT_PASSCRED,
+    /* IP_MTU_DISCOVER value stored verbatim so getsockopt round-trips the
+     * Linux PMTUD mode the guest set. The host accepts the value but does
+     * not honour every Linux mode; see sys_setsockopt for the IP_DONTFRAG
+     * translation for the modes macOS supports.
+     */
+    SOCK_OPT_IP_MTU_DISCOVER,
     SOCK_OPT_COUNT
 };
 

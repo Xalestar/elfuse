@@ -30,6 +30,7 @@ bool fuse_path_matches_mount(const char *path);
 int fuse_stat_path(const char *path, struct stat *st, int at_flags);
 int fuse_access_path(const char *path, int mode, int flags);
 int fuse_materialize_path(const char *path, char *out_path, size_t outsz);
+int fuse_materialize_fd(int fd, char *out_path, size_t outsz);
 int fuse_fstat_fd(int fd, struct stat *st);
 int64_t fuse_getdents64(guest_t *g, int fd, uint64_t buf_gva, uint64_t count);
 int64_t fuse_read_fd(guest_t *g, int fd, uint64_t buf_gva, uint64_t count);

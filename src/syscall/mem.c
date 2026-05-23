@@ -13,6 +13,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -216,6 +217,7 @@ static void split_regions_at_boundary(guest_t *g, uint64_t boundary)
 
         g->regions[i].end = boundary;
         g->regions[i + 1].offset += (boundary - g->regions[i + 1].start);
+        g->regions[i + 1].gpa_base += (boundary - g->regions[i + 1].start);
         g->regions[i + 1].start = boundary;
         if (g->regions[i + 1].backing_fd >= 0) {
             g->regions[i + 1].backing_fd = dup(g->regions[i + 1].backing_fd);
@@ -347,6 +349,319 @@ static int prot_to_perms(int prot)
     return perms;
 }
 
+static void *host_ptr_for_gpa(const guest_t *g, uint64_t gpa)
+{
+    if (gpa < g->guest_size)
+        return (uint8_t *) g->host_base + gpa;
+
+    const guest_mapping_t *m = guest_find_mapping(g, gpa);
+    if (m)
+        return (uint8_t *) m->host_va + (gpa - m->gpa);
+
+    const guest_overflow_t *o = guest_find_overflow(g, gpa);
+    if (o)
+        return (uint8_t *) o->host_base + (gpa - o->ipa_start);
+
+    return NULL;
+}
+
+static bool region_range_overlaps(const guest_t *g,
+                                  uint64_t start,
+                                  uint64_t end)
+{
+    int lo = 0, hi = g->nregions - 1, first = g->nregions;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        if (g->regions[mid].end > start) {
+            first = mid;
+            hi = mid - 1;
+        } else {
+            lo = mid + 1;
+        }
+    }
+
+    return first < g->nregions && g->regions[first].start < end;
+}
+
+static int64_t sys_mmap_fixed_high_va(guest_t *g,
+                                      uint64_t addr,
+                                      uint64_t length,
+                                      int prot,
+                                      int flags,
+                                      guest_fd_t fd,
+                                      uint64_t offset,
+                                      bool is_noreplace)
+{
+    int64_t ret = -LINUX_ENOMEM;
+
+    if (!g->is_rosetta)
+        return -LINUX_ENOMEM;
+
+    bool is_anon = (flags & LINUX_MAP_ANONYMOUS) != 0;
+    bool is_shared = (flags & LINUX_MAP_SHARED) != 0;
+    host_fd_ref_t backing_ref = {.fd = -1, .owned = false};
+    int host_backing_fd = -1;
+    int track_backing_fd = -1;
+    bool close_host_backing_fd = false;
+    /* High-water mark of VA installed by the mapping loop; reachable from
+     * the fail label so the rollback knows what to invalidate. Must be
+     * initialized before any goto fail that runs before the loop.
+     */
+    uint64_t va_installed_end = 0;
+    /* If a fresh block has been block-mapped (live RW/RX over the full
+     * 2 MiB) but has not yet had its L3 split-inherited entries zeroed,
+     * the rollback must clear the full block, not just [addr, addr+length).
+     * Tracks at most one in-flight fresh block at a time; UINT64_MAX means
+     * no in-flight fresh block needs full-scope rollback.
+     */
+    uint64_t inflight_fresh_block_va = UINT64_MAX;
+
+    if (!is_anon && is_shared)
+        return -LINUX_ENODEV;
+
+    /* Reject wrap before reusing addr + length anywhere below. The caller
+     * page-rounds length, but addr is guest-supplied and a huge length
+     * against a high VA can still overflow. Also reject the case where
+     * addr + length is too close to UINT64_MAX for ALIGN_UP to round up
+     * the 2 MiB boundary without wrapping to 0 (which would make va_end
+     * smaller than va_start and underflow backing_span).
+     */
+    if (length == 0 || addr > UINT64_MAX - length)
+        return -LINUX_ENOMEM;
+    if ((addr + length) > UINT64_MAX - (BLOCK_2MIB - 1))
+        return -LINUX_ENOMEM;
+
+    if (guest_kbuf_user_va_overlap(addr, length))
+        return -LINUX_ENOMEM;
+
+    if (region_range_overlaps(g, addr, addr + length)) {
+        if (is_noreplace)
+            return -LINUX_EEXIST;
+        /* High-VA MAP_FIXED replacement is still limited to fresh ranges.
+         * Replacing partially-overlapping non-identity mappings needs a more
+         * complete VA-aware rollback path than the low-VA slab code uses.
+         */
+        return -LINUX_ENOMEM;
+    }
+
+    uint64_t va_start = ALIGN_DOWN(addr, BLOCK_2MIB);
+    uint64_t va_end = ALIGN_UP(addr + length, BLOCK_2MIB);
+    uint64_t backing_span = va_end - va_start;
+    uint64_t backing_gpa_start = ALIGN_UP(
+        (g->mmap_end > g->mmap_next) ? g->mmap_end : g->mmap_next, BLOCK_2MIB);
+    uint64_t backing_limit =
+        g->kbuf_gpa ? g->kbuf_gpa : (g->interp_base - INFRA_RESERVE);
+    if (backing_gpa_start >= backing_limit ||
+        backing_span > backing_limit - backing_gpa_start)
+        return -LINUX_ENOMEM;
+
+    if (!is_anon) {
+        if (fuse_fd_refuse_mmap(fd)) {
+            char materialized_path[PATH_MAX];
+            int rc = fuse_materialize_fd(fd, materialized_path,
+                                         sizeof(materialized_path));
+            if (rc < 0)
+                return rc;
+            host_backing_fd = open(materialized_path, O_RDONLY | O_CLOEXEC);
+            int saved_errno = errno;
+            unlink(materialized_path);
+            if (host_backing_fd < 0) {
+                errno = saved_errno;
+                return linux_errno();
+            }
+            close_host_backing_fd = true;
+        } else {
+            if (host_fd_ref_open(fd, &backing_ref) < 0)
+                return -LINUX_EBADF;
+            host_backing_fd = backing_ref.fd;
+        }
+        track_backing_fd = dup(host_backing_fd);
+        if (track_backing_fd < 0) {
+            ret = -LINUX_ENOMEM;
+            goto fail;
+        }
+        if (prot != LINUX_PROT_NONE) {
+            char probe;
+            ssize_t nr;
+            do {
+                nr = pread(host_backing_fd, &probe, sizeof(probe),
+                           (off_t) offset);
+            } while (nr < 0 && errno == EINTR);
+            if (nr < 0) {
+                ret = linux_errno();
+                goto fail;
+            }
+        }
+    }
+
+    int map_perms =
+        (prot == LINUX_PROT_NONE) ? MEM_PERM_RW : prot_to_perms(prot);
+
+    /* Mapping loop installs PT state in block-sized steps. Any L1/L2 tables
+     * newly allocated during this call are left in place on rollback: they
+     * are zero descriptors after invalidation and harmless until reused by
+     * a later mmap.
+     */
+    va_installed_end = va_start;
+
+    for (uint64_t va = va_start; va < va_end; va += BLOCK_2MIB) {
+        uint64_t gpa = backing_gpa_start + (va - va_start);
+
+        void *host = host_ptr_for_gpa(g, gpa);
+        if (!host)
+            goto fail;
+        memset(host, 0, BLOCK_2MIB);
+
+        /* Detect freshness BEFORE guest_map_va_range so the decision is not
+         * confused by a prior high-VA mmap into the same 2 MiB block. A
+         * fresh block needs its split-inherited L3 entries zeroed so gap
+         * pages do not silently inherit block-level perms; a pre-existing
+         * block must be left alone so earlier mappings into the same block
+         * survive.
+         */
+        bool fresh_block = !guest_va_block_mapped(g, va);
+
+        if (guest_map_va_range(g, va, va + BLOCK_2MIB, gpa, map_perms) < 0)
+            goto fail;
+        va_installed_end = va + BLOCK_2MIB;
+
+        /* Fresh blocks are live with full-2 MiB block-level perms from
+         * here until guest_invalidate_ptes zeros the split-inherited L3
+         * entries. If split or invalidate fails in between, the rollback
+         * must scrub the entire block; record it for the fail path.
+         */
+        if (fresh_block)
+            inflight_fresh_block_va = va;
+
+        /* Always split so guest_install_va_pages can write 4 KiB L3 PTEs
+         * for the actual mapped range; pre-existing tables make split a
+         * no-op.
+         */
+        if (guest_split_block(g, va) < 0)
+            goto fail;
+
+        if (fresh_block) {
+            if (guest_invalidate_ptes(g, va, va + BLOCK_2MIB) < 0)
+                goto fail;
+            /* L3 entries are zeroed; the block is no longer live at
+             * 2 MiB scope and the narrow rollback is sufficient.
+             */
+            inflight_fresh_block_va = UINT64_MAX;
+        }
+    }
+
+    uint8_t *map_host =
+        host_ptr_for_gpa(g, backing_gpa_start + (addr - va_start));
+    if (!map_host)
+        goto fail;
+
+    if (!is_anon && prot != LINUX_PROT_NONE) {
+        memset(map_host, 0, length);
+        uint8_t *dst = map_host;
+        size_t remaining = length;
+        off_t file_off = (off_t) offset;
+        while (remaining > 0) {
+            ssize_t nr = pread(host_backing_fd, dst, remaining, file_off);
+            if (nr < 0) {
+                if (errno == EINTR)
+                    continue;
+                break;
+            }
+            if (nr == 0)
+                break;
+            dst += nr;
+            remaining -= (size_t) nr;
+            file_off += nr;
+        }
+    }
+
+    /* Install L3 PTEs for the actual mapped range. Fresh blocks were
+     * fully invalidated in the loop above so their gap pages do not
+     * inherit block-level perms; pre-existing blocks are left untouched
+     * so prior high-VA mmaps into the same 2 MiB block survive.
+     *
+     * PROT_NONE still needs an explicit invalidate for the requested
+     * pages: when the range lands inside a reused 2 MiB block, leaving
+     * the inherited L3 descriptors intact would make the new guard range
+     * spuriously accessible.
+     */
+    if (prot == LINUX_PROT_NONE) {
+        if (guest_invalidate_ptes(g, addr, addr + length) < 0)
+            goto fail;
+    } else {
+        uint64_t gpa_for_addr = backing_gpa_start + (addr - va_start);
+        if (guest_install_va_pages(g, addr, length, gpa_for_addr,
+                                   prot_to_perms(prot)) < 0)
+            goto fail;
+    }
+
+    uint64_t backing_gpa_end = backing_gpa_start + backing_span;
+    if (backing_gpa_end > g->mmap_next)
+        g->mmap_next = backing_gpa_end;
+    if (backing_gpa_end > g->mmap_end)
+        g->mmap_end = backing_gpa_end;
+
+    uint64_t gpa_base = backing_gpa_start + (addr - va_start);
+    if (!region_has_capacity_after_removes(g, NULL, 0, 1))
+        goto fail;
+    if (guest_region_add_ex_owned_gpa(g, addr, addr + length, gpa_base, prot,
+                                      flags, offset, NULL,
+                                      track_backing_fd) < 0)
+        goto fail;
+    track_backing_fd = -1;
+    if (close_host_backing_fd && host_backing_fd >= 0)
+        close(host_backing_fd);
+    host_fd_ref_close(&backing_ref);
+
+    return (int64_t) addr;
+
+fail:
+    /* Roll back PT state installed by this call. The success path
+     * preserves pre-existing 2 MiB blocks (so prior high-VA mmaps in the
+     * same block survive); the rollback must respect that same
+     * invariant. Two cases:
+     *
+     *   1. An in-flight fresh block: block-mapped at full-2 MiB perms but
+     *      not yet invalidated. Zero the entire 2 MiB so no stray RW/RX
+     *      mapping survives across the failure.
+     *   2. The requested subrange [addr, addr+length): pre-existing
+     *      blocks and completed fresh blocks were only ever written
+     *      inside this range by guest_install_va_pages, so a narrow
+     *      invalidate is the right scope. Completed fresh blocks had all
+     *      L3 entries cleared in the loop, so any leftover split-
+     *      inherited descriptors outside [addr, addr+length) are dormant
+     *      and harmless until overwritten by a future mmap into the same
+     *      VA range. Region tracking itself was never updated on this
+     *      path (guest_region_add_ex_owned_gpa is the final commit), so
+     *      region metadata is consistent without further cleanup.
+     */
+    if (inflight_fresh_block_va != UINT64_MAX) {
+        if (guest_invalidate_ptes(g, inflight_fresh_block_va,
+                                  inflight_fresh_block_va + BLOCK_2MIB) < 0) {
+            log_error(
+                "sys_mmap_fixed_high_va: rollback invalidate failed for "
+                "fresh block [0x%llx, 0x%llx)",
+                (unsigned long long) inflight_fresh_block_va,
+                (unsigned long long) (inflight_fresh_block_va + BLOCK_2MIB));
+        }
+    }
+    if (va_installed_end > va_start) {
+        if (guest_invalidate_ptes(g, addr, addr + length) < 0) {
+            log_error(
+                "sys_mmap_fixed_high_va: rollback invalidate failed for "
+                "VA [0x%llx, 0x%llx)",
+                (unsigned long long) addr,
+                (unsigned long long) (addr + length));
+        }
+    }
+    if (track_backing_fd >= 0)
+        close(track_backing_fd);
+    if (close_host_backing_fd && host_backing_fd >= 0)
+        close(host_backing_fd);
+    host_fd_ref_close(&backing_ref);
+    return ret;
+}
+
 static int mremap_extend_range(guest_t *g,
                                uint64_t off,
                                uint64_t size,
@@ -425,6 +740,7 @@ static int restore_file_overlay_range(guest_t *g,
 typedef struct {
     uint64_t start;
     uint64_t end;
+    uint64_t gpa_base;
     int prot;
     int flags;
     uint64_t offset;
@@ -500,6 +816,7 @@ static int capture_region_snapshots(guest_t *g,
         region_snapshot_t *snap = &snaps[n++];
         snap->start = r->start;
         snap->end = r->end;
+        snap->gpa_base = r->gpa_base;
         snap->prot = r->prot;
         snap->flags = r->flags;
         snap->offset = r->offset;
@@ -617,10 +934,10 @@ static int restore_region_snapshots(guest_t *g, region_snapshot_t *snaps, int n)
 {
     for (int i = 0; i < n; i++) {
         region_snapshot_t *snap = &snaps[i];
-        if (guest_region_add_ex_owned(g, snap->start, snap->end, snap->prot,
-                                      snap->flags, snap->offset,
-                                      snap->name[0] ? snap->name : NULL,
-                                      snap->backing_fd) < 0) {
+        if (guest_region_add_ex_owned_gpa(
+                g, snap->start, snap->end, snap->gpa_base, snap->prot,
+                snap->flags, snap->offset, snap->name[0] ? snap->name : NULL,
+                snap->backing_fd) < 0) {
             snap->backing_fd = -1;
             close_region_snapshots(snaps, n);
             return -LINUX_ENOMEM;
@@ -1178,8 +1495,15 @@ int64_t sys_mmap(guest_t *g,
     if (!is_anon && (offset & 4095))
         return -LINUX_EINVAL;
 
-    if (!is_anon && fuse_fd_refuse_mmap(fd))
-        return -LINUX_ENODEV;
+    if (!is_anon && fuse_fd_refuse_mmap(fd)) {
+        bool allow_materialized_fuse_mmap =
+            g->is_rosetta &&
+            ((flags & LINUX_MAP_FIXED) ||
+             (flags & LINUX_MAP_FIXED_NOREPLACE)) &&
+            addr >= g->guest_size && !(flags & LINUX_MAP_SHARED);
+        if (!allow_materialized_fuse_mmap)
+            return -LINUX_ENODEV;
+    }
 
     /* Round length up to page size (overflow-safe) */
     if (length > UINT64_MAX - 4095)
@@ -1207,9 +1531,27 @@ int64_t sys_mmap(guest_t *g,
         if (addr > 0x0000FFFFFFFFFFFFULL)
             return -LINUX_ENOMEM;
 
+        if (addr >= g->guest_size)
+            return sys_mmap_fixed_high_va(g, addr, length, prot, flags, fd,
+                                          offset, is_noreplace);
+
+        /* High-VA MAP_FIXED (rosetta's JIT slabs at 240 TiB, code caches
+         * at 85 TiB, etc.) is not safe to expose yet. The previous draft
+         * could install TTBR0 aliases for addresses above the primary guest
+         * buffer, but munmap/mprotect/fork bookkeeping still track regions
+         * by low GPA and mmap_next only. Returning success here therefore
+         * created mappings that later teardown paths could not manage and
+         * let overflow-backed aliases corrupt the fork snapshot high-water
+         * mark. Fail closed until the region metadata and teardown paths are
+         * made VA-aware end-to-end.
+         */
         /* MAP_FIXED: addr is IPA-based, convert to offset */
         uint64_t off = addr - g->ipa_base;
-        /* Use subtraction-based check to avoid off+length overflow */
+        /* Use subtraction-based check to avoid off+length overflow.
+         * Stays primary-buffer-only for the low-VA path because the body
+         * below issues raw host_base+off arithmetic (memset, pread, etc.).
+         * The high-VA path above is the alternate route for rosetta.
+         */
         if (off > g->guest_size || length > g->guest_size - off)
             return -LINUX_ENOMEM;
 
@@ -1792,7 +2134,10 @@ int64_t sys_mremap(guest_t *g,
         ~(LINUX_MREMAP_MAYMOVE | LINUX_MREMAP_FIXED | LINUX_MREMAP_DONTUNMAP))
         return -LINUX_EINVAL;
 
-    /* Overflow check on old range */
+    /* Overflow check on old range. mremap's body shrinks, copies, and zeroes
+     * via raw host_base+off arithmetic, so the check stays primary-only
+     * here until the data-movement paths are made region-aware.
+     */
     uint64_t old_off = old_addr - g->ipa_base;
     if (old_off > g->guest_size)
         return -LINUX_EFAULT;
@@ -1835,6 +2180,9 @@ int64_t sys_mremap(guest_t *g,
         if (new_addr & 4095)
             return -LINUX_EINVAL;
         uint64_t new_off = new_addr - g->ipa_base;
+        /* MREMAP_FIXED dest stays primary-only for the same reason as the
+         * source check above.
+         */
         if (new_off > g->guest_size || new_size > g->guest_size - new_off)
             return -LINUX_ENOMEM;
 
@@ -2300,9 +2648,13 @@ int64_t sys_madvise(guest_t *g, uint64_t addr, uint64_t length, int advice)
         return 0;
 
     /* Range must lie within the guest IPA window. Linux returns -ENOMEM
-     * (not -EINVAL) for addresses outside the process address space — see
+     * (not -EINVAL) for addresses outside the process address space; see
      * madvise(2): "Addresses in the specified range are not currently
-     * mapped, or are outside the address space of the process."
+     * mapped, or are outside the address space of the process." Stays
+     * primary-only because MADV_DONTNEED zeroes via raw host_base+off and
+     * the slab restore path likewise assumes primary backing. The
+     * region-aware variant will consume guest_is_valid_range once the body
+     * is updated.
      */
     uint64_t off = addr - g->ipa_base;
     if (off > g->guest_size || length > g->guest_size - off)
@@ -2521,6 +2873,14 @@ int64_t sys_munmap(guest_t *g, uint64_t addr, uint64_t length)
         return -LINUX_EINVAL;
 
     if (addr <= 0x0000FFFFFFFFFFFFULL) {
+        if (addr >= g->guest_size) {
+            if (region_range_overlaps(g, addr, addr + length)) {
+                if (guest_invalidate_ptes(g, addr, addr + length) < 0)
+                    return -LINUX_ENOMEM;
+                guest_region_remove(g, addr, addr + length);
+            }
+            return 0;
+        }
         uint64_t unmap_off = addr - g->ipa_base;
         if (unmap_off <= g->guest_size && length <= g->guest_size - unmap_off) {
             uint64_t end = unmap_off + length;
@@ -2583,6 +2943,23 @@ int64_t sys_mprotect(guest_t *g, uint64_t addr, uint64_t length, int prot)
         return -LINUX_EINVAL;
 
     if (addr <= 0x0000FFFFFFFFFFFFULL) {
+        if (addr >= g->guest_size) {
+            uint64_t mprot_end = addr + length;
+            if (guest_kbuf_user_va_overlap(addr, length) &&
+                (prot & LINUX_PROT_EXEC))
+                return -LINUX_EINVAL;
+
+            guest_region_set_prot(g, addr, mprot_end, prot);
+            if (prot != LINUX_PROT_NONE) {
+                if (guest_update_perms(g, addr, mprot_end,
+                                       prot_to_perms(prot)) < 0)
+                    return -LINUX_ENOMEM;
+            } else {
+                if (guest_invalidate_ptes(g, addr, mprot_end) < 0)
+                    return -LINUX_ENOMEM;
+            }
+            return 0;
+        }
         uint64_t mprot_off = addr - g->ipa_base;
         if (mprot_off <= g->guest_size && length <= g->guest_size - mprot_off) {
             uint64_t mprot_end = mprot_off + length;
@@ -2761,6 +3138,11 @@ int64_t sys_msync(guest_t *g, uint64_t addr, uint64_t length, int flags)
         return -LINUX_ENOMEM;
 
     uint64_t off = addr - g->ipa_base;
+    /* sys_msync stays primary-only here for the same reason as madvise:
+     * msync iterates regions and reaches into host_base+off to read pages
+     * back from the file overlay. Widening to extra-region ranges needs a
+     * region-aware iterator landing alongside the data-movement refactor.
+     */
     if (off > g->guest_size || length > g->guest_size - off)
         return -LINUX_ENOMEM;
     uint64_t end = off + length;

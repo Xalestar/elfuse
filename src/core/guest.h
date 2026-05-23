@@ -98,6 +98,30 @@
  */
 #define GUEST_IPA_BASE 0x0ULL
 
+/* Kernel-VA window for x86_64-via-Rosetta guests.
+ *
+ * Rosetta issues MAP_FIXED at bits-63-set addresses (0xFFFFFFFFF0000000+) for
+ * its internal kernel-VA allocations. With EPD1=1 (default TCR), TTBR1 walks
+ * are disabled and such VAs fault. The kbuf window enables TTBR1, backs a
+ * 256 MiB region in the primary buffer at kbuf_gpa, and installs an L0[511]/
+ * L1[511]/L2[384..511] page-table tree.
+ *
+ * KBUF_USER_VA is the bits-47:0 alias used by rosetta's TaggedPointer
+ * extraction (which strips bits 63:48). Mapping the SAME physical kbuf pages
+ * at both KBUF_VA_BASE under TTBR1 and KBUF_USER_VA under TTBR0 lets a single
+ * physical region service both views.
+ *
+ * Aliasing-proof invariant: the kbuf is RW under both mappings; nothing
+ * executable is ever installed inside [kbuf_gpa, kbuf_gpa + KBUF_SIZE). The
+ * aliased VAs are leaf data only, so HVF's per-mapping W^X enforcement cannot
+ * create a writable-and-executable race. Future kbuf writers must keep the
+ * pages RW-only; an executable kbuf alias would violate the invariant.
+ */
+#define KBUF_VA_BASE \
+    0xFFFFFFFFF0000000ULL       /* TTBR1 kernel-VA base (last 256 MiB) */
+#define KBUF_SIZE 0x10000000ULL /* 256 MiB */
+#define KBUF_USER_VA (KBUF_VA_BASE & 0x0000FFFFFFFFFFFFULL) /* TTBR0 mirror */
+
 /* Page table attributes. */
 /* Memory region permission flags */
 #define MEM_PERM_R (1 << 0)
@@ -107,12 +131,23 @@
 #define MEM_PERM_RW (MEM_PERM_R | MEM_PERM_W)
 
 /* A contiguous region of guest memory to be mapped in page tables.
- * Identity-mapped: VA == GPA.
+ *
+ * Default mode (va_base == 0): identity-mapped, VA == GPA. Used by every
+ * boot region (shim, vDSO, brk, stack) and every aarch64 ELF segment.
+ *
+ * Rosetta segments use va_base != 0 to install a non-identity mapping:
+ * the rosetta ELF is statically linked at 0x800000000000 (128 TiB) but its
+ * bytes live in the primary buffer at a low GPA. Page-table entries are
+ * indexed by va_base + (offset within region) and emit a block descriptor
+ * whose output address is gpa_start + (offset within region). This is the
+ * only place in elfuse where guest VA diverges from guest GPA.
  */
 typedef struct {
-    uint64_t gpa_start; /* Output IPA/GPA (2MiB aligned) */
-    uint64_t gpa_end;   /* Output IPA/GPA end (exclusive, 2MiB aligned) */
-    int perms;          /* MEM_PERM_* flags */
+    uint64_t gpa_start; /* Output GPA / IPA (2MiB aligned) */
+    uint64_t gpa_end;   /* Output GPA / IPA end (exclusive, 2MiB aligned) */
+    uint64_t
+        va_base; /* 0 for identity, else the guest VA the region appears at */
+    int perms;   /* MEM_PERM_* flags */
 } mem_region_t;
 
 /* Semantic region tracking. */
@@ -151,14 +186,18 @@ typedef struct {
  * Regions are kept sorted by start address in guest_t.regions[].
  */
 typedef struct {
-    uint64_t start;  /* GPA start for gap-finder (page-aligned) */
-    uint64_t end;    /* GPA end (exclusive, page-aligned) */
-    int prot;        /* LINUX_PROT_* flags */
-    int flags;       /* LINUX_MAP_* flags (for /proc/self/maps display) */
-    uint64_t offset; /* File offset (for /proc/self/maps display) */
-    int backing_fd;  /* Duplicated host fd for file-backed mappings, or -1 */
-    bool shared;     /* MAP_SHARED (writes should propagate) */
-    bool noreserve;  /* MAP_NORESERVE: PTEs deferred until fault */
+    uint64_t start;    /* GPA start for gap-finder (page-aligned) */
+    uint64_t end;      /* GPA end (exclusive, page-aligned) */
+    uint64_t gpa_base; /* Backing GPA corresponding to start. Equals start for
+                        * identity-mapped regions; differs for high-VA guest
+                        * mappings whose VA and GPA diverge.
+                        */
+    int prot;          /* LINUX_PROT_* flags */
+    int flags;         /* LINUX_MAP_* flags (for /proc/self/maps display) */
+    uint64_t offset;   /* File offset (for /proc/self/maps display) */
+    int backing_fd;    /* Duplicated host fd for file-backed mappings, or -1 */
+    bool shared;       /* MAP_SHARED (writes should propagate) */
+    bool noreserve;    /* MAP_NORESERVE: PTEs deferred until fault */
     bool overlay_active; /* Region has a live host MAP_FIXED|MAP_SHARED overlay
                           * of backing_fd at host_base+start. The kernel's page
                           * cache keeps it coherent with the file and with peer
@@ -207,6 +246,51 @@ typedef struct {
     uint64_t start; /* Page-aligned VA when kind == TLBI_RANGE */
 } tlbi_request_t;
 
+/* Multi-region IPA mapping.
+ *
+ * The primary buffer is identity-mapped at IPA 0 and covers the low IPA range
+ * (typically 64 GiB on M1, 1 TiB on M3+). Anything that lives above that --
+ * notably rosetta's statically-linked segments at 128 TiB -- needs its own
+ * Stage-2 mapping installed via a separate hv_vm_map. Each such region is
+ * recorded in guest_t.mappings[] so guest_ptr / gva_resolve can translate
+ * page-table-walk results that land outside the primary buffer.
+ *
+ * macOS user-space cannot directly mmap at host VA 128 TiB, so the host VA
+ * is unrelated to the guest IPA. The mapping records both.
+ */
+#define GUEST_MAX_MAPPINGS 8
+typedef struct {
+    uint64_t gpa;      /* IPA where the mapping is installed (Stage-2 base) */
+    void *host_va;     /* Host virtual address backing the IPA range */
+    size_t size;       /* Bytes covered (always page-aligned) */
+    uint32_t hv_perms; /* HV_MEMORY_READ/WRITE/EXEC bitmask used at map time */
+    bool owns_host;    /* True if host_va was allocated by guest_add_mapping */
+} guest_mapping_t;
+
+/* Overflow segment for incremental GPA expansion.
+ *
+ * The primary buffer's mmap pool is large by aarch64 standards (56 GiB on M1,
+ * 1016 GiB on M3+) but rosetta JIT/PIE/slab traffic at 85 TB / 240 TB issues
+ * many 2 MiB blocks that consume the pool quickly on hosts where Stage-2 caps
+ * the primary buffer at 36-bit IPA. Overflow segments are 1 GiB host buffers
+ * mapped at IPAs stacked just above guest_size; a bump allocator hands out
+ * 2 MiB blocks. New segments are created lazily so untouched overflow costs
+ * nothing.
+ *
+ * Layout matches externals/hyper-linux/src/guest.h:146-153 to keep the
+ * upcoming syscall_exec / fork_ipc ports straightforward.
+ */
+#define GUEST_MAX_OVERFLOW 4
+#define GUEST_OVERFLOW_SIZE                          \
+    (1ULL * 1024 * 1024 * 1024) /* 1 GiB per segment \
+                                 */
+typedef struct {
+    void *host_base;    /* Host buffer backing the IPA range */
+    uint64_t ipa_start; /* Stage-2 IPA of this segment */
+    uint64_t size;      /* Total bytes (always GUEST_OVERFLOW_SIZE today) */
+    uint64_t next;      /* Bump offset; (next + BLOCK_2MIB) > size means full */
+} guest_overflow_t;
+
 /* Guest state. */
 typedef struct {
     void *host_base; /* Host pointer to allocated guest memory */
@@ -254,10 +338,57 @@ typedef struct {
      */
     uint64_t mmap_rw_gap_hint, mmap_rx_gap_hint;
 
-    uint64_t ttbr0;       /* TTBR0 value (IPA of L0 page table) */
-    hv_vcpu_t vcpu;       /* vCPU handle */
+    uint64_t ttbr0; /* TTBR0 value (IPA of L0 page table) */
+    uint64_t ttbr1; /* TTBR1 value (IPA of L0 kernel page table; 0 if unused) */
+    hv_vcpu_t vcpu; /* vCPU handle */
     hv_vcpu_exit_t *exit; /* vCPU exit info */
     uint32_t ipa_bits;    /* IPA bits requested from HVF */
+
+    /* x86_64-via-Rosetta state. All zero for aarch64 guests. Populated when
+     * the rosetta feature flag is on and an EM_X86_64 binary is loaded.
+     * Survives guest_reset so execve of another x86_64 binary keeps the same
+     * placement and kbuf wiring.
+     *
+     * Field semantics mirror externals/hyper-linux/src/guest.h so that future
+     * ports of rosetta.c/.h, syscall_exec.c, and fork_ipc.c do not need to
+     * rename anything:
+     *   rosetta_guest_base : Stage-2 GPA where rosetta segments are installed
+     *                        via guest_add_mapping (typically 128 TiB).
+     *   rosetta_va_base    : Guest virtual base where rosetta is loaded
+     *                        (matches its static link address, 0x800000000000).
+     *   rosetta_size       : Total bytes covering all rosetta PT_LOAD segments.
+     *   rosetta_entry      : Rosetta ELF entry point (high VA).
+     *   kbuf_gpa           : Stage-2 GPA backing the kbuf window inside the
+     *                        primary buffer (256 MiB, 2 MiB-aligned).
+     *   kbuf_base          : Host pointer to the kbuf, == host_base+kbuf_gpa.
+     *                        The guest VA for the kernel mirror is the fixed
+     *                        constant KBUF_VA_BASE; the user-VA alias is the
+     *                        derived constant KBUF_USER_VA.
+     */
+    bool is_rosetta;
+    uint64_t rosetta_guest_base;
+    uint64_t rosetta_va_base;
+    uint64_t rosetta_size;
+    uint64_t rosetta_entry;
+    uint64_t kbuf_gpa;
+    void *kbuf_base;
+
+    /* Extra IPA mappings installed via hv_vm_map at a non-zero GPA. Consulted
+     * by gva_resolve when the page-table walk yields a GPA outside the primary
+     * buffer (gpa >= guest_size). Cleared on guest_init; preserved across
+     * guest_reset because rosetta placement is stable across execve.
+     */
+    guest_mapping_t mappings[GUEST_MAX_MAPPINGS];
+    int n_mappings;
+
+    /* Overflow segments. noverflow grows from 0 lazily as guest_overflow_alloc
+     * runs out of bump space. overflow_ipa_next tracks the next free IPA
+     * stacked above guest_size; initialized in guest_init to g->guest_size.
+     */
+    guest_overflow_t overflow[GUEST_MAX_OVERFLOW];
+    int noverflow;
+    uint64_t overflow_ipa_next;
+
     /* Semantic region tracking for munmap/mprotect/proc-self-maps */
     guest_region_t regions[GUEST_MAX_REGIONS];
     int nregions; /* Number of active regions */
@@ -459,6 +590,175 @@ int guest_init_from_shm(guest_t *g,
 /* Tear down VM and free guest memory. */
 void guest_destroy(guest_t *g);
 
+/* Install a Stage-2 mapping for a high IPA range that the primary buffer does
+ * not cover (e.g. rosetta's segments at 128 TiB). Calls hv_vm_map with the
+ * supplied permissions. If host_va_inout points to NULL, allocates an anon
+ * host buffer of the requested size and records ownership so guest_destroy
+ * frees it. Otherwise the caller-supplied host_va is mapped as-is and the
+ * mapping does not own it. size and gpa must be page-aligned.
+ *
+ * The new region is appended to g->mappings[] for guest_ptr / gva_resolve
+ * fall-through. Returns 0 on success, -1 if GUEST_MAX_MAPPINGS is exhausted,
+ * if the allocation/mapping fails, or if the range collides with the primary
+ * buffer or an existing extra mapping.
+ *
+ * Locking: callers MUST hold mmap_lock. gva_resolve_perm reads mappings[]
+ * lock-free during page-table walks, so mutating n_mappings / mappings[]
+ * from concurrent vCPUs without serialization would race.
+ */
+int guest_add_mapping(guest_t *g,
+                      uint64_t gpa,
+                      size_t size,
+                      uint32_t hv_perms,
+                      void **host_va_inout);
+
+/* Tear down the Rosetta-specific guest personality: unmap the translator's
+ * extra IPA mappings, clear the TTBR1/kbuf fields, and scrub the rosetta_*
+ * metadata. Used when a Rosetta-launched process execve()s an aarch64 image.
+ *
+ * Locking: callers MUST hold mmap_lock. gva_resolve_perm reads mappings[]
+ * lock-free during page-table walks.
+ */
+void guest_clear_rosetta_state(guest_t *g);
+
+/* Linear scan of g->mappings[] for the entry covering gpa. Returns NULL if
+ * gpa is below g->guest_size (i.e. inside the primary buffer) or not covered
+ * by any extra mapping.
+ */
+const guest_mapping_t *guest_find_mapping(const guest_t *g, uint64_t gpa);
+
+/* Bump-allocate a 2 MiB block from the overflow segments. Lazily creates a
+ * new 1 GiB segment (via mmap + hv_vm_map at g->overflow_ipa_next) when the
+ * existing segments are exhausted. Returns the GPA of the allocated block,
+ * or UINT64_MAX if all GUEST_MAX_OVERFLOW segments are full or a host/HVF
+ * allocation step failed. Callers should treat UINT64_MAX as -ENOMEM.
+ *
+ * Locking: callers MUST hold mmap_lock. gva_resolve_perm reads overflow[]
+ * lock-free during page-table walks.
+ */
+uint64_t guest_overflow_alloc(guest_t *g);
+
+/* Locate the overflow segment covering gpa. Returns NULL if gpa is not within
+ * any overflow segment.
+ */
+const guest_overflow_t *guest_find_overflow(const guest_t *g, uint64_t gpa);
+
+/* Returns true when [gpa, gpa+len) is fully contained within the primary
+ * buffer, OR fully contained within a single extra mapping, OR fully
+ * contained within a single overflow segment. The check rejects ranges that
+ * straddle region boundaries -- host pointers cannot safely span discontiguous
+ * backing regions. len == 0 returns true (zero-length ranges are well-formed
+ * by convention; syscall handlers that disallow them check separately).
+ *
+ * Use this for syscalls that need to validate a guest IPA range without
+ * coupling to the primary-buffer-only assumption: sys_mmap MAP_FIXED,
+ * sys_munmap, sys_mremap, sys_mprotect, sys_msync, and any future caller
+ * that handles rosetta high-VA traffic.
+ */
+bool guest_is_valid_range(const guest_t *g, uint64_t gpa, uint64_t len);
+
+/* Initialize the TTBR1 kbuf window. kbuf_gpa must be 2 MiB-aligned and the
+ * [kbuf_gpa, kbuf_gpa + KBUF_SIZE) range must lie within the primary buffer.
+ * Allocates three page-table pages (L0/L1/L2) from the PT pool, populates
+ * L0[511] -> L1, L1[511] -> L2, and L2[384..511] = 128 x 2 MiB block
+ * descriptors with PT_AP_RW_EL0 | PT_UXN | PT_PXN (RW, non-executable).
+ * Stores the resulting TTBR1 IPA in g->ttbr1 and sets g->kbuf_gpa /
+ * g->kbuf_base. On any failure all three fields are scrubbed to 0/NULL
+ * so the caller cannot read stale state.
+ *
+ * Returns 0 on success, -1 on alignment / bounds / PT-pool-exhaustion failure.
+ *
+ * Locking: callers MUST hold mmap_lock. The function mutates the PT pool
+ * and the kbuf fields; gva translation reads ttbr1 lock-free.
+ */
+int guest_init_kbuf(guest_t *g, uint64_t kbuf_gpa);
+
+/* Install the TTBR0 user-VA mirror of the kbuf window. Walks the existing
+ * TTBR0 tree (at g->ttbr0) to L0[511]/L1[511]/L2[384..511] and writes
+ * 128 x 2 MiB block descriptors mapping [KBUF_USER_VA, KBUF_USER_VA +
+ * KBUF_SIZE) to [g->kbuf_gpa, g->kbuf_gpa + KBUF_SIZE) with RW + UXN + PXN
+ * perms. Rosetta's TaggedPointer extraction strips bits 63:48 so the same
+ * physical pages must be reachable through both TTBR1 (kernel VA) and
+ * TTBR0 (the user-VA alias).
+ *
+ * Must be called after guest_build_page_tables (g->ttbr0 must point at a
+ * valid L0 page) and after guest_init_kbuf (g->kbuf_gpa must be set).
+ * Returns 0 on success, -1 on PT-pool exhaustion or invalid state.
+ *
+ * Locking: callers MUST hold mmap_lock.
+ */
+int guest_install_kbuf_user_alias(guest_t *g);
+
+/* Install L2 block descriptors mapping [va_start, va_end) to
+ * [gpa_start, gpa_start + (va_end-va_start)) under TTBR0. Both addresses
+ * and the size must be 2 MiB-aligned. Walks the existing TTBR0 tree at
+ * g->ttbr0 and allocates L1/L2 tables from the PT pool as needed.
+ *
+ * If an L2 slot is already populated, the function leaves it untouched
+ * and continues with the next block; the caller is expected to use
+ * guest_update_perms (or split + update_perms) if it needs to refine
+ * permissions on an already-mapped 2 MiB block.
+ *
+ * Records a guest_pt_gen_bump and a TLBI request covering the new range
+ * so the shim invalidates matching TLB entries on the way back to EL0.
+ *
+ * Returns 0 on success, -1 on alignment, PT-pool-exhaustion, or out-of-L0
+ * failure. Used by sys_mmap for high-VA MAP_FIXED requests (rosetta's
+ * JIT slabs at 240 TiB, code caches at 85 TiB) where the VA lives outside
+ * the primary buffer but the GPA still does.
+ *
+ * Locking: callers MUST hold mmap_lock.
+ */
+int guest_map_va_range(guest_t *g,
+                       uint64_t va_start,
+                       uint64_t va_end,
+                       uint64_t gpa_start,
+                       int perms);
+
+/* Install (or overwrite) 4 KiB L3 page descriptors mapping [va, va+length)
+ * to [gpa, gpa+length) with the requested perms. Unlike guest_update_perms,
+ * which only edits existing descriptors and falls back to region metadata
+ * for invalid entries, this helper always writes a fresh make_page_desc so
+ * a previously-invalidated L3 slot is restored without consulting the
+ * region table. Splits L2 block descriptors on the path lazily.
+ *
+ * All three arguments (va, length, gpa) must be PAGE_SIZE aligned. The L2
+ * chain (L0->L1->L2) must already be in place (caller's responsibility,
+ * typically via a prior guest_map_va_range).
+ *
+ * Returns 0 on success, -1 on alignment, missing L2 chain, or PT-pool
+ * exhaustion.
+ *
+ * Locking: callers MUST hold mmap_lock.
+ */
+int guest_install_va_pages(guest_t *g,
+                           uint64_t va,
+                           uint64_t length,
+                           uint64_t gpa,
+                           int perms);
+
+/* Query whether a 2 MiB TTBR0 VA block already has a leaf mapping.
+ * Returns true only for a present L2 block descriptor.
+ */
+bool guest_va_block_mapped(const guest_t *g, uint64_t va);
+
+/* Returns true when the VA range [va, va+size) overlaps the user-VA kbuf
+ * alias window [KBUF_USER_VA, KBUF_USER_VA+KBUF_SIZE). Callers that install
+ * TTBR0 mappings (the future rosetta_finalize, sys_mmap MAP_FIXED touching
+ * this range, the page-table-build pass) must reject MEM_PERM_X when this
+ * helper returns true: TTBR1 maps the same physical pages RW only, and an
+ * executable TTBR0 alias would defeat HVF's per-mapping W^X enforcement.
+ */
+static inline bool guest_kbuf_user_va_overlap(uint64_t va, uint64_t size)
+{
+    if (size == 0)
+        return false;
+    uint64_t end = va + size;
+    if (end < va) /* arithmetic overflow */
+        end = UINT64_MAX;
+    return va < (KBUF_USER_VA + KBUF_SIZE) && KBUF_USER_VA < end;
+}
+
 /* Get a host pointer for a guest virtual address (read access).
  * Returns NULL if gva is out of bounds or not readable.
  */
@@ -626,6 +926,15 @@ int guest_region_add_ex(guest_t *g,
                         uint64_t offset,
                         const char *name,
                         int backing_fd);
+int guest_region_add_ex_gpa(guest_t *g,
+                            uint64_t start,
+                            uint64_t end,
+                            uint64_t gpa_base,
+                            int prot,
+                            int flags,
+                            uint64_t offset,
+                            const char *name,
+                            int backing_fd);
 /* Like guest_region_add_ex, but consumes owned_backing_fd on success or
  * failure.
  */
@@ -637,6 +946,15 @@ int guest_region_add_ex_owned(guest_t *g,
                               uint64_t offset,
                               const char *name,
                               int owned_backing_fd);
+int guest_region_add_ex_owned_gpa(guest_t *g,
+                                  uint64_t start,
+                                  uint64_t end,
+                                  uint64_t gpa_base,
+                                  int prot,
+                                  int flags,
+                                  uint64_t offset,
+                                  const char *name,
+                                  int owned_backing_fd);
 
 /* Remove all region coverage in [start, end). Regions fully contained are
  * deleted; partially overlapping regions are trimmed or split.

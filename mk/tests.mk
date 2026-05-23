@@ -4,6 +4,8 @@
         test-static-bins \
         test-dynamic test-dynamic-coreutils test-glibc-dynamic \
         test-glibc-coreutils test-perf \
+        test-rosetta-cli test-rosetta-statics test-rosetta-failure-modes \
+        test-rosetta-alpine test-rosetta-all bench-rosetta \
         test-matrix test-matrix-elfuse-aarch64 test-matrix-qemu-aarch64 \
         test-full test-multi-vcpu test-rwx test-sysroot-rename \
         test-case-collision test-case-collision-fallback test-sysroot-create-paths \
@@ -20,6 +22,17 @@ test-hello: $(ELFUSE_BIN) $(TEST_HELLO_DEP)
 check-syscall-coverage:
 	@python3 scripts/check-syscall-coverage.py
 
+define RUN_OPTIONAL_SKIP77
+	@set -e; \
+	rc=0; \
+	$(1) || rc=$$?; \
+	if [ "$$rc" = 77 ]; then \
+		printf "$(YELLOW)SKIP$(RESET) %s\n" "$(2)"; \
+	elif [ "$$rc" != 0 ]; then \
+		exit "$$rc"; \
+	fi
+endef
+
 ## Run the unit test suite plus busybox applet validation
 check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage
 	@bash tests/driver.sh -e $(ELFUSE_BIN) -d $(TEST_DIR) -v
@@ -35,6 +48,8 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage
 	@$(MAKE) --no-print-directory test-fuse-alpine
 	@printf "\n$(BLUE)━━━ timeout=0 validation ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-timeout-disable
+	@printf "\n$(BLUE)━━━ rosetta CLI gating ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-rosetta-cli
 
 test-sysroot-rename: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-rename
 	@set -e; \
@@ -113,6 +128,40 @@ test-timeout-disable: $(ELFUSE_BIN) $(TEST_HELLO_DEP)
 ## Run GDB stub integration tests (LLDB <-> elfuse gdbstub)
 test-gdbstub: $(ELFUSE_BIN) $(TEST_DIR)/test-hello
 	@bash tests/test-gdbstub.sh -e $(ELFUSE_BIN) -v
+
+## Run Rosetta CLI gating regressions without requiring Rosetta runtime support
+test-rosetta-cli: $(ELFUSE_BIN)
+	@bash tests/test-rosetta-cli.sh $(ELFUSE_BIN)
+
+## Smoke test x86_64 statics through Rosetta. Requires Rosetta-for-Linux
+## installed on the host and the Alpine x86_64 fixture tree staged via
+## INCLUDE_X86_64=1 bash tests/fetch-fixtures.sh. Skips cleanly otherwise.
+test-rosetta-statics: $(ELFUSE_BIN)
+	$(call RUN_OPTIONAL_SKIP77,bash tests/test-rosetta-statics.sh $(ELFUSE_BIN),test-rosetta-statics)
+
+## Probe known-unsupported scenarios (dynamic x86_64, mid-process execve,
+## --gdb on x86_64, --no-rosetta). Verifies the failure path emits a
+## stable error rather than crashing or succeeding silently.
+test-rosetta-failure-modes: $(ELFUSE_BIN)
+	@bash tests/test-rosetta-failure-modes.sh $(ELFUSE_BIN)
+
+## Alpine x86_64 file-I/O + text-pipeline coverage. Lifts the matrix's
+## busybox-applet style tests against the Alpine staticbin tree but stays
+## lightweight enough for the rosetta-all aggregate. Skips cleanly when
+## fixtures or Rosetta-for-Linux are missing.
+test-rosetta-alpine: $(ELFUSE_BIN)
+	$(call RUN_OPTIONAL_SKIP77,bash tests/test-rosetta-alpine.sh $(ELFUSE_BIN),test-rosetta-alpine)
+
+## Run every Rosetta-specific test target in sequence.
+test-rosetta-all: test-rosetta-cli test-rosetta-failure-modes \
+                  test-rosetta-statics test-rosetta-alpine
+
+## Wall-clock bench harness for x86_64-via-Rosetta workloads. Prints
+## best-of-N samples plus the aarch64 reference where available. Set
+## BENCH_ITERS=<n> to change sample count (default 5).
+BENCH_ITERS ?= 5
+bench-rosetta: $(ELFUSE_BIN)
+	$(call RUN_OPTIONAL_SKIP77,bash tests/bench-rosetta.sh $(ELFUSE_BIN) $(BENCH_ITERS),bench-rosetta)
 
 ## Alias for check (backward compat)
 test-all: check
@@ -406,6 +455,11 @@ test-matrix-elfuse-aarch64: $(ELFUSE_BIN) $(TEST_DEPS)
 ## Run test matrix: qemu aarch64 mode
 test-matrix-qemu-aarch64: $(ELFUSE_BIN) $(TEST_DEPS)
 	@bash tests/test-matrix.sh qemu-aarch64
+
+## Probe the x86_64-via-Rosetta matrix wiring. Fails closed until the runtime
+## and fixture corpus are complete enough to execute real coverage.
+test-matrix-elfuse-x86_64: $(ELFUSE_BIN) $(TEST_DEPS)
+	@bash tests/test-matrix.sh elfuse-x86_64
 
 # Full test suite
 ## Run the complete test suite (aarch64: unit + busybox + gdbstub + coreutils + static + dynamic)

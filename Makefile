@@ -24,6 +24,7 @@ SRCS := \
     core/stack.c \
     core/vdso.c \
     core/bootstrap.c \
+    core/rosetta.c \
     core/sysroot.c \
     runtime/thread.c \
     runtime/futex.c \

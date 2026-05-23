@@ -26,6 +26,9 @@
 #define NETLINK_ROUTE 0
 
 /* Linux socket types + flags. */
+#define LINUX_SOCK_STREAM 1
+#define LINUX_SOCK_DGRAM 2
+#define LINUX_SOCK_SEQPACKET 5
 #define LINUX_SOCK_NONBLOCK 0x800
 #define LINUX_SOCK_CLOEXEC 0x80000
 

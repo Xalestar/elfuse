@@ -259,7 +259,16 @@ run_check find "hello.txt" "$TMPDIR" "-name" "hello.txt"
 # Networking
 printf '\n%s── Networking ──%s\n' "$BLUE" "$RESET"
 run_check nslookup "Address" "example.com"
-run_check wget "Example" "-q" "-O" "-" "http://example.com/"
+# wget pulls a real document from example.com. In sandboxed CI / corporate
+# networks where outbound HTTP is filtered, this fails with "No route to
+# host" through no fault of busybox itself. Probe TCP reachability from
+# the host first and skip cleanly rather than report a misleading failure.
+# /dev/tcp/host/port is bash-specific; nc -z is more portable here.
+if nc -z -w 2 example.com 80 2> /dev/null; then
+    run_check wget "Example" "-q" "-O" "-" "http://example.com/"
+else
+    run_skip wget "external http unreachable from this host"
+fi
 run_skip ping "needs raw socket / setuid"
 run_nc_http_check
 run_skip telnet "needs interactive terminal"

@@ -124,6 +124,8 @@ static int net_sock_opt_index_for(int level, int optname)
     }
     if (level == LINUX_IPPROTO_IPV6 && optname == LINUX_IPV6_V6ONLY)
         return SOCK_OPT_IPV6_V6ONLY;
+    if (level == LINUX_IPPROTO_IP && optname == LINUX_IP_MTU_DISCOVER)
+        return SOCK_OPT_IP_MTU_DISCOVER;
     return -1;
 }
 

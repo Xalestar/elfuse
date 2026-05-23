@@ -1713,7 +1713,14 @@ void robust_list_walk(guest_t *g, thread_entry_t *t)
             futex_gva = list_ptr + (uint64_t) futex_offset;
         else
             futex_gva = list_ptr - (uint64_t) (-futex_offset);
-        if (futex_gva >= g->ipa_base + g->guest_size ||
+        /* Canonical user-VA range check (bits 47:0). Anything with bit 63
+         * set is kernel-VA territory and is never a valid futex address.
+         * The previous primary-buffer-only check (futex_gva < ipa_base +
+         * guest_size) silently dropped rosetta's high-VA futexes; the
+         * subsequent guest_read_small / guest_write_small calls do the
+         * actual mapping check via the page-table walker.
+         */
+        if (futex_gva > 0x0000FFFFFFFFFFFFULL ||
             !futex_uaddr_is_aligned(futex_gva)) {
             /* Out of range or unaligned: skip. Linux's unaligned_p() rejects
              * these; emulating the same avoids partial cross-page writes
@@ -1765,7 +1772,11 @@ void robust_list_walk(guest_t *g, thread_entry_t *t)
             futex_gva = pending + (uint64_t) futex_offset;
         else
             futex_gva = pending - (uint64_t) (-futex_offset);
-        if (futex_gva >= g->ipa_base + g->guest_size ||
+        /* Canonical user-VA + alignment only; guest_read_small below is the
+         * actual reachability test, so rosetta high-VA robust futexes are
+         * not silently skipped (was: futex_gva >= ipa_base + guest_size).
+         */
+        if (futex_gva > 0x0000FFFFFFFFFFFFULL ||
             !futex_uaddr_is_aligned(futex_gva))
             return;
         uint32_t futex_val;

@@ -65,8 +65,13 @@
 /* TCR_EL1.
  * 4KiB granule, 48-bit VA, EPD1=1 (TTBR1 walks disabled).
  * Used by main.c (initial setup) and syscall/exec.c (exec re-init).
+ *
+ * The KBUF variant clears EPD1 (TTBR1 walks enabled) and sets TBI1=1 so
+ * rosetta's TaggedPointer masking still resolves the kbuf window at the
+ * bits-63-set VA range. Selected at bootstrap when g->is_rosetta is set.
  */
 #define TCR_EL1_VALUE 0x25B5903510ULL
+#define TCR_EL1_VALUE_KBUF 0x65B5103510ULL
 
 /* vCPU register helpers.
  *

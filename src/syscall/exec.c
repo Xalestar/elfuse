@@ -22,7 +22,9 @@
 #include "hvutil.h"
 #include "utils.h"
 
+#include "core/bootstrap.h"
 #include "core/elf.h"
+#include "core/rosetta.h"
 #include "core/stack.h"
 #include "core/vdso.h"
 
@@ -40,6 +42,100 @@
 /* fd_cleanup_entry() releases type-specific fd resources after the CLOEXEC
  * entry has been removed from the shared fd table.
  */
+
+/* Force HVF to commit the sysreg/GPR writes that sys_execve performs after
+ * a guest_reset before vcpu_run resumes. HVF defers writes until the next
+ * register-touch on the owning thread, and a stale read here is harmless.
+ * Use the HV_CHECK-wrapped accessors so a real HVF error (HV_BUSY,
+ * HV_ERROR) past the point of no return aborts cleanly with a diagnostic
+ * instead of silently resuming with undefined register state.
+ */
+static void exec_sync_vcpu_regs(hv_vcpu_t vcpu)
+{
+    (void) vcpu_get_sysreg(vcpu, HV_SYS_REG_TTBR0_EL1);
+    (void) vcpu_get_sysreg(vcpu, HV_SYS_REG_TCR_EL1);
+    (void) vcpu_get_sysreg(vcpu, HV_SYS_REG_TTBR1_EL1);
+    (void) vcpu_get_sysreg(vcpu, HV_SYS_REG_ELR_EL1);
+    (void) vcpu_get_sysreg(vcpu, HV_SYS_REG_SP_EL0);
+    (void) vcpu_get_sysreg(vcpu, HV_SYS_REG_SPSR_EL1);
+    (void) vcpu_get_reg(vcpu, HV_REG_X8);
+}
+
+/* Release the buffers and temporary host-side files that sys_execve allocates
+ * before crossing the point of no return. Used by both the Rosetta and the
+ * aarch64 success paths.
+ */
+static void exec_cleanup_inputs(char *argv_buf,
+                                char *envp_buf,
+                                const char *path_host_buf,
+                                bool path_host_temp,
+                                const char *interp_host_buf,
+                                bool interp_host_temp)
+{
+    if (path_host_temp)
+        unlink(path_host_buf);
+    if (interp_host_temp)
+        unlink(interp_host_buf);
+    free(argv_buf);
+    free(envp_buf);
+}
+
+static int exec_resolve_guest_host_path(const char *guest_path,
+                                        char *host_path,
+                                        size_t host_path_sz,
+                                        bool *host_path_temp)
+{
+    path_translation_t tx;
+    if (!guest_path || !host_path || host_path_sz == 0 || !host_path_temp) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    *host_path_temp = false;
+    if (path_translate_at(LINUX_AT_FDCWD, guest_path, PATH_TR_NONE, &tx) < 0)
+        return -1;
+    if (tx.fuse_path) {
+        int rc =
+            fuse_materialize_path(tx.intercept_path, host_path, host_path_sz);
+        if (rc < 0) {
+            errno = -rc;
+            return -1;
+        }
+        *host_path_temp = true;
+        return 0;
+    }
+
+    size_t len = str_copy_trunc(host_path, tx.host_path, host_path_sz);
+    if (len >= host_path_sz) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    return 0;
+}
+
+static int exec_resolve_interp_host_path(const char *sysroot,
+                                         const char *interp_guest_path,
+                                         char *interp_host_path,
+                                         size_t interp_host_path_sz,
+                                         bool *interp_host_temp)
+{
+    char interp_candidate[LINUX_PATH_MAX];
+    elf_resolve_interp(sysroot, interp_guest_path, interp_candidate,
+                       sizeof(interp_candidate));
+    if (strcmp(interp_candidate, interp_guest_path) != 0) {
+        size_t len = str_copy_trunc(interp_host_path, interp_candidate,
+                                    interp_host_path_sz);
+        if (len >= interp_host_path_sz) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        *interp_host_temp = false;
+        return 0;
+    }
+
+    return exec_resolve_guest_host_path(interp_guest_path, interp_host_path,
+                                        interp_host_path_sz, interp_host_temp);
+}
 
 /* Read a NULL-terminated pointer array from guest memory.
  * Each pointer in the array is a 64-bit GVA pointing to a string.
@@ -346,11 +442,23 @@ int64_t sys_execve(hv_vcpu_t vcpu,
      * unrecoverable, matching the Linux kernel's behavior (SIGKILL).
      */
 
-    /* Reject x86_64 binaries (only aarch64 is supported) */
+    /* x86_64 targets dispatch through guest_bootstrap_rosetta_post_reset
+     * once the point-of-no-return work below clears guest state. Reject
+     * here only when Rosetta is disabled via --no-rosetta or
+     * ELFUSE_NO_ROSETTA=1; otherwise mark the transition and skip the
+     * aarch64-specific ELF/interp setup below.
+     */
+    bool target_is_rosetta = false;
     if (elf_info.e_machine == EM_X86_64) {
-        log_error("execve: x86_64 binaries not supported: %s", path);
-        err = -LINUX_ENOEXEC;
-        goto fail;
+        if (!proc_rosetta_enabled()) {
+            log_error(
+                "execve: x86_64 ELF rejected by --no-rosetta "
+                "(or ELFUSE_NO_ROSETTA=1): %s",
+                path);
+            err = -LINUX_ENOEXEC;
+            goto fail;
+        }
+        target_is_rosetta = true;
     }
 
     /* Compute load base once (used for size check and later mapping).
@@ -378,14 +486,32 @@ int64_t sys_execve(hv_vcpu_t vcpu,
     elf_info_t interp_info;
     memset(&interp_info, 0, sizeof(interp_info));
     char interp_resolved[LINUX_PATH_MAX];
+    char interp_display_path[LINUX_PATH_MAX];
     interp_resolved[0] = '\0';
+    interp_display_path[0] = '\0';
 
-    if (elf_info.interp_path[0] != '\0') {
+    /* x86_64 targets do not pre-load their PT_INTERP. Rosetta is statically
+     * linked and loads the target binary (and any guest-side dynamic linker)
+     * itself via fd 3, so the aarch64-only interpreter pre-load below is
+     * skipped for rosetta exec.
+     */
+    if (!target_is_rosetta && elf_info.interp_path[0] != '\0') {
         char sysroot_snap[LINUX_PATH_MAX];
         bool have_sr =
             proc_sysroot_snapshot(sysroot_snap, sizeof(sysroot_snap));
-        elf_resolve_interp(have_sr ? sysroot_snap : NULL, elf_info.interp_path,
-                           interp_resolved, sizeof(interp_resolved));
+        if (exec_resolve_interp_host_path(have_sr ? sysroot_snap : NULL,
+                                          elf_info.interp_path, interp_resolved,
+                                          sizeof(interp_resolved),
+                                          &interp_host_temp) < 0) {
+            log_error("execve: failed to resolve interpreter: %s",
+                      elf_info.interp_path);
+            err = -LINUX_ENOEXEC;
+            goto fail;
+        }
+        str_copy_trunc(
+            interp_display_path,
+            interp_host_temp ? elf_info.interp_path : interp_resolved,
+            sizeof(interp_display_path));
 
         log_debug("execve: pre-validating interpreter: %s", interp_resolved);
 
@@ -409,12 +535,8 @@ int64_t sys_execve(hv_vcpu_t vcpu,
      */
     if (0) {
     fail:
-        if (path_host_temp)
-            unlink(path_host_buf);
-        if (interp_host_temp)
-            unlink(interp_host_buf);
-        free(argv_buf);
-        free(envp_buf);
+        exec_cleanup_inputs(argv_buf, envp_buf, path_host_buf, path_host_temp,
+                            interp_host_buf, interp_host_temp);
         return err;
     }
 
@@ -508,6 +630,24 @@ int64_t sys_execve(hv_vcpu_t vcpu,
      * kernel exec failure after its point of no return.
      */
     fork_notify_vfork_exec();
+    /* Only clear rosetta state when leaving rosetta. For rosetta-to-rosetta
+     * exec the placement (rosetta_guest_base, rosetta_va_base, kbuf_gpa,
+     * ttbr1) must survive guest_reset so guest_bootstrap_rosetta_post_reset
+     * hits rosetta_prepare's re-entry branch and reuses the existing GPA
+     * instead of picking a fresh one. Keep proc_rosetta_active in sync so
+     * /proc/self/exe readlink reports the right path.
+     */
+    if (g->is_rosetta && !target_is_rosetta) {
+        rosettad_clear_binary_path();
+        guest_clear_rosetta_state(g);
+        proc_set_rosetta_active(false);
+    } else if (!g->is_rosetta && target_is_rosetta) {
+        /* aarch64 -> rosetta: enter rosetta mode fresh. guest_clear was
+         * already a no-op in this branch since the parent had no rosetta
+         * state to clear. */
+        g->is_rosetta = true;
+        proc_set_rosetta_active(true);
+    }
     guest_reset(g);
 
     /* The replacement image must not inherit process-wide shutdown requests
@@ -529,6 +669,94 @@ int64_t sys_execve(hv_vcpu_t vcpu,
     unsigned int shim_size = proc_get_shim_size();
     if (shim_ptr && shim_size > 0) {
         memcpy((uint8_t *) g->host_base + g->shim_base, shim_ptr, shim_size);
+    }
+
+    /* x86_64 re-bootstrap branch: hand off the post-reset work to the
+     * Rosetta-aware helper, then write vCPU sysregs for kernel-VA execution
+     * and return without touching the aarch64-specific block below.
+     */
+    if (target_is_rosetta) {
+        /* Drain the previous rosettad bridge before rosetta_finalize wires
+         * a fresh one. The detached handler thread only clears its global
+         * client-fd marker on its own EOF/exit. 1 s is enough headroom
+         * for a loaded host; a hung handler past that point will lose
+         * the start_handler CAS later, and the warning here marks the
+         * cause. Soft cap; the install may still succeed on timeout if
+         * the handler's CAS races us favourably.
+         */
+        if (!rosettad_wait_for_idle(1000)) {
+            log_warn(
+                "execve: rosettad bridge did not drain within 1s; "
+                "rosetta_finalize CAS may lose the race");
+        }
+
+        /* path_host may point at path_host_buf (normal path) or at
+         * interp_host_buf (shebang resolution landed on a FUSE-backed
+         * x86_64 binary). Ownership of any materialized temp transfers
+         * to rosettad regardless of which buffer holds the path, so
+         * capture that temp path in one place and clear the matching
+         * temp flag here. exec_cleanup_inputs becomes a no-op for the
+         * transferred slot, and the post-PNR rollback below can unlink
+         * via owned_rosetta_temp without re-discriminating which buffer
+         * was selected.
+         */
+        const char *owned_rosetta_temp = NULL;
+        if (path_host == path_host_buf && path_host_temp) {
+            owned_rosetta_temp = path_host_buf;
+            path_host_temp = false;
+        } else if (path_host == interp_host_buf && interp_host_temp) {
+            owned_rosetta_temp = interp_host_buf;
+            interp_host_temp = false;
+        }
+
+        uint64_t r_entry = 0, r_sp = 0, r_ttbr0 = 0;
+        if (guest_bootstrap_rosetta_post_reset(
+                g, path_host, owned_rosetta_temp != NULL, path, argc,
+                (const char **) argv, envp, shim_size, false, &r_entry, &r_sp,
+                &r_ttbr0) < 0) {
+            /* Post-PNR fatal failure. The temp flag was cleared up front
+             * so exec_cleanup_inputs would be a no-op, and rosettad never
+             * reached its ownership-commit point on this failure path.
+             * Best-effort unlink so the materialized temp does not orphan
+             * in /tmp on a path the kernel parallels with SIGKILL.
+             */
+            if (owned_rosetta_temp)
+                unlink(owned_rosetta_temp);
+            log_fatal(
+                "execve failed after point of no return: "
+                "rosetta re-bootstrap failed for %s",
+                path);
+            exit(128);
+        }
+
+        /* I-cache for the (possibly re-mapped) rosetta segments has already
+         * been invalidated inside rosetta_prepare; only the shim needs an
+         * I-cache flush from here.
+         */
+        sys_icache_invalidate((uint8_t *) g->host_base + g->shim_base,
+                              shim_size);
+
+        uint64_t entry_ipa = guest_ipa(g, r_entry);
+        uint64_t sp_ipa = guest_ipa(g, r_sp);
+
+        hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TTBR0_EL1, r_ttbr0);
+        hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TCR_EL1, TCR_EL1_VALUE_KBUF);
+        hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TTBR1_EL1, g->ttbr1);
+        hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, entry_ipa);
+        hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SP_EL0, sp_ipa);
+        hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SPSR_EL1, 0x0);
+        hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TPIDR_EL0, 0);
+        vcpu_zero_gprs(vcpu);
+        hv_vcpu_set_reg(vcpu, HV_REG_X8, 2);
+        tlbi_request_clear();
+
+        exec_sync_vcpu_regs(vcpu);
+
+        log_debug("execve: rosetta target %s, entry=0x%llx sp=0x%llx", path,
+                  (unsigned long long) entry_ipa, (unsigned long long) sp_ipa);
+        exec_cleanup_inputs(argv_buf, envp_buf, path_host_buf, path_host_temp,
+                            interp_host_buf, interp_host_temp);
+        return SYSCALL_EXEC_HAPPENED;
     }
 
     /* Load the executable image that was validated before guest_reset(). */
@@ -735,7 +963,7 @@ int64_t sys_execve(hv_vcpu_t vcpu,
                                  interp_info.segments[i].memsz + interp_base,
                              elf_pf_to_prot(interp_info.segments[i].flags),
                              LINUX_MAP_PRIVATE, interp_info.segments[i].offset,
-                             interp_resolved);
+                             interp_display_path);
         }
     }
     /* Leave the lowest stack page unmapped so downward overflow faults before
@@ -785,6 +1013,8 @@ int64_t sys_execve(hv_vcpu_t vcpu,
 
     /* Switch EL0 translation to the rebuilt page tables. */
     hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TTBR0_EL1, ttbr0);
+    hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TCR_EL1, TCR_EL1_VALUE);
+    hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_TTBR1_EL1, 0);
 
     /* The shim will ERET to this address after syscall dispatch returns. */
     hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, entry_ipa);
@@ -816,28 +1046,13 @@ int64_t sys_execve(hv_vcpu_t vcpu,
     hv_vcpu_set_reg(vcpu, HV_REG_X8, 2);
     tlbi_request_clear();
 
-    /* Readback forces HVF to commit sysreg/GPR writes before the run loop
-     * resumes the vCPU.
-     */
-    {
-        uint64_t _sync;
-        hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_TTBR0_EL1, &_sync);
-        hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ELR_EL1, &_sync);
-        hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_SP_EL0, &_sync);
-        hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_SPSR_EL1, &_sync);
-        hv_vcpu_get_reg(vcpu, HV_REG_X8, &_sync);
-        (void) _sync;
-    }
+    exec_sync_vcpu_regs(vcpu);
 
     log_debug("execve: loaded %s, entry=0x%llx sp=0x%llx", path_host,
               (unsigned long long) entry_ipa, (unsigned long long) sp_ipa);
 
-    if (path_host_temp)
-        unlink(path_host_buf);
-    if (interp_host_temp)
-        unlink(interp_host_buf);
-    free(argv_buf);
-    free(envp_buf);
+    exec_cleanup_inputs(argv_buf, envp_buf, path_host_buf, path_host_temp,
+                        interp_host_buf, interp_host_temp);
 
     return SYSCALL_EXEC_HAPPENED;
 

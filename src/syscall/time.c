@@ -15,9 +15,10 @@
 
 #include "utils.h"
 
+#include "runtime/thread.h" /* current_thread, guest_tid */
 #include "syscall/abi.h"
 #include "syscall/internal.h"
-#include "syscall/proc.h" /* proc_exit_group_requested */
+#include "syscall/proc.h" /* proc_exit_group_requested, proc_get_pid */
 #include "syscall/signal.h"
 #include "syscall/time.h"
 
@@ -178,14 +179,32 @@ static int translate_clockid(int linux_clockid)
         return CLOCK_MONOTONIC;
     default:
         /* Handle Linux dynamic CPU clock IDs (negative values).
-         * Decode: pid = ~(clockid >> 3), perthread = clockid & 4
-         * Only support pid=0 (self); other pids have no macOS equivalent.
+         * Decode: encoded id = ~(clockid >> 3), perthread = clockid & 4,
+         * type bits = clockid & 3 (PROF=0, VIRT=1, SCHED=2).
+         * Linux's convention:
+         *   encoded id == 0    -> "self" (process or thread variant)
+         *   encoded id == pid  -> that process
+         *   per-thread variant: encoded id == 0 means current thread,
+         *                       or the target TID for pthread_getcpuclockid.
+         *
+         * The macOS host only exposes CLOCK_THREAD_CPUTIME_ID for the
+         * calling thread, so cross-thread or cross-process queries are
+         * unsupportable. Accept both process and per-thread clocks when
+         * they refer to self (encoded 0 or matching self pid/tid). Reject
+         * foreign ids and reserved type bits with -EINVAL.
          */
         if (linux_clockid < 0) {
-            int pid = LINUX_CPUCLOCK_PID(linux_clockid);
-            if (pid != 0)
-                return -1; /* Other process CPU times are unavailable */
+            int type_bits = linux_clockid & 3;
+            if (type_bits == 3)
+                return -1; /* Reserved type bits in dynamic clock id */
+            int encoded_id = LINUX_CPUCLOCK_PID(linux_clockid);
             bool is_perthread = linux_clockid & LINUX_CPUCLOCK_PERTHREAD_MASK;
+            int self_pid = (int) proc_get_pid();
+            int self_tid =
+                current_thread ? (int) current_thread->guest_tid : self_pid;
+            int self_match = is_perthread ? self_tid : self_pid;
+            if (encoded_id != 0 && encoded_id != self_match)
+                return -1; /* Foreign process/thread clocks unsupported */
             return is_perthread ? CLOCK_THREAD_CPUTIME_ID
                                 : CLOCK_PROCESS_CPUTIME_ID;
         }

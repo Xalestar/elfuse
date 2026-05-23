@@ -18,6 +18,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <stdbool.h>
+#include <limits.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
 #include <sys/ioctl.h>
@@ -25,7 +26,10 @@
 
 #include "utils.h"
 
+#include "core/rosetta.h"
+#include "hvutil.h"
 #include "runtime/procemu.h"
+#include "runtime/thread.h"
 
 #include "syscall/abi.h"
 #include "syscall/fd.h"
@@ -116,6 +120,98 @@ static int64_t io_return_zero(host_fd_ref_t *host_ref)
 {
     host_fd_ref_close(host_ref);
     return 0;
+}
+
+static bool rosetta_ioctl_target_fd(guest_t *g, int host_fd)
+{
+    if (!g->is_rosetta)
+        return false;
+
+    /* Rosetta opens /proc/self/exe (which under rosetta resolves to the
+     * rosetta translator, not elfuse) and issues the VZ probe ioctls on
+     * that descriptor. Match against ROSETTA_PATH so the gate triggers
+     * regardless of where elfuse itself lives on disk.
+     */
+    char resolved[PATH_MAX];
+    if (fcntl(host_fd, F_GETPATH, resolved) < 0)
+        return false;
+    if (strcmp(resolved, ROSETTA_PATH) != 0)
+        return false;
+
+    /* Defense in depth: require the syscall to originate from inside the
+     * rosetta translator image. The /proc/self/exe redirection makes the
+     * launcher fd reachable to any code running under a rosetta-enabled
+     * VM, so without this check a guest-launched helper that opened
+     * /proc/self/exe could exercise the synthetic VZ probe path. Today
+     * the responses are public constants, but the gate guards against
+     * future synthetic responses that leak host state. ELR_EL1 carries
+     * the EL0 return PC captured at SVC entry on aarch64.
+     *
+     * Skip if the rosetta image bounds are not yet known (pre-finalize);
+     * the F_GETPATH match above is the only gate in that window, and
+     * rosetta_finalize publishes the bounds before issuing any ioctl.
+     */
+    if (g->rosetta_va_base && g->rosetta_size) {
+        if (!current_thread)
+            return false;
+        uint64_t pc = vcpu_get_sysreg(current_thread->vcpu, HV_SYS_REG_ELR_EL1);
+        if (pc < g->rosetta_va_base ||
+            pc - g->rosetta_va_base >= g->rosetta_size)
+            return false;
+    }
+    return true;
+}
+
+/* Returns true if request matches one of the Rosetta VZ probe ioctls. */
+static bool rosetta_vz_request(uint64_t request)
+{
+    return request == ROSETTA_VZ_CHECK || request == ROSETTA_VZ_CAPS ||
+           request == ROSETTA_VZ_ACTIVATE;
+}
+
+/* Handle the Rosetta VZ probe ioctl trio. Writes synthetic responses to the
+ * guest buffer at arg and returns the value the guest sees (1 on success,
+ * negative Linux errno on a guest_write fault). Caller is responsible for
+ * dispatch gating (see rosetta_vz_request + rosetta_ioctl_target_fd).
+ */
+static int64_t rosetta_vz_ioctl(guest_t *g, uint64_t request, uint64_t arg)
+{
+    switch (request) {
+    case ROSETTA_VZ_CHECK: {
+        static const char rosetta_sig[ROSETTA_VZ_SIG_LEN] =
+            "Our hard work\nby these words guarded\n"
+            "please don't steal\n\xc2\xa9 Apple Inc";
+        if (guest_write(g, arg, rosetta_sig, sizeof(rosetta_sig)) < 0)
+            return -LINUX_EFAULT;
+        return 1;
+    }
+    case ROSETTA_VZ_CAPS: {
+        /* caps is zero-initialised: VZ_SECONDARY and the trailing NUL of any
+         * partially-copied binary path are already in place.
+         */
+        uint8_t caps[ROSETTA_CAPS_SIZE] = {0};
+        caps[ROSETTA_CAPS_VZ_ENABLE] = 1;
+        static const char fake_sock_path[] = ROSETTAD_SOCKET_PATH;
+        memcpy(&caps[ROSETTA_CAPS_SOCKET_PATH], fake_sock_path,
+               sizeof(fake_sock_path));
+        /* Snapshot the caps binary path under the rosetta path lock so a
+         * concurrent execve cannot tear the string between length probe
+         * and copy. Inline buffer matches the cap exactly; the snapshot
+         * helper bounds the write itself.
+         */
+        char bin[ROSETTA_CAPS_BINARY_PATH_LEN];
+        size_t bin_n = rosettad_snapshot_caps_binary_path(bin, sizeof(bin));
+        if (bin_n > 0)
+            memcpy(&caps[ROSETTA_CAPS_BINARY_PATH], bin, bin_n);
+        if (guest_write(g, arg, caps, sizeof(caps)) < 0)
+            return -LINUX_EFAULT;
+        return 1;
+    }
+    case ROSETTA_VZ_ACTIVATE:
+        return 1;
+    }
+    /* Caller gates dispatch; this is unreachable in practice. */
+    return -LINUX_ENOTTY;
 }
 
 /* termios flag translation helpers. */
@@ -1179,6 +1275,18 @@ int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg)
     if (err < 0)
         return err;
     int host_fd = host_ref.fd;
+
+    /* Rosetta's Virtualization.framework probe ioctls are issued on the
+     * /proc/self/exe launcher fd very early at startup. Gate on that actual
+     * host file rather than on every fd in a Rosetta guest, but do not key on
+     * ROSETTA_PATH itself: the probe is against the launcher, not the
+     * translator image.
+     */
+    if (rosetta_vz_request(request) && rosetta_ioctl_target_fd(g, host_fd)) {
+        int64_t r = rosetta_vz_ioctl(g, request, arg);
+        host_fd_ref_close(&host_ref);
+        return r;
+    }
 
     switch (request) {
     case LINUX_TIOCSPGRP: {

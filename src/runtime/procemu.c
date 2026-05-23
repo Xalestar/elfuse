@@ -45,6 +45,7 @@
 
 #include "debug/log.h"
 #include "runtime/procemu.h"
+#include "core/rosetta.h"
 #include "runtime/thread.h"
 
 #include "syscall/abi.h"
@@ -1560,8 +1561,15 @@ int proc_intercept_open(const guest_t *g,
     /* /proc/self/exe -> open the actual ELF binary.
      * Unlike readlinkat (which returns the path string), openat needs to
      * return an actual file descriptor to the binary.
+     * Under rosetta, the binfmt_misc convention treats rosetta as the
+     * interpreter visible to the guest: rosetta opens /proc/self/fd/X
+     * via /proc/self/exe to identify itself and then issues the VZ
+     * ioctls on that descriptor. Return ROSETTA_PATH so the VZ ioctl
+     * gate (rosetta_ioctl_target_fd) recognises the fd.
      */
     if (!strcmp(path, "/proc/self/exe")) {
+        if (g && g->is_rosetta)
+            return open(ROSETTA_PATH, O_RDONLY);
         char exe[LINUX_PATH_MAX];
         if (!proc_elf_path_snapshot(exe, sizeof(exe))) {
             errno = ENOENT;
@@ -2591,6 +2599,17 @@ int proc_intercept_readlink(const char *path, char *buf, size_t bufsiz)
      * abstraction the rest of the path layer presents.
      */
     if (!strcmp(path, "/proc/self/exe")) {
+        /* Under rosetta, readlink("/proc/self/exe") points at the rosetta
+         * translator (the binfmt_misc interpreter). Matches the behavior
+         * Linux exposes when binfmt_misc dispatch is active.
+         */
+        if (proc_rosetta_active()) {
+            size_t len = strlen(ROSETTA_PATH);
+            if (len > bufsiz)
+                len = bufsiz;
+            memcpy(buf, ROSETTA_PATH, len);
+            return (int) len;
+        }
         char exe_buf[LINUX_PATH_MAX];
         if (!proc_elf_path_snapshot(exe_buf, sizeof(exe_buf))) {
             errno = ENOENT;

@@ -190,6 +190,12 @@ static void test_shm_name_visible_after_fork(void)
 
     char name[64];
     snprintf(name, sizeof(name), "/elfuse-msync-fork-%ld", (long) getpid());
+    /* Best-effort cleanup of stale shm objects from a previous run that
+     * was killed between create and the final unlink. macOS shm objects
+     * persist across process death, so without this O_EXCL fails with
+     * EEXIST and the test reports a spurious shm_open failure.
+     */
+    my_shm_unlink(name);
     int fd = my_shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0600);
     if (fd < 0) {
         FAIL("parent shm_open failed");

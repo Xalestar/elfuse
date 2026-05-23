@@ -21,6 +21,7 @@
 
 #include "utils.h"
 
+#include "core/rosetta.h"
 #include "debug/log.h"
 #include <fcntl.h>
 #include <errno.h>
@@ -42,10 +43,46 @@
 
 /* Syscall implementations. */
 
+static bool rosetta_socket_shim_enabled(guest_t *g)
+{
+    if (!g || !g->is_rosetta)
+        return false;
+
+    size_t cmdline_len = 0;
+    const char *cmdline = proc_get_cmdline(&cmdline_len);
+    size_t rosetta_len = strlen(ROSETTA_PATH);
+
+    return cmdline && cmdline_len > rosetta_len &&
+           memcmp(cmdline, ROSETTA_PATH, rosetta_len + 1) == 0;
+}
+
+static bool rosettad_connect_target(const struct sockaddr_storage *mac_sa)
+{
+    if (!mac_sa || mac_sa->ss_family != AF_UNIX)
+        return false;
+    const struct sockaddr_un *sun = (const struct sockaddr_un *) mac_sa;
+    return strcmp(sun->sun_path, ROSETTAD_SOCKET_PATH) == 0;
+}
+
+static bool rosetta_seqpacket_placeholder(guest_t *g, int guest_fd, int host_fd)
+{
+    int cached_type = 0;
+    if (!rosetta_socket_shim_enabled(g) ||
+        !net_socket_cached_int_get(guest_fd, LINUX_SOL_SOCKET, LINUX_SO_TYPE,
+                                   &cached_type) ||
+        cached_type != LINUX_SOCK_SEQPACKET || rosettad_is_socket(host_fd))
+        return false;
+
+    int so_type = 0;
+    socklen_t so_type_len = sizeof(so_type);
+    if (getsockopt(host_fd, SOL_SOCKET, SO_TYPE, &so_type, &so_type_len) < 0)
+        return false;
+
+    return (so_type & 0xF) == SOCK_STREAM;
+}
+
 int64_t sys_socket(guest_t *g, int domain, int type, int protocol)
 {
-    (void) g;
-
     /* AF_NETLINK: synthetic emulation, no macOS equivalent */
     if (domain == LINUX_AF_NETLINK)
         return netlink_socket(protocol, type);
@@ -54,6 +91,37 @@ int64_t sys_socket(guest_t *g, int domain, int type, int protocol)
     int real_type = extract_sock_type(type);
     int nonblock = extract_sock_nonblock(type);
     int cloexec = extract_sock_cloexec(type);
+
+    /* Rosetta opens AF_UNIX SOCK_SEQPACKET to talk to rosettad. macOS does
+     * not support SOCK_SEQPACKET on AF_UNIX, so while the translator process
+     * is active we create an unconnected SOCK_STREAM placeholder instead.
+     * sys_connect() upgrades only the specific rosettad path to the private
+     * socketpair/handler transport; any other connect on this placeholder
+     * fails so unrelated Unix IPC is not silently downgraded to STREAM.
+     */
+    if (rosetta_socket_shim_enabled(g) && mac_domain == AF_UNIX &&
+        real_type == LINUX_SOCK_SEQPACKET) {
+        int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (fd < 0)
+            return linux_errno();
+        int one = 1;
+        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+        if ((nonblock && fd_set_nonblock(fd) < 0) ||
+            (cloexec && fd_set_cloexec(fd) < 0)) {
+            close(fd);
+            return linux_errno();
+        }
+
+        int gfd = fd_alloc(FD_SOCKET, fd, NULL);
+        if (gfd < 0) {
+            close(fd);
+            return -LINUX_EMFILE;
+        }
+        if (cloexec)
+            fd_table[gfd].linux_flags |= LINUX_O_CLOEXEC;
+        net_socket_cache_init_defaults(gfd, domain, real_type);
+        return gfd;
+    }
 
     int fd = socket(mac_domain, real_type, protocol);
     if (fd < 0)
@@ -368,6 +436,65 @@ int64_t sys_connect(guest_t *g, int fd, uint64_t addr_gva, uint32_t addrlen)
         return 0;
     }
 
+    /* Upgrade the translator's fake AF_UNIX/SOCK_SEQPACKET placeholder to the
+     * private rosettad bridge only when it actually connects to the rosettad
+     * Unix path from the VZ_CAPS payload.
+     */
+    int cached_type = 0;
+    bool shimmed_seqpacket = rosetta_seqpacket_placeholder(g, fd, host_ref.fd);
+    if (shimmed_seqpacket &&
+        net_socket_cached_int_get(fd, LINUX_SOL_SOCKET, LINUX_SO_TYPE,
+                                  &cached_type) &&
+        rosettad_connect_target(&mac_sa)) {
+        int pair[2];
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair) < 0) {
+            host_fd_ref_close(&host_ref);
+            return linux_errno();
+        }
+
+        int one = 1;
+        setsockopt(pair[0], SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+        setsockopt(pair[1], SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+
+        int old_status = fcntl(host_ref.fd, F_GETFL, 0);
+        fd_entry_t snap;
+        bool have_snap = fd_snapshot(fd, &snap);
+        if ((old_status >= 0 && (old_status & O_NONBLOCK) &&
+             fd_set_nonblock(pair[0]) < 0) ||
+            (have_snap && (snap.linux_flags & LINUX_O_CLOEXEC) &&
+             fd_set_cloexec(pair[0]) < 0)) {
+            close(pair[0]);
+            close(pair[1]);
+            host_fd_ref_close(&host_ref);
+            return linux_errno();
+        }
+
+        if (fd_alloc_at(fd, FD_SOCKET, pair[0]) < 0) {
+            close(pair[0]);
+            close(pair[1]);
+            host_fd_ref_close(&host_ref);
+            return -LINUX_EMFILE;
+        }
+        if (have_snap)
+            fd_table[fd].linux_flags = snap.linux_flags;
+        net_socket_cache_init_defaults(fd, LINUX_AF_UNIX, cached_type);
+
+        if (rosettad_start_handler(pair[1], pair[0]) < 0) {
+            close(pair[1]);
+            log_warn(
+                "sys_connect: rosettad handler thread failed to start; "
+                "rosetta will see EOF on its socketpair");
+        }
+
+        host_fd_ref_close(&host_ref);
+        return 0;
+    }
+
+    if (shimmed_seqpacket) {
+        host_fd_ref_close(&host_ref);
+        return -LINUX_EPROTOTYPE;
+    }
+
     if (connect(host_ref.fd, (struct sockaddr *) &mac_sa, (socklen_t) mac_len) <
         0) {
         host_fd_ref_close(&host_ref);
@@ -676,8 +803,42 @@ int64_t sys_setsockopt(guest_t *g,
         return 0;
     }
 
-    if (level == LINUX_IPPROTO_IP &&
-        (optname == LINUX_IP_MTU_DISCOVER || optname == LINUX_IP_RECVERR)) {
+    if (level == LINUX_IPPROTO_IP && optname == LINUX_IP_MTU_DISCOVER) {
+        /* P2P networking tools (libp2p, syncthing, WireGuard userland,
+         * Tailscale's bundled tailscaled) set IP_MTU_DISCOVER early in
+         * connect and abort on -ENOPROTOOPT. macOS has no direct
+         * equivalent; accept the option, cache the Linux PMTUD mode for
+         * getsockopt round-trip, and where the host can honour it, push
+         * the closest IP_DONTFRAG setting onto the underlying socket.
+         * Linux PMTUD modes:
+         *   0 DONT  / 1 WANT  -> allow fragmentation (DONTFRAG off)
+         *   2 DO   / 3 PROBE  / 4 INTERFACE -> set DF (DONTFRAG on)
+         *   5 OMIT -> behave like DONT (best-effort)
+         */
+        if (!net_socket_fd_is_valid(fd))
+            return -LINUX_EBADF;
+        if (optlen > sizeof(int))
+            return -LINUX_EINVAL;
+        int value = 0;
+        if (optlen > 0 && guest_read_small(g, optval_gva, &value, optlen) < 0)
+            return -LINUX_EFAULT;
+        net_socket_cached_int_set(fd, LINUX_IPPROTO_IP, LINUX_IP_MTU_DISCOVER,
+                                  value);
+        host_fd_ref_t hr;
+        if (host_fd_ref_open(fd, &hr) == 0) {
+            int dontfrag = (value >= 2 && value <= 4) ? 1 : 0;
+            (void) setsockopt(hr.fd, IPPROTO_IP, IP_DONTFRAG, &dontfrag,
+                              sizeof(dontfrag));
+            host_fd_ref_close(&hr);
+        }
+        return 0;
+    }
+    if (level == LINUX_IPPROTO_IP && optname == LINUX_IP_RECVERR) {
+        /* No macOS equivalent for the Linux extended-error queue. Accept
+         * and discard; the queue stays empty, so subsequent recvmsg with
+         * MSG_ERRQUEUE returns -EAGAIN as Linux would for a quiescent
+         * connection.
+         */
         if (!net_socket_fd_is_valid(fd))
             return -LINUX_EBADF;
         if (optlen > sizeof(int))
@@ -854,7 +1015,14 @@ int64_t sys_getsockopt(guest_t *g,
         if (!net_socket_fd_is_valid(fd))
             return -LINUX_EBADF;
         if (guest_optlen >= sizeof(int)) {
+            /* IP_MTU_DISCOVER round-trips through the per-fd cache so
+             * getsockopt reports what the guest last wrote via setsockopt.
+             * IP_RECVERR has no cache (the extended-error queue stays
+             * permanently empty), so it always reports 1.
+             */
             int val = 1;
+            if (optname == LINUX_IP_MTU_DISCOVER)
+                (void) net_socket_cached_int_get(fd, level, optname, &val);
             uint32_t out_len = sizeof(int);
             if (guest_write_small(g, optval_gva, &val, sizeof(val)) < 0)
                 return -LINUX_EFAULT;

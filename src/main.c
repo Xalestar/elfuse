@@ -29,11 +29,14 @@
 
 #include "core/bootstrap.h"
 #include "core/guest.h"
+#include "core/rosetta.h"
 #include "core/sysroot.h"
 
 #include "runtime/forkipc.h"
 #include "runtime/proctitle.h"
 
+#include "syscall/fuse.h"
+#include "syscall/path.h"
 #include "syscall/proc.h"
 
 #include "debug/gdbstub.h"
@@ -47,6 +50,42 @@ static int parse_int_arg(const char *s, int min, int max, int *out)
     if (errno != 0 || end == s || *end != '\0' || value < min || value > max)
         return -1;
     *out = (int) value;
+    return 0;
+}
+
+static int resolve_guest_elf_host_path(const char *elf_guest_path,
+                                       char *elf_host_path,
+                                       size_t elf_host_path_sz,
+                                       bool *elf_host_temp)
+{
+    path_translation_t tx;
+    if (!elf_guest_path || !elf_host_path || elf_host_path_sz == 0 ||
+        !elf_host_temp) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    *elf_host_temp = false;
+    if (path_translate_at(LINUX_AT_FDCWD, elf_guest_path, PATH_TR_NONE, &tx) <
+        0)
+        return -1;
+
+    if (tx.fuse_path) {
+        int rc = fuse_materialize_path(tx.intercept_path, elf_host_path,
+                                       elf_host_path_sz);
+        if (rc < 0) {
+            errno = -rc;
+            return -1;
+        }
+        *elf_host_temp = true;
+        return 0;
+    }
+
+    size_t len = str_copy_trunc(elf_host_path, tx.host_path, elf_host_path_sz);
+    if (len >= elf_host_path_sz) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
     return 0;
 }
 
@@ -70,6 +109,7 @@ static void cleanup_main_resources(guest_t *g,
 {
     if (guest_initialized)
         guest_destroy(g);
+    rosettad_clear_binary_path();
     if (host_cwd && host_cwd[0] != '\0' && chdir(host_cwd) < 0)
         (void) chdir("/");
     sysroot_cleanup_mount(sysroot_mount);
@@ -120,12 +160,37 @@ int main(int argc, char **argv)
     log_init();
 
     bool verbose = false;
+    /* x86_64-via-Rosetta is on by default; --no-rosetta or
+     * ELFUSE_NO_ROSETTA=1 disables it. Architecture is auto-detected from
+     * the ELF header in guest_bootstrap_prepare; the access() probe in
+     * rosetta_prepare surfaces an install hint if Rosetta is not present.
+     */
+    bool rosetta_enabled = true;
     int timeout_sec = 10, fork_child_fd = -1, vfork_notify_fd = -1;
     const char *sysroot = NULL;
     const char *create_sysroot = NULL;
     int gdb_port = 0;
     bool gdb_stop_on_entry = false;
     int arg_start = 1;
+
+    /* 'elfuse rosettad translate <in> <out>' runs the real Apple rosettad
+     * binary inside an elfuse guest to materialise an AOT translation. The
+     * rosettad bridge in src/core/rosetta.c invokes this on cache miss; the
+     * subcommand rewrites argv so the rest of main proceeds as a normal
+     * aarch64-linux execution of rosettad with the requested arguments.
+     */
+    if (argc >= 5 && !strcmp(argv[1], "rosettad") &&
+        !strcmp(argv[2], "translate")) {
+        static char *rewritten[6];
+        rewritten[0] = argv[0];
+        rewritten[1] = (char *) ROSETTAD_TRANSLATOR_PATH;
+        rewritten[2] = (char *) "translate";
+        rewritten[3] = argv[3];
+        rewritten[4] = argv[4];
+        rewritten[5] = NULL;
+        argv = rewritten;
+        argc = 5;
+    }
 
     /* --help and --version do not require an ELF path. */
     if (argc > 1) {
@@ -137,6 +202,7 @@ int main(int argc, char **argv)
             printf(
                 "usage: elfuse [--verbose] [--timeout N] [--sysroot PATH]\n"
                 "              [--create-sysroot PATH]\n"
+                "              [--no-rosetta]\n"
                 "              [--gdb PORT] [--gdb-stop-on-entry]\n"
                 "              <elf-path> [args...]\n"
                 "\n"
@@ -150,6 +216,9 @@ int main(int argc, char **argv)
                 "PATH first\n"
                 "  --create-sysroot PATH   Provision and use a case-sensitive "
                 "APFS sparsebundle mounted at PATH\n"
+                "  --no-rosetta            Disable x86_64-via-Rosetta "
+                "(architecture is auto-detected from the ELF header; "
+                "on by default)\n"
                 "  --gdb PORT              Listen for GDB Remote Serial "
                 "Protocol on PORT\n"
                 "  --gdb-stop-on-entry     Halt before the first guest "
@@ -199,6 +268,9 @@ int main(int argc, char **argv)
                    arg_start + 1 < argc) {
             create_sysroot = argv[arg_start + 1];
             arg_start += 2;
+        } else if (!strcmp(argv[arg_start], "--no-rosetta")) {
+            rosetta_enabled = false;
+            arg_start++;
         } else if (!strcmp(argv[arg_start], "--gdb") && arg_start + 1 < argc) {
             if (parse_int_arg(argv[arg_start + 1], 1, 65535, &gdb_port) < 0) {
                 log_error("invalid GDB port: %s", argv[arg_start + 1]);
@@ -217,7 +289,8 @@ int main(int argc, char **argv)
             log_error("unknown option: %s", argv[arg_start]);
             log_error(
                 "usage: elfuse [--verbose] [--timeout N] "
-                "[--sysroot PATH] [--create-sysroot PATH] [--gdb PORT] "
+                "[--sysroot PATH] [--create-sysroot PATH] [--no-rosetta] "
+                "[--gdb PORT] "
                 "[--gdb-stop-on-entry] <elf-path> [args...]");
             return 1;
         }
@@ -229,6 +302,19 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    /* ELFUSE_NO_ROSETTA=1 mirrors --no-rosetta for environments where
+     * passing flags is awkward (test harnesses, wrapper scripts). Unset or
+     * any other value leaves the default on. Commit the result before the
+     * --fork-child early-return so helper processes inherit the parent's
+     * opt-out semantics exactly.
+     */
+    if (rosetta_enabled) {
+        const char *no_rosetta_env = getenv("ELFUSE_NO_ROSETTA");
+        if (no_rosetta_env && strcmp(no_rosetta_env, "1") == 0)
+            rosetta_enabled = false;
+    }
+    proc_set_rosetta_enabled(rosetta_enabled);
+
     /* Fork-child mode: receive VM state over IPC and run */
     if (fork_child_fd >= 0)
         return fork_child_main(fork_child_fd, vfork_notify_fd, verbose,
@@ -237,7 +323,8 @@ int main(int argc, char **argv)
     if (arg_start >= argc) {
         log_error(
             "usage: elfuse [--verbose] [--timeout N] "
-            "[--sysroot PATH] [--create-sysroot PATH] <elf-path> [args...]");
+            "[--sysroot PATH] [--create-sysroot PATH] [--no-rosetta] "
+            "<elf-path> [args...]");
         return 1;
     }
 
@@ -271,6 +358,8 @@ int main(int argc, char **argv)
     bool guest_initialized = false;
     sysroot_mount_t sysroot_mount;
     char host_cwd[LINUX_PATH_MAX];
+    char elf_host_path[LINUX_PATH_MAX];
+    bool elf_host_temp = false;
     bool have_host_cwd = (getcwd(host_cwd, sizeof(host_cwd)) != NULL);
     memset(&sysroot_mount, 0, sizeof(sysroot_mount));
     if (!elf_path || (have_sysroot && !sysroot_path) || !guest_argv) {
@@ -320,16 +409,53 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    proc_set_sysroot(sysroot);
+    if (resolve_guest_elf_host_path(elf_path, elf_host_path,
+                                    sizeof(elf_host_path),
+                                    &elf_host_temp) < 0) {
+        log_error("failed to resolve ELF path %s: %s", elf_path,
+                  strerror(errno));
+        cleanup_main_resources(&g, guest_initialized, &sysroot_mount,
+                               have_host_cwd ? host_cwd : NULL, guest_argv,
+                               guest_argc, elf_path, sysroot_path);
+        if (elf_host_temp)
+            unlink(elf_host_path);
+        return 1;
+    }
+
+    if (gdb_port > 0) {
+        elf_info_t probe_info;
+        if (guest_bootstrap_probe_elf(elf_host_path, &probe_info) == 0 &&
+            probe_info.e_machine == EM_X86_64) {
+            log_error(
+                "--gdb is not supported for x86_64 guests; the current stub "
+                "only exposes the translated aarch64 view");
+            cleanup_main_resources(&g, guest_initialized, &sysroot_mount,
+                                   have_host_cwd ? host_cwd : NULL, guest_argv,
+                                   guest_argc, elf_path, sysroot_path);
+            if (elf_host_temp)
+                unlink(elf_host_path);
+            return 1;
+        }
+    }
+
     guest_bootstrap_t boot;
     extern char **environ;
 
-    if (guest_bootstrap_prepare(&g, elf_path, sysroot, guest_argc, guest_argv,
-                                environ, shim_bin, shim_bin_len, verbose,
+    if (guest_bootstrap_prepare(&g, elf_host_path, elf_host_temp, elf_path,
+                                sysroot, guest_argc, guest_argv, environ,
+                                shim_bin, shim_bin_len, verbose,
                                 &guest_initialized, &boot) < 0) {
         cleanup_main_resources(&g, guest_initialized, &sysroot_mount,
                                have_host_cwd ? host_cwd : NULL, guest_argv,
                                guest_argc, elf_path, sysroot_path);
+        if (elf_host_temp)
+            unlink(elf_host_path);
         return 1;
+    }
+    if (elf_host_temp && !g.is_rosetta) {
+        unlink(elf_host_path);
+        elf_host_temp = false;
     }
 
     if (have_sysroot) {
