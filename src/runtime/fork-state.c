@@ -428,7 +428,9 @@ static int fork_ipc_send_backing_fds(int ipc_sock,
 
 int fork_ipc_send_process_state(int ipc_sock,
                                 const guest_region_t *regions_snapshot,
-                                uint32_t num_guest_regions)
+                                uint32_t num_guest_regions,
+                                const guest_region_t *preannounced_snapshot,
+                                uint32_t num_preannounced)
 {
     char cwd[LINUX_PATH_MAX] = {0};
     getcwd(cwd, sizeof(cwd));
@@ -474,6 +476,14 @@ int fork_ipc_send_process_state(int ipc_sock,
     if (num_guest_regions > 0 &&
         fork_ipc_write_all(ipc_sock, regions_snapshot,
                            num_guest_regions * sizeof(guest_region_t)) < 0)
+        return -1;
+
+    if (fork_ipc_write_all(ipc_sock, &num_preannounced,
+                           sizeof(num_preannounced)) < 0)
+        return -1;
+    if (num_preannounced > 0 &&
+        fork_ipc_write_all(ipc_sock, preannounced_snapshot,
+                           num_preannounced * sizeof(guest_region_t)) < 0)
         return -1;
 
     if (fork_ipc_send_backing_fds(ipc_sock, regions_snapshot,
@@ -655,6 +665,27 @@ int fork_ipc_recv_process_state(int ipc_fd, guest_t *g, signal_state_t *sig)
         return -1;
     }
     g->nregions = (int) num_guest_regions;
+
+    uint32_t num_preannounced = 0;
+    if (fork_ipc_read_all(ipc_fd, &num_preannounced, sizeof(num_preannounced)) <
+        0) {
+        log_error("fork-child: failed to read preannounced count");
+        return -1;
+    }
+    uint32_t recv_preannounced = num_preannounced;
+    if (recv_preannounced > GUEST_MAX_PREANNOUNCED)
+        recv_preannounced = GUEST_MAX_PREANNOUNCED;
+    if (recv_preannounced > 0 &&
+        fork_ipc_read_all(ipc_fd, g->preannounced,
+                          recv_preannounced * sizeof(guest_region_t)) < 0) {
+        log_error("fork-child: failed to read preannounced regions");
+        return -1;
+    }
+    if (num_preannounced > recv_preannounced &&
+        fork_ipc_drain_bytes(ipc_fd, (num_preannounced - recv_preannounced) *
+                                         sizeof(guest_region_t)) < 0)
+        return -1;
+    g->npreannounced = (int) recv_preannounced;
 
     /* Capture parent state before clearing the inherited overlay/backing fd
      * fields. parent_had_fd lets recv_backing_fds iterate in the same order the

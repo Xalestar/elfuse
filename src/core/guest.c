@@ -535,6 +535,7 @@ void guest_destroy(guest_t *g)
         }
     }
     g->nregions = 0;
+    g->npreannounced = 0;
     /* Close the shm fd if guest memory owns one (parent with shm backing) */
     if (g->shm_fd >= 0) {
         close(g->shm_fd);
@@ -950,7 +951,7 @@ int guest_map_va_range(guest_t *g,
         if (l2[l2_idx] & PT_VALID) {
             /* Block already mapped -- caller may want guest_update_perms /
              * guest_split_block instead. Skip silently to mirror upstream's
-             * sys_mmap_high_va "reuse existing GPA" behaviour.
+             * sys_mmap_high_va "reuse existing GPA" behavior.
              */
             continue;
         }
@@ -970,7 +971,7 @@ int guest_install_kbuf_user_alias(guest_t *g)
     if (!g || !g->kbuf_gpa || !g->ttbr0) {
         log_error(
             "guest_install_kbuf_user_alias: kbuf or ttbr0 not "
-            "initialised");
+            "initialized");
         return -1;
     }
 
@@ -1785,6 +1786,38 @@ int guest_region_add_ex_owned_gpa(guest_t *g,
     return 0;
 }
 
+int guest_preannounce(guest_t *g,
+                      uint64_t start,
+                      uint64_t end,
+                      int prot,
+                      int flags,
+                      uint64_t offset,
+                      const char *name)
+{
+    if (g->npreannounced >= GUEST_MAX_PREANNOUNCED)
+        return -1;
+
+    int i = g->npreannounced;
+    while (i > 0 && g->preannounced[i - 1].start > start) {
+        g->preannounced[i] = g->preannounced[i - 1];
+        i--;
+    }
+
+    guest_region_t *r = &g->preannounced[i];
+    memset(r, 0, sizeof(*r));
+    r->start = start;
+    r->end = end;
+    r->gpa_base = start;
+    r->prot = prot;
+    r->flags = flags;
+    r->offset = offset;
+    r->backing_fd = -1;
+    if (name)
+        str_copy_trunc(r->name, name, sizeof(r->name));
+    g->npreannounced++;
+    return 0;
+}
+
 void guest_region_remove(guest_t *g, uint64_t start, uint64_t end)
 {
     int i = 0;
@@ -2027,6 +2060,7 @@ static void guest_region_clear(guest_t *g)
         }
     }
     g->nregions = 0;
+    g->npreannounced = 0;
 }
 
 /* Page table builder. */
@@ -2538,7 +2572,7 @@ static uint64_t *find_l2_entry(guest_t *g, uint64_t va)
     return &l2[l2_idx];
 }
 
-/* Split a 2MiB L2 block descriptor into 512 × 4KiB L3 page descriptors.
+/* Split a 2MiB L2 block descriptor into 512 x 4KiB L3 page descriptors.
  * The caller provides the L2 entry via find_l2_entry.
  * Extracts the output IPA from the existing descriptor.
  */

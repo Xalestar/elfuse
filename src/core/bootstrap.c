@@ -288,7 +288,7 @@ static bool build_boot_regions(mem_region_t *regions,
      * guest memory; rosetta itself reads the target via fd 3 once it is
      * running. Adding those segments to the page-table builder would emit
      * ghost L2/L3 entries at the binary's x86_64 link address (typically
-     * 0x400000) pointing into uninitialised primary-buffer GPAs. The
+     * 0x400000) pointing into uninitialized primary-buffer GPAs. The
      * rosetta image's own segments are registered by rosetta_prepare's
      * separate region append in the bootstrap caller.
      */
@@ -704,7 +704,6 @@ int guest_bootstrap_rosetta_post_reset(guest_t *g,
     mem_region_t regions[MAX_BOOT_REGIONS];
     int nregions = 0;
     rosetta_result_t rr;
-
     if (rosetta_prepare(g, elf_host_path, regions, &nregions, MAX_BOOT_REGIONS,
                         verbose, &rr) < 0) {
         log_error("rosetta_prepare failed during exec re-bootstrap");
@@ -712,7 +711,7 @@ int guest_bootstrap_rosetta_post_reset(guest_t *g,
     }
 
     /* build_boot_regions skips ELF segments when g->is_rosetta is set, so a
-     * zero-initialised guest_bootstrap_t is enough to drive it here.
+     * zero-initialized guest_bootstrap_t is enough to drive it here.
      */
     guest_bootstrap_t boot_stub;
     memset(&boot_stub, 0, sizeof(boot_stub));
@@ -729,9 +728,9 @@ int guest_bootstrap_rosetta_post_reset(guest_t *g,
     }
     g->ttbr0 = ttbr0;
 
-    /* Re-publish /proc/self/maps style metadata. Mirrors the bootstrap path
-     * so the post-exec view reports rosetta-as-anonymous-mapping plus the
-     * heap, stack, stack-guard, shim, and shim-data.
+    /* Re-publish /proc/self/maps style metadata. Mirrors the bootstrap path so
+     * the post-exec view reports rosetta-as-anonymous-mapping plus the heap,
+     * stack, stack-guard, shim, and shim-data.
      */
     register_elf_segment_regions(g, &rr.rosetta_info, 0,
                                  g->rosetta_guest_base - g->rosetta_va_base,

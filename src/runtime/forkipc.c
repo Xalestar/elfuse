@@ -1226,6 +1226,7 @@ int64_t sys_clone(hv_vcpu_t vcpu,
 
     mmap_fork_anon_shared_txn_t *anon_shared_txn = NULL;
     guest_region_t *regions_snapshot = NULL;
+    guest_region_t preannounced_snapshot[GUEST_MAX_PREANNOUNCED];
 
     /* Convert MAP_SHARED|MAP_ANONYMOUS regions that have no backing fd
      * into memfd-backed overlay regions. The conversion seeds a private
@@ -1402,6 +1403,11 @@ int64_t sys_clone(hv_vcpu_t vcpu,
         }
         memcpy(regions_snapshot, g->regions, snap_sz);
     }
+    int npreannounced_snapshot = g->npreannounced;
+    if (npreannounced_snapshot > 0) {
+        memcpy(preannounced_snapshot, g->preannounced,
+               (size_t) npreannounced_snapshot * sizeof(guest_region_t));
+    }
 
     if (fork_ipc_send_fd_table(ipc_sock) < 0) {
         log_error("clone: failed to send fd table");
@@ -1409,8 +1415,10 @@ int64_t sys_clone(hv_vcpu_t vcpu,
     }
 
     uint32_t num_guest_regions = (uint32_t) nregions_snapshot;
+    uint32_t num_preannounced = (uint32_t) npreannounced_snapshot;
     if (fork_ipc_send_process_state(ipc_sock, regions_snapshot,
-                                    num_guest_regions) < 0) {
+                                    num_guest_regions, preannounced_snapshot,
+                                    num_preannounced) < 0) {
         log_error("clone: failed to send process state");
         goto fail_snapshot;
     }

@@ -170,13 +170,9 @@ void crash_report(hv_vcpu_t vcpu,
     fprintf(stderr, "\n");
 
     if (vcpu) {
-        fprintf(stderr, "## Registers\n");
-
         uint64_t pc = 0, cpsr = 0;
         hv_vcpu_get_reg(vcpu, HV_REG_PC, &pc);
         hv_vcpu_get_reg(vcpu, HV_REG_CPSR, &cpsr);
-        fprintf(stderr, "PC   = 0x%016llx  CPSR = 0x%016llx\n",
-                (unsigned long long) pc, (unsigned long long) cpsr);
 
         uint64_t esr = 0, far_reg = 0, elr = 0, spsr = 0, sctlr = 0, sp_el0 = 0,
                  tpidr = 0;
@@ -187,6 +183,24 @@ void crash_report(hv_vcpu_t vcpu,
         hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_SCTLR_EL1, &sctlr);
         hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_SP_EL0, &sp_el0);
         hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_TPIDR_EL0, &tpidr);
+
+        /* The Rosetta breadcrumb has its own section header so
+         * downstream parsers can keep treating "## Registers" as the
+         * first line of the register section. Emitting the banner
+         * inline above that header used to break that assumption.
+         */
+        if ((g && g->is_rosetta) || proc_rosetta_active()) {
+            fprintf(stderr, "## Rosetta\n");
+            fprintf(stderr,
+                    "via Apple Rosetta: aarch64 PC=0x%016llx "
+                    "ELR=0x%016llx TPIDR_EL0=0x%016llx\n\n",
+                    (unsigned long long) pc, (unsigned long long) elr,
+                    (unsigned long long) tpidr);
+        }
+
+        fprintf(stderr, "## Registers\n");
+        fprintf(stderr, "PC   = 0x%016llx  CPSR = 0x%016llx\n",
+                (unsigned long long) pc, (unsigned long long) cpsr);
 
         fprintf(stderr, "ESR  = 0x%016llx  EC=0x%02x (%s)\n",
                 (unsigned long long) esr, (unsigned) ((esr >> 26) & 0x3f),

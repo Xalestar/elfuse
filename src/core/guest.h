@@ -161,6 +161,13 @@ typedef struct {
  */
 #define GUEST_MAX_REGIONS 4096
 
+/* Preannounced regions appear only in /proc/self/maps and are NOT consulted by
+ * mmap / mprotect / munmap conflict checks. Used for runtimes such as Rosetta
+ * that snapshot a code map from /proc/self/maps before they reserve or remap
+ * their own address ranges via MAP_FIXED_NOREPLACE.
+ */
+#define GUEST_MAX_PREANNOUNCED 16
+
 /* HVF stage-2 mapping segment. The slab is mapped to HVF in pieces so that
  * file-backed MAP_SHARED regions can have real host-VA overlays applied via
  * mmap MAP_FIXED|MAP_SHARED of a file fd. HVF requires hv_vm_unmap to target
@@ -392,6 +399,8 @@ typedef struct {
     /* Semantic region tracking for munmap/mprotect/proc-self-maps */
     guest_region_t regions[GUEST_MAX_REGIONS];
     int nregions; /* Number of active regions */
+    guest_region_t preannounced[GUEST_MAX_PREANNOUNCED];
+    int npreannounced; /* /proc/self/maps-only shadow regions */
 
     /* HVF stage-2 segment list: the union of segments[0..n_segments) covers the
      * live IPA range that is currently hv_vm_map'd to HVF. Sorted by ipa.
@@ -955,6 +964,18 @@ int guest_region_add_ex_owned_gpa(guest_t *g,
                                   uint64_t offset,
                                   const char *name,
                                   int owned_backing_fd);
+
+/* Add a preannounced region that appears in /proc/self/maps only.
+ * These entries are kept separate from regions[] so they do not cause
+ * -EEXIST on guest MAP_FIXED_NOREPLACE reservations.
+ */
+int guest_preannounce(guest_t *g,
+                      uint64_t start,
+                      uint64_t end,
+                      int prot,
+                      int flags,
+                      uint64_t offset,
+                      const char *name);
 
 /* Remove all region coverage in [start, end). Regions fully contained are
  * deleted; partially overlapping regions are trimmed or split.

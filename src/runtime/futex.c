@@ -73,8 +73,8 @@ static _Atomic int futex_interrupt_requested = 0;
 #define FUTEX_WAKE_BITSET 10
 
 /* Strips the FUTEX_PRIVATE_FLAG (0x80) and FUTEX_CLOCK_REALTIME bits so the
- * dispatch switch sees only the base operation. Emulation does not
- * differentiate private vs shared futexes (single-process guest).
+ * dispatch switch sees only the base operation. Emulation doesn't differentiate
+ * private vs shared futexes (single-process guest).
  */
 #define FUTEX_CMD_MASK 0x7F
 
@@ -97,14 +97,16 @@ static _Atomic int futex_interrupt_requested = 0;
  *
  * os_sync_available is set in futex_init() when the runtime supports the
  * os_sync_wait_on_address family (macOS 14.4+). Plain FUTEX_WAIT remains on
- * the bucket path until Darwin can preserve Linux's -EAGAIN race semantics,
- * so os_sync_wait_enabled stays false for now and the wake-side helper stays
+ * the bucket path until Darwin can preserve Linux's -EAGAIN race semantics, so
+ * os_sync_wait_enabled stays false for now and the wake-side helper stays
  * dormant too.
  *
  * The wait quantum is capped at 100 ms so proc_exit_group_requested() and
  * futex_interrupt_pending() get noticed promptly without a process-wide
  * broadcast channel. The 1-second EINTR simulation that the bucket path uses
- * for shutdown-stalled multi-threaded runtimes is preserved here.
+ * for shutdown-stalled multi-threaded runtimes is preserved here, but only
+ * once more than one guest thread is active. Single-threaded guests should not
+ * see synthetic EINTR churn on indefinite waits.
  */
 #if ELFUSE_HAVE_OS_SYNC_WAIT_ON_ADDRESS
 static bool os_sync_available;
@@ -113,6 +115,11 @@ static bool os_sync_wait_enabled;
 
 #define FUTEX_OS_SYNC_POLL_CAP_NS (100ULL * 1000 * 1000)
 #define FUTEX_OS_SYNC_EINTR_SIM_MS 1000
+
+static inline bool futex_should_simulate_periodic_eintr(void)
+{
+    return !thread_is_single_active();
+}
 
 /* Hash table */
 
@@ -267,25 +274,25 @@ static int futex_make_deadline(guest_t *g,
 }
 
 /* Compute the relative wait quantum until an absolute CLOCK_REALTIME deadline,
- * capped at cap_ns. Operates on (sec, nsec) pairs to avoid overflowing
- * int64_t when delta_sec * NSEC_PER_SEC could exceed INT64_MAX:
- * linux_timespec_is_valid() accepts tv_sec up to FUTEX_TIMESPEC_SEC_MAX
- * (== INT64_MAX/4), and the absolute-deadline path forwards that value
- * unchanged into the host timespec. Multiplying tv_sec * 1e9 first would
- * overflow signed arithmetic for adversarial guest inputs.
+ * capped at cap_ns. Operates on (sec, nsec) pairs to avoid overflowing int64_t
+ * when delta_sec * NSEC_PER_SEC could exceed INT64_MAX: linux_timespec_is_valid
+ * accepts tv_sec up to FUTEX_TIMESPEC_SEC_MAX (== INT64_MAX/4), and the
+ * absolute-deadline path forwards that value unchanged into the host timespec.
+ * Multiplying tv_sec * 1e9 first would overflow signed arithmetic for
+ * adversarial guest inputs.
  *
- * Borrow-normalize the (delta_sec, delta_nsec) pair before comparing so a
- * caller who hits delta_sec == 1 with delta_nsec < 0 (e.g., deadline tv_nsec
- * just past now tv_nsec when now is near a second boundary) does not get
- * billed the full cap when only a few nanoseconds remain. After the borrow
- * delta_nsec lives in [0, NSEC_PER_SEC); a single borrow always suffices
- * because both inputs are normalized.
+ * Borrow-normalize the (delta_sec, delta_nsec) pair before comparing so caller
+ * who hits delta_sec == 1 with delta_nsec < 0 (e.g., deadline tv_nsec just past
+ * now tv_nsec when now is near a second boundary) does not get billed the full
+ * cap when only a few nanoseconds remain. After the borrow delta_nsec lives in
+ * [0, NSEC_PER_SEC); a single borrow always suffices because both inputs are
+ * normalized.
  *
- * Once delta_sec >= 1 (post-borrow) the cap (~100 ms) dominates regardless
- * of delta_nsec, so the function returns cap_ns. delta_sec == 0 falls
- * through to min(delta_nsec, cap_ns). delta_sec < 0 (or delta_sec == 0 and
- * delta_nsec == 0) means the deadline has elapsed; return 0 so the caller
- * surfaces ETIMEDOUT without re-arming.
+ * Once delta_sec >= 1 (post-borrow) the cap (~100 ms) dominates regardless of
+ * delta_nsec, so the function returns cap_ns. delta_sec == 0 falls through to
+ * min(delta_nsec, cap_ns). delta_sec < 0 (or delta_sec == 0 and delta_nsec ==
+ * 0) means the deadline has elapsed; return 0 so the caller surfaces ETIMEDOUT
+ * without re-arming.
  */
 static uint64_t futex_remaining_ns(const struct timespec *deadline,
                                    uint64_t cap_ns)
@@ -386,7 +393,9 @@ static int64_t futex_os_sync_wait(guest_t *g,
         return -LINUX_EAGAIN;
 
     struct timeval wait_start;
-    if (!has_timeout)
+    bool simulate_periodic_eintr =
+        !has_timeout && futex_should_simulate_periodic_eintr();
+    if (simulate_periodic_eintr)
         gettimeofday(&wait_start, NULL);
 
     /* Bound consecutive EFAULT retries. Apple documents EFAULT as transient
@@ -430,7 +439,7 @@ static int64_t futex_os_sync_wait(guest_t *g,
         if (proc_exit_group_requested() || futex_interrupt_pending())
             return -LINUX_EINTR;
 
-        if (!has_timeout) {
+        if (simulate_periodic_eintr) {
             struct timeval now;
             gettimeofday(&now, NULL);
             long elapsed_ms = (now.tv_sec - wait_start.tv_sec) * 1000 +
@@ -530,7 +539,9 @@ static int64_t futex_wait(guest_t *g,
      * condition and retrying.
      */
     struct timeval wait_start;
-    if (!has_timeout)
+    bool simulate_periodic_eintr =
+        !has_timeout && futex_should_simulate_periodic_eintr();
+    if (simulate_periodic_eintr)
         gettimeofday(&wait_start, NULL);
 
     while (!__atomic_load_n(&waiter.woken, __ATOMIC_ACQUIRE)) {
@@ -555,18 +566,20 @@ static int64_t futex_wait(guest_t *g,
                 break;
             }
 
-            /* Simulate periodic signal delivery: return -EINTR after 1 second
-             * of blocking. This prevents deadlocks in multi-threaded runtimes
-             * that rely on signal-interrupted futex_wait for scheduler context
-             * switching.
+            /* Simulate periodic signal delivery only for multi-threaded
+             * guests. Single-threaded glibc startup paths can legitimately
+             * park in FUTEX_WAIT forever until a real wake arrives, and
+             * synthetic EINTR here breaks that contract.
              */
-            struct timeval now;
-            gettimeofday(&now, NULL);
-            long elapsed_ms = (now.tv_sec - wait_start.tv_sec) * 1000 +
-                              (now.tv_usec - wait_start.tv_usec) / 1000;
-            if (elapsed_ms >= 1000) {
-                ret = -LINUX_EINTR;
-                break;
+            if (simulate_periodic_eintr) {
+                struct timeval now;
+                gettimeofday(&now, NULL);
+                long elapsed_ms = (now.tv_sec - wait_start.tv_sec) * 1000 +
+                                  (now.tv_usec - wait_start.tv_usec) / 1000;
+                if (elapsed_ms >= FUTEX_OS_SYNC_EINTR_SIM_MS) {
+                    ret = -LINUX_EINTR;
+                    break;
+                }
             }
         }
     }

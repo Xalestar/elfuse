@@ -79,6 +79,64 @@ static char proc_tmpdir[128];
 static bool proc_tmpdir_ok;
 static pthread_mutex_t proc_tmpdir_lock = PTHREAD_MUTEX_INITIALIZER;
 
+typedef struct {
+    uint64_t start, end;
+    int prot, flags;
+    uint64_t offset;
+    char name[64];
+} maps_entry_t;
+
+static void maps_entry_insert(maps_entry_t *entries,
+                              int *nentries,
+                              uint64_t start,
+                              uint64_t end,
+                              int prot,
+                              int flags,
+                              uint64_t offset,
+                              const char *name)
+{
+    if (*nentries >= MAPS_ENTRY_MAX || end <= start)
+        return;
+
+    int i = *nentries;
+    while (i > 0 && entries[i - 1].start > start) {
+        entries[i] = entries[i - 1];
+        i--;
+    }
+
+    maps_entry_t *e = &entries[i];
+    e->start = start;
+    e->end = end;
+    e->prot = prot;
+    e->flags = flags;
+    e->offset = offset;
+    if (name && name[0])
+        str_copy_trunc(e->name, name, sizeof(e->name));
+    else
+        e->name[0] = '\0';
+    (*nentries)++;
+}
+
+static void maps_entries_merge_adjacent(maps_entry_t *entries, int *nentries)
+{
+    if (*nentries <= 1)
+        return;
+
+    int out = 0;
+    for (int i = 1; i < *nentries; i++) {
+        if (entries[i].start == entries[out].end &&
+            entries[i].prot == entries[out].prot &&
+            entries[i].flags == entries[out].flags &&
+            entries[i].offset == entries[out].offset &&
+            strcmp(entries[i].name, entries[out].name) == 0) {
+            entries[out].end = entries[i].end;
+            continue;
+        }
+        entries[++out] = entries[i];
+    }
+    *nentries = out + 1;
+}
+
 /* Synthetic /sys/devices/system/cpu directory backing store. Populated lazily
  * on first access (Java GC, Go runtime, libnuma probe these to size thread
  * pools). Layout matches the minimal subset Linux exposes:
@@ -1793,48 +1851,57 @@ int proc_intercept_open(const guest_t *g,
         int off = 0;
 
         /* Build a flat array of (va_start, va_end, prot, flags, offset, name)
-         * from regions[] with merging.
+         * from regions[] plus /proc/self/maps-only preannounced[] entries.
+         * preannounced[] is intentionally NOT consulted by mmap conflict
+         * detection, so advertise-only Rosetta/JIT regions do not trip
+         * MAP_FIXED_NOREPLACE with -EEXIST.
          */
-        typedef struct {
-            uint64_t start, end;
-            int prot, flags;
-            uint64_t offset;
-            char name[64];
-        } maps_entry_t;
         maps_entry_t entries[MAPS_ENTRY_MAX];
         int nentries = 0;
 
-        /* Convert regions[] to maps entries (identity-mapped) */
-        for (int i = 0; i < g->nregions && nentries < MAPS_ENTRY_MAX - 1; i++) {
+        /* Convert regions[] to maps entries. regions[] is already sorted by
+         * start address; merge contiguous runs that came from one mmap.
+         */
+        for (int i = 0; i < g->nregions && nentries < MAPS_ENTRY_MAX; i++) {
             const guest_region_t *r = &g->regions[i];
             uint64_t start = r->start & ~0xFFFULL;
             uint64_t end = (r->end + 0xFFF) & ~0xFFFULL;
 
-            /* Try to merge with previous entry if contiguous and same
-             * prot/flags/name. This collapses many 2 MiB blocks into a single
-             * maps line, matching real Linux kernel behavior.
-             */
-            if (nentries > 0) {
-                maps_entry_t *prev = &entries[nentries - 1];
-                if (start == prev->end && r->prot == prev->prot &&
-                    r->flags == prev->flags && !strcmp(r->name, prev->name)) {
-                    prev->end = end;
-                    continue;
+            if (nentries > 0 && entries[nentries - 1].end == start &&
+                entries[nentries - 1].prot == r->prot &&
+                entries[nentries - 1].flags == r->flags &&
+                entries[nentries - 1].offset == r->offset &&
+                !strcmp(entries[nentries - 1].name, r->name)) {
+                entries[nentries - 1].end = end;
+                continue;
+            }
+            maps_entry_insert(entries, &nentries, start, end, r->prot, r->flags,
+                              r->offset, r->name);
+        }
+
+        /* Add preannounced entries only when no live semantic region already
+         * covers that interval. This keeps /proc/self/maps honest once the
+         * runtime really has installed the range.
+         */
+        for (int i = 0; i < g->npreannounced && nentries < MAPS_ENTRY_MAX;
+             i++) {
+            const guest_region_t *r = &g->preannounced[i];
+            bool shadowed = false;
+            for (int j = 0; j < g->nregions; j++) {
+                if (g->regions[j].start < r->end &&
+                    g->regions[j].end > r->start) {
+                    shadowed = true;
+                    break;
                 }
             }
+            if (shadowed)
+                continue;
 
-            maps_entry_t *e = &entries[nentries++];
-            e->start = start;
-            e->end = end;
-            e->prot = r->prot;
-            e->flags = r->flags;
-            e->offset = r->offset;
-            if (r->name[0]) {
-                str_copy_trunc(e->name, r->name, sizeof(e->name));
-            } else {
-                e->name[0] = '\0';
-            }
+            maps_entry_insert(entries, &nentries, r->start & ~0xFFFULL,
+                              (r->end + 0xFFFULL) & ~0xFFFULL, r->prot,
+                              r->flags, r->offset, r->name);
         }
+        maps_entries_merge_adjacent(entries, &nentries);
 
         /* Emit lines after merging so buffer accounting is centralized. */
         for (int i = 0; i < nentries && off < (int) sizeof(buf) - 256; i++) {
@@ -2185,7 +2252,7 @@ int proc_intercept_open(const guest_t *g,
                 (uint64_t) vm_stat.inactive_count * page_size / 1024;
             uint64_t purgeable_kb =
                 (uint64_t) vm_stat.purgeable_count * page_size / 1024;
-            /* Available ≈ free + inactive + purgeable (Linux heuristic) */
+            /* Available ~= free + inactive + purgeable (Linux heuristic) */
             avail_kb = free_kb + inactive_kb + purgeable_kb;
             if (avail_kb > total_kb)
                 avail_kb = total_kb;

@@ -98,5 +98,7 @@ int fork_ipc_recv_fd_table(int ipc_fd, guest_t *g);
 
 int fork_ipc_send_process_state(int ipc_sock,
                                 const guest_region_t *regions_snapshot,
-                                uint32_t num_guest_regions);
+                                uint32_t num_guest_regions,
+                                const guest_region_t *preannounced_snapshot,
+                                uint32_t num_preannounced);
 int fork_ipc_recv_process_state(int ipc_fd, guest_t *g, signal_state_t *sig);
