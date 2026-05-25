@@ -932,6 +932,13 @@ int64_t sys_waitid(guest_t *g,
 
 /* vCPU run loop. */
 
+static _Thread_local bool hvc6_yield_requested;
+
+void proc_request_hvc6_yield(void)
+{
+    hvc6_yield_requested = true;
+}
+
 /* Global vCPU handle for the SIGALRM handler (unavoidable global state --
  * signal handlers cannot receive context parameters).
  */
@@ -1787,9 +1794,14 @@ int vcpu_run_loop(hv_vcpu_t vcpu,
                         uint64_t args[8] = {0};
                         for (int i = 0; i < 8; i++)
                             hv_vcpu_get_reg(vcpu, HV_REG_X0 + i, &args[i]);
+                        hvc6_yield_requested = false;
                         uint64_t result =
                             g->hvc6_handler(x8, args, g->hvc6_userdata);
                         hv_vcpu_set_reg(vcpu, HV_REG_X0, result);
+                        if (hvc6_yield_requested) {
+                            hvc6_yield_requested = false;
+                            running = false;
+                        }
                     }
                     /* PC already advanced by HVC instruction */
                     break;

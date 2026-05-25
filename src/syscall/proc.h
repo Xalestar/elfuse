@@ -347,6 +347,12 @@ int proc_exit_group_requested(void);
 
 /* vCPU run loop. */
 
+/* Request that the current host thread's HVC #6 run loop returns after the
+ * active handler completes. Safe for concurrent HVC #6 handlers because the
+ * request is thread-local and consumed only by the current vcpu_run_loop().
+ */
+void proc_request_hvc6_yield(void);
+
 /* Run the vCPU execution loop. Returns the exit code.
  *
  * When timeout_sec > 0 (main thread): uses alarm() for per-iteration
