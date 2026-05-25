@@ -71,7 +71,7 @@ The build signs `build/elfuse` before use. Override the signing identity with
   `--sysroot`, and attaching `gdb` / `lldb` to the built-in stub.
 - [docs/testing.md](docs/testing.md): build prerequisites, the `make check`
   flow, the QEMU cross-check matrix, and fixture handling.
-- [docs/internals.md](docs/internals.md): canonical technical reference —
+- [docs/internals.md](docs/internals.md): canonical technical reference --
   HVF constraints, EL1 shim and HVC protocol, page-table splitting, syscall
   translation tables, threads/futex, fork/clone IPC, signals, ptrace, and
   the GDB stub.
@@ -109,7 +109,7 @@ Boundaries to be aware of:
   virtualization. `/proc`, `/dev`, and mount data are compatibility views.
 - HVF allows one VM per host process, so Linux-style `fork` is implemented
   via `posix_spawn` plus state transfer (a fast CoW path is used when
-  available — see [docs/internals.md](docs/internals.md)).
+  available -- see [docs/internals.md](docs/internals.md)).
 - `MAP_SHARED` is treated as `MAP_PRIVATE`; this matches single-process
   guest semantics and unblocks tools that expect file-backed mappings.
 - Unsupported syscalls return Linux-style errors rather than silently

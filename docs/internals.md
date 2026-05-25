@@ -82,7 +82,7 @@ Apple HVF imposes a handful of constraints that shape the rest of the design:
 - System registers cannot be set via `MSR` from the guest because
   `HCR_EL2.TSC=1` traps all `MSR` writes. Boot-time sysreg installation
   (RES1 bits, MMU enable, TTBR0, etc.) goes through HVC #4 from the EL1
-  shim. Runtime EL0 sysreg traps — `MSR TPIDR_EL0` and similar — are
+  shim. Runtime EL0 sysreg traps -- `MSR TPIDR_EL0` and similar -- are
   handled by the HVC #12 system-instruction trap path.
 - Only `HV_SYS_REG_*` constants from Hypervisor.framework may be used for
   register IDs.
@@ -116,9 +116,9 @@ interp_base  - varies:        Dynamic linker (g->interp_base, --sysroot only)
 The guest size is determined by the VM's configured IPA width (capped at
 40-bit / 1 TiB):
 
-- 36-bit IPA (64 GiB) — native AArch64 on Apple M2: `mmap_limit ≈ 56 GiB`,
+- 36-bit IPA (64 GiB) -- native AArch64 on Apple M2: `mmap_limit ≈ 56 GiB`,
   `interp_base ≈ 60 GiB`
-- 40-bit IPA (1 TiB) — native AArch64 on Apple M3 and later:
+- 40-bit IPA (1 TiB) -- native AArch64 on Apple M3 and later:
   `mmap_limit ≈ 1016 GiB`, `interp_base ≈ 1020 GiB`
 
 Both `mmap_limit` and `interp_base` are computed at runtime from `guest_size`
@@ -356,7 +356,7 @@ are supported per VM.
 - The classic ops: `FUTEX_WAIT`, `FUTEX_WAKE`, `FUTEX_WAIT_BITSET`,
   `FUTEX_WAKE_BITSET`, `FUTEX_REQUEUE`, `FUTEX_CMP_REQUEUE`, `FUTEX_WAKE_OP`.
 - A subset of priority-inheritance ops: `FUTEX_LOCK_PI`, `FUTEX_UNLOCK_PI`,
-  `FUTEX_TRYLOCK_PI`. Priority semantics are not actually inherited — the
+  `FUTEX_TRYLOCK_PI`. Priority semantics are not actually inherited -- the
   ops behave as ordinary mutex acquire/release, which is enough for glibc
   and musl to make forward progress.
 - `futex_waitv` (syscall 449) for batch waits across up to 128 futex
@@ -423,7 +423,7 @@ state transfer:
 When `g->shm_fd >= 0` the guest memory is file-backed (`mkstemp` + `unlink`,
 `MAP_SHARED`). Fork sends the backing fd over `SCM_RIGHTS`:
 
-- Parent stays on `MAP_SHARED` and does NOT remap — HVF caches the host
+- Parent stays on `MAP_SHARED` and does NOT remap -- HVF caches the host
   VA→PA mapping from `hv_vm_map`, and a `MAP_FIXED` remap does not update
   Stage-2, so a remapping parent would observe stale pages.
 - Child maps the fd `MAP_PRIVATE`, producing an instant CoW clone with zero
@@ -431,7 +431,7 @@ When `g->shm_fd >= 0` the guest memory is file-backed (`mkstemp` + `unlink`,
 - The IPC header sets `has_shm = 1` and `num_regions = 0`, skipping memory
   serialization entirely.
 - Child calls `guest_init_from_shm()` instead of `guest_init()`, and must
-  restore `g->ttbr0` from the IPC header — `guest_init_from_shm` zeroes the
+  restore `g->ttbr0` from the IPC header -- `guest_init_from_shm` zeroes the
   struct, and without `ttbr0` page-table walks fail for all high VAs.
 
 This path is roughly 50× faster than the legacy IPC copy path on large guest
@@ -496,7 +496,7 @@ Key points:
   `alarm()` for its per-iteration vCPU watchdog.
 - `signal_check_timer()` is called from the vCPU loop after each syscall.
 - After `SYSCALL_EXEC_HAPPENED`, the vCPU loop verifies that `ELR_EL1` is
-  non-zero — a defensive check against HVF register-sync bugs.
+  non-zero -- a defensive check against HVF register-sync bugs.
 - Each `thread_entry_t` carries its own `blocked` mask. `rt_sigprocmask`
   operates on `current_thread->blocked`, and child threads inherit the
   parent's mask at clone time.
@@ -511,11 +511,11 @@ which the tracer reads and writes registers through the snapshot protocol.
 
 In `src/syscall/proc.c`:
 
-- `PTRACE_SEIZE` — attach without stopping; sets `ptraced = 1`.
-- `PTRACE_CONT` — resume the stopped tracee, optionally injecting a signal.
-- `PTRACE_INTERRUPT` — force the tracee into ptrace-stop via
+- `PTRACE_SEIZE` -- attach without stopping; sets `ptraced = 1`.
+- `PTRACE_CONT` -- resume the stopped tracee, optionally injecting a signal.
+- `PTRACE_INTERRUPT` -- force the tracee into ptrace-stop via
   `hv_vcpus_exit()`.
-- `PTRACE_GETREGSET` / `PTRACE_SETREGSET` (`NT_PRSTATUS`) — read or write
+- `PTRACE_GETREGSET` / `PTRACE_SETREGSET` (`NT_PRSTATUS`) -- read or write
   the tracee's register snapshot. Writes are applied on resume.
 
 ### Snapshot Protocol
@@ -601,14 +601,14 @@ correctly. `elf_resolve_interp()` in `src/core/elf.c` is shared between
 
 `src/debug/` is split by role:
 
-- `gdbstub.c` — session lifecycle, stop/resume flow, packet dispatch
-- `gdbstub-rsp.c` — RSP packet transport and hex helpers
-- `gdbstub-reg.c` — register snapshot layout, restore flow, `target.xml`
+- `gdbstub.c` -- session lifecycle, stop/resume flow, packet dispatch
+- `gdbstub-rsp.c` -- RSP packet transport and hex helpers
+- `gdbstub-reg.c` -- register snapshot layout, restore flow, `target.xml`
 
 The stub runs in all-stop mode. Because Hypervisor.framework register access
 must happen on the owning thread, the stopped vCPU snapshots its own state;
 the GDB-handler thread reads and updates the snapshot, and the owning thread
-restores the modified state on resume — the same pattern used by ptrace.
+restores the modified state on resume -- the same pattern used by ptrace.
 
 The split mirrors the architectural boundary: transport and encoding are
 independent of guest execution; register layout is independent of socket I/O;
@@ -618,10 +618,10 @@ stop/resume sequencing remains tightly coupled to process and thread state.
 
 `elfuse` uses several layers of validation:
 
-- `make check` — fast guest tests plus the BusyBox applet smoke suite.
-- `make test-busybox` — applet coverage in isolation.
-- `make test-gdbstub` — debugger integration.
-- `make test-matrix` — cross-checks elfuse against QEMU on the same corpus.
+- `make check` -- fast guest tests plus the BusyBox applet smoke suite.
+- `make test-busybox` -- applet coverage in isolation.
+- `make test-gdbstub` -- debugger integration.
+- `make test-matrix` -- cross-checks elfuse against QEMU on the same corpus.
 
 The rule for contributors is simple: match the validation depth to the
 subsystem you changed. Procfs, process state, dynamic linking, and debugging

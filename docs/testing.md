@@ -140,12 +140,12 @@ baseline. The exact labels each sub-suite emits, and the contract
 they verify, are:
 
 - `tests/test-rosetta-cli.sh` (4): `rosetta-disabled-flag`,
-  `rosetta-disabled-env`, `rosetta-gdb`, `rosetta-default` —
+  `rosetta-disabled-env`, `rosetta-gdb`, `rosetta-default` --
   command-line gating of the translator path (opt-out flag, env
   override, `--gdb` rejection, install-hint surface).
 
 - `tests/test-rosetta-failure-modes.sh` (3): `no-rosetta-flag`,
-  `no-rosetta-env`, `gdb-x86_64` — command-line rejection paths.
+  `no-rosetta-env`, `gdb-x86_64` -- command-line rejection paths.
   Self-contained against a synthesized minimal x86_64 ELF; no
   external fixture tree required. The dynamic-linker bring-up and
   mid-process execve scenarios that used to live here are now
@@ -157,7 +157,7 @@ they verify, are:
   `printenv`, `expr-zero`, `expr-mul`, `basename`, `dirname`,
   `stat-self`, `factor`, `seq`, `sha256sum`, `md5sum`, `uname-m`, `arch`,
   `busybox-arch-subcommand`, `date-utc`, `id-u`, `nproc`,
-  `env-execve` — statically-linked Alpine busybox applets,
+  `env-execve` -- statically-linked Alpine busybox applets,
   exercising VZ ioctl gate, `/proc/self/exe` redirect, high-VA mmap,
   and the kbuf alias.
 
@@ -170,25 +170,25 @@ they verify, are:
   `pipe-awk-field`, `head-n3`, `tail-n3`, `pipe-sort-uniq`,
   `pipe-cut-field`, `pipe-rev`, `tac-reverse-first-line`, `seq-1-5`,
   `seq-step`, `factor-prime`, `factor-composite`, `diff-identical`,
-  `diff-differs`, `pipe-base64-decode` — broader file I/O, text
+  `diff-differs`, `pipe-base64-decode` -- broader file I/O, text
   processing, and host-shell pipelines stitched through Rosetta on
   every stage.
 
 - `tests/test-rosetta-audit.sh` (2): `audit-known-limitations`,
-  `tls0-known-hang` — bookkeeping probe that asserts the documented
+  `tls0-known-hang` -- bookkeeping probe that asserts the documented
   Rosetta shadowing failures (above) remain the only divergences;
   fails loudly if a new threading/signal-state edge case starts
   diverging.
 
 - `tests/test-rosetta-jit.sh` (2): `luajit-trace`,
-  `luajit-coroutine` — guest-side JIT under translation
+  `luajit-coroutine` -- guest-side JIT under translation
   (LuaJIT trace emission + coroutine allocation), covering the
   small-mprotect RW->RX and per-thread icache observation path that
   rosetta's own JIT does not exercise.
 
 - `tests/test-rosetta-glibc.sh` (7): `glibc-hello`,
   `glibc-hello-via-ldso`, `glibc-hello-list`, `glibc-dlopen`,
-  `glibc-tls`, `glibc-gdtls`, `glibc-pthread-tls` —
+  `glibc-tls`, `glibc-gdtls`, `glibc-pthread-tls` --
   dynamically-linked glibc x86_64 binary acceptance through
   `--sysroot` against the staged minimal glibc rootfs under
   `externals/test-fixtures/x86_64-glibc/rootfs/`. The first three
