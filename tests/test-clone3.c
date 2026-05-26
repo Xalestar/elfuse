@@ -658,6 +658,35 @@ static void test_partial_deferred_stack_munmap(void)
         munmap(reuse_stack, stack_size);
 }
 
+/* Test 15: legacy clone(2) rejects CLONE_NEW* namespace flags with EINVAL,
+ * matching clone3 (issue #44). Before the fix these flags fell through to a
+ * plain fork that falsely appeared to succeed. CLONE_NEWTIME is omitted: it
+ * lives in the CSIGNAL low byte and is not reachable through clone(2).
+ */
+static void test_legacy_clone_namespaces(void)
+{
+    static const struct {
+        unsigned long flag;
+        const char *name;
+    } ns_flags[] = {
+        {0x00020000, "CLONE_NEWNS"},   {0x02000000, "CLONE_NEWCGROUP"},
+        {0x04000000, "CLONE_NEWUTS"},  {0x08000000, "CLONE_NEWIPC"},
+        {0x10000000, "CLONE_NEWUSER"}, {0x20000000, "CLONE_NEWPID"},
+        {0x40000000, "CLONE_NEWNET"},
+    };
+    for (size_t i = 0; i < sizeof(ns_flags) / sizeof(ns_flags[0]); i++) {
+        /* SIGCHLD (17) in the low byte makes this a fork-like clone. */
+        long ret = raw_clone(ns_flags[i].flag | 17, NULL, NULL, 0, NULL);
+        CHECK(ret == -22 /* EINVAL */,
+              "clone(%s) returned %ld (expected -EINVAL)", ns_flags[i].name,
+              ret);
+        if (ret == 0) /* defensive: a leaked child must not run the suite */
+            raw_syscall1(__NR_exit, 0);
+        else if (ret > 0)
+            raw_syscall4(__NR_wait4, ret, 0, 0, 0);
+    }
+}
+
 int main(int argc, char **argv)
 {
     if (argc > 1 && !strcmp(argv[1], "--clone3-vfork-child"))
@@ -687,6 +716,7 @@ int main(int argc, char **argv)
     test_vfork_exec_unblocks_parent();
     test_deferred_stack_munmap();
     test_partial_deferred_stack_munmap();
+    test_legacy_clone_namespaces();
 
     SUMMARY("test-clone3");
     return fails > 0 ? 1 : 0;

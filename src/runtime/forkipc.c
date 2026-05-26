@@ -360,6 +360,23 @@ int fork_child_main(int ipc_fd,
 #define LINUX_CLONE_CHILD_SETTID 0x01000000
 /* LINUX_SIGCHLD defined in syscall_signal.h (included above) */
 
+/* Namespace flags. elfuse implements no namespace isolation. Both
+ * sys_clone and sys_clone3 reject them.
+ */
+#define LINUX_CLONE_NEWTIME 0x00000080
+#define LINUX_CLONE_NEWNS 0x00020000
+#define LINUX_CLONE_NEWCGROUP 0x02000000
+#define LINUX_CLONE_NEWUTS 0x04000000
+#define LINUX_CLONE_NEWIPC 0x08000000
+#define LINUX_CLONE_NEWUSER 0x10000000
+#define LINUX_CLONE_NEWPID 0x20000000
+#define LINUX_CLONE_NEWNET 0x40000000
+
+#define LINUX_CLONE3_NS_FLAGS                                         \
+    (LINUX_CLONE_NEWNS | LINUX_CLONE_NEWCGROUP | LINUX_CLONE_NEWUTS | \
+     LINUX_CLONE_NEWIPC | LINUX_CLONE_NEWUSER | LINUX_CLONE_NEWPID |  \
+     LINUX_CLONE_NEWNET | LINUX_CLONE_NEWTIME)
+
 /* CLONE_THREAD: create a new guest thread in the same VM. */
 
 /* Arguments passed to the worker pthread. Allocated by sys_clone_thread, freed
@@ -1069,6 +1086,14 @@ int64_t sys_clone(hv_vcpu_t vcpu,
                   uint64_t ctid_gva,
                   bool verbose)
 {
+    /* Namespaces are not implemented. CLONE_NEWTIME (0x80) lives in the CSIGNAL
+     * low byte and, like CLONE_INTO_CGROUP (bit 33) and set_tid, cannot be
+     * conveyed through clone(2) at all, so only the higher namespace bits are
+     * reachable here.
+     */
+    if ((flags & ~(uint64_t) 0xff) & LINUX_CLONE3_NS_FLAGS)
+        return -LINUX_EINVAL;
+
     /* CLONE_THREAD: create a new thread in the same VM (not a new process) */
     if (flags & LINUX_CLONE_THREAD) {
         return sys_clone_thread(vcpu, g, flags, child_stack, stack_map_start,
@@ -1507,22 +1532,9 @@ struct linux_clone_args {
 
 #define CLONE_ARGS_SIZE_VER0 64 /* v5.3: first 8 fields (flags..tls) */
 
-/* Unsupported clone3 flags: reject early rather than silently ignoring. */
+/* Unsupported clone3-only flags: reject early rather than silently ignoring. */
 #define LINUX_CLONE_PIDFD 0x00001000
 #define LINUX_CLONE_INTO_CGROUP 0x200000000ULL
-#define LINUX_CLONE_NEWNS 0x00020000
-#define LINUX_CLONE_NEWCGROUP 0x02000000
-#define LINUX_CLONE_NEWUTS 0x04000000
-#define LINUX_CLONE_NEWIPC 0x08000000
-#define LINUX_CLONE_NEWUSER 0x10000000
-#define LINUX_CLONE_NEWPID 0x20000000
-#define LINUX_CLONE_NEWNET 0x40000000
-#define LINUX_CLONE_NEWTIME 0x00000080
-
-#define LINUX_CLONE3_NS_FLAGS                                         \
-    (LINUX_CLONE_NEWNS | LINUX_CLONE_NEWCGROUP | LINUX_CLONE_NEWUTS | \
-     LINUX_CLONE_NEWIPC | LINUX_CLONE_NEWUSER | LINUX_CLONE_NEWPID |  \
-     LINUX_CLONE_NEWNET | LINUX_CLONE_NEWTIME)
 
 int64_t sys_clone3(hv_vcpu_t vcpu,
                    guest_t *g,
