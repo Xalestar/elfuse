@@ -1879,21 +1879,33 @@ int proc_intercept_open(const guest_t *g,
                               r->offset, r->name);
         }
 
-        /* Add preannounced entries only when no live semantic region already
-         * covers that interval. This keeps /proc/self/maps honest once the
-         * runtime really has installed the range.
+        /* Add preannounced entries only while they still have an uncovered
+         * tail. Once the union of live regions covers the full advertised
+         * interval, suppress the shadow entry so /proc/self/maps shows only
+         * the realized split VMAs. A partial union must stay visible because
+         * some reserved-but-not-realized span remains to advertise.
          */
         for (int i = 0; i < g->npreannounced && nentries < MAPS_ENTRY_MAX;
              i++) {
             const guest_region_t *r = &g->preannounced[i];
             bool shadowed = false;
+            uint64_t covered_end = r->start;
+
             for (int j = 0; j < g->nregions; j++) {
-                if (g->regions[j].start < r->end &&
-                    g->regions[j].end > r->start) {
+                const guest_region_t *live = &g->regions[j];
+
+                if (live->end <= covered_end)
+                    continue;
+                if (live->start > covered_end)
+                    break;
+
+                covered_end = live->end;
+                if (covered_end >= r->end) {
                     shadowed = true;
                     break;
                 }
             }
+
             if (shadowed)
                 continue;
 

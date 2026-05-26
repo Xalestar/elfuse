@@ -885,7 +885,7 @@ EXPECTED_FAIL["qemu-aarch64"]=1
 # diverge inside sys_mmap_fixed_high_va on IPA width: apple-m1-m2 is
 # 36-bit (overflow-segment path), apple-m3-plus is 40-bit (bisected
 # -slab path on M5). The seven Rosetta sub-suites currently emit fixed
-# pass counts regardless of IPA width, so both rows start at 69; an
+# pass counts regardless of IPA width, so both rows start at 71; an
 # operator with M3+ hardware updates the apple-m3-plus row in place
 # when their observed counts diverge. apple-unknown is the fallback
 # row for SoC strings the detector does not recognise yet.

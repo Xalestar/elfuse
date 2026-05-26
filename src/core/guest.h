@@ -968,6 +968,13 @@ int guest_region_add_ex_owned_gpa(guest_t *g,
 /* Add a preannounced region that appears in /proc/self/maps only.
  * These entries are kept separate from regions[] so they do not cause
  * -EEXIST on guest MAP_FIXED_NOREPLACE reservations.
+ *
+ * No producer wires this up today. The storage, fork-IPC, and
+ * /proc/self/maps consumer are kept as scaffolding for runtimes that
+ * consult /proc/self/maps before reserving VA ranges. Preannouncing
+ * the x86_64 image during Rosetta bring-up was tried and rejected: it
+ * perturbed Rosetta's internal allocation tracker. The hook stays
+ * until a workload needs an advertise-only entry.
  */
 int guest_preannounce(guest_t *g,
                       uint64_t start,

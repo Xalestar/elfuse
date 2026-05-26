@@ -221,7 +221,7 @@ different paths under different IPA widths:
 
 - `apple-m1-m2`: 36-bit native IPA, exercises the overflow-segment
   path. Captured on this codebase against Apple M1 hardware
-  (MacBookAir10,1). The seven sub-suites land at 73/0/0.
+  (MacBookAir10,1). The seven sub-suites land at 71/0/0.
 
 - `apple-m3-plus`: 40-bit native IPA, exercises the bisected-slab
   path (and the M5 slab-bisection variant). Currently held equal to
