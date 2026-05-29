@@ -1693,6 +1693,14 @@ int64_t sys_fchmodat(guest_t *g,
     return 0;
 }
 
+/* Fake success on EPERM: emulated-root guests expect chown to succeed. */
+static int64_t chown_result(int rc)
+{
+    if (rc < 0)
+        return (errno == EPERM) ? 0 : linux_errno();
+    return 0;
+}
+
 int64_t sys_fchownat(guest_t *g,
                      int dirfd,
                      uint64_t path_gva,
@@ -1719,13 +1727,10 @@ int64_t sys_fchownat(guest_t *g,
         return -LINUX_EBADF;
 
     int mac_flags = translate_at_flags(flags);
-    if (fchownat(dir_ref.fd, tx.host_path, owner, group, mac_flags) < 0) {
-        host_fd_ref_close(&dir_ref);
-        return linux_errno();
-    }
-
+    int64_t out = chown_result(
+        fchownat(dir_ref.fd, tx.host_path, owner, group, mac_flags));
     host_fd_ref_close(&dir_ref);
-    return 0;
+    return out;
 }
 
 int64_t sys_fchown(int fd, uint32_t owner, uint32_t group)
@@ -1737,12 +1742,9 @@ int64_t sys_fchown(int fd, uint32_t owner, uint32_t group)
     host_fd_ref_t host_ref;
     if (host_fd_ref_open(fd, &host_ref) < 0)
         return -LINUX_EBADF;
-    if (fchown(host_ref.fd, owner, group) < 0) {
-        host_fd_ref_close(&host_ref);
-        return linux_errno();
-    }
+    int64_t out = chown_result(fchown(host_ref.fd, owner, group));
     host_fd_ref_close(&host_ref);
-    return 0;
+    return out;
 }
 
 int64_t sys_utimensat(guest_t *g,
