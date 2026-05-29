@@ -221,6 +221,25 @@ $(BUILD_DIR)/test-lowbase-mem-300000: tests/test-lowbase-mem.c | $(BUILD_DIR)
 	$(Q)$(CROSS_COMPILE)gcc -D_GNU_SOURCE -static -O2 -no-pie \
 		-Wl,-Ttext-segment=0x300000 -o $@ $<
 
+# bench-hot-guard-glibc is the dynamic-glibc twin of bench-hot-guard.
+# Built only when the cross-glibc toolchain ships its own sysroot
+# (so a host without that toolchain can still run the rest of the
+# suite). Linked without -static so glibc resolves time / urandom
+# syscalls through the vDSO trampoline -- which is exactly what the
+# guardrail script verifies against the 50 ns / 200 ns ceilings.
+ifneq ($(wildcard $(LINUX_TOOLCHAIN)/aarch64-unknown-linux-gnu/sysroot/.),)
+# -DGUARD_USE_LIBC_CG switches the bench's clock_gettime case from a
+# direct vDSO trampoline call to the libc wrapper, so the dynamic-glibc
+# build measures glibc's actual routing decision. A regression in the
+# NT_GNU_ABI_TAG note or LINUX_2.6.39 versioning would push this
+# measurement from ~7 ns up to SVC time (~2000 ns) and fail the
+# guardrail.
+$(BUILD_DIR)/bench-hot-guard-glibc: tests/bench-hot-guard.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (dynamic glibc)"
+	$(Q)$(CROSS_COMPILE)gcc -D_GNU_SOURCE -DGUARD_USE_LIBC_CG=1 -O2 \
+		-o $@ $<
+endif
+
 endif
 
 include mk/tests.mk

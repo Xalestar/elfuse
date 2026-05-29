@@ -593,6 +593,13 @@ static void run_case(const bench_case_t *bc, unsigned long iters)
 
 int main(int argc, char **argv)
 {
+    /* Line-buffer stdout so each completed case is visible immediately
+     * when the bench is piped or redirected. Full buffering hides the
+     * progress and turns "the bench is slow" into "the bench appears
+     * stuck" until the buffer flushes at exit.
+     */
+    setvbuf(stdout, NULL, _IOLBF, 0);
+
     unsigned long iters = 1000000;
     if (argc > 1)
         iters = strtoul(argv[1], NULL, 10);
