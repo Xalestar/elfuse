@@ -458,8 +458,15 @@ int guest_init_from_shm(guest_t *g,
     g->interp_base = size - 0x100000000ULL;
     g->mmap_limit = size - 0x200000000ULL;
     g->overflow_ipa_next = size;
-    if (compute_infra_layout(g) < 0)
+    if (compute_infra_layout(g) < 0) {
+        /* Layout computation may reject a malformed header (impossible
+         * guest_size / ipa_bits combination) before the mapping is set up;
+         * close the inherited shm fd here so the caller's contract -- this
+         * function takes ownership of shm_fd -- holds on every error path.
+         */
+        close(shm_fd);
         return -1;
+    }
     g->pt_pool_next = g->pt_pool_base;
 
     /* Map the shm fd MAP_PRIVATE: copy-on-write semantics. Reads see

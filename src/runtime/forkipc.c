@@ -24,6 +24,7 @@
 #include <sys/socket.h>
 #include <dirent.h> /* fdopendir, for DIR* reconstruction in child */
 #include <sys/wait.h>
+#include <sys/clonefile.h> /* fclonefileat for CoW shm snapshots */
 #include <mach-o/dyld.h>
 
 #include "hvutil.h"
@@ -1137,6 +1138,51 @@ static void *vm_clone_thread_run(void *arg)
     return NULL;
 }
 
+/* Create an APFS block-level CoW clone of src_fd via fclonefileat (O(metadata),
+ * independent of the source once either side writes). Returns the clone fd on
+ * success, -1 with errno set on failure (non-APFS /tmp, ENOSYS, ENOSPC, ...).
+ * Callers that issue this snapshot are documented at the call site; the helper
+ * itself only owns the clone-path lifecycle.
+ */
+static int fork_snapshot_shm_via_clonefile(int src_fd)
+{
+    /* fclonefileat needs a destination path on the same APFS volume as the
+     * source. /tmp is APFS on every shipped macOS Apple Silicon configuration;
+     * if a user has remapped /tmp to a different filesystem the call fails
+     * and the caller drops back to the legacy path.
+     *
+     * The destination lives inside a fresh mkdtemp directory (mode 0700) so
+     * no other local user can race to claim the destination basename between
+     * path selection and fclonefileat: an earlier mkstemp + unlink +
+     * fclonefileat sequence left a window where /tmp was world-writable for
+     * that name and a concurrent process could DoS the fast path via EEXIST.
+     */
+    char tmpdir[] = "/tmp/elfuse-fork-XXXXXX";
+    if (mkdtemp(tmpdir) == NULL)
+        return -1;
+    char clone_path[64];
+    snprintf(clone_path, sizeof(clone_path), "%s/snap", tmpdir);
+    if (fclonefileat(src_fd, AT_FDCWD, clone_path, 0) < 0) {
+        int saved_errno = errno;
+        rmdir(tmpdir);
+        errno = saved_errno;
+        return -1;
+    }
+    int clone_fd = open(clone_path, O_RDWR | O_CLOEXEC);
+    int saved_errno = errno;
+    /* Best-effort cleanup: the clone fd alone keeps the inode alive, so any
+     * unlink/rmdir failure here is a directory-leak nuisance, not a
+     * correctness issue. Caller still gets the open fd.
+     */
+    (void) unlink(clone_path);
+    (void) rmdir(tmpdir);
+    if (clone_fd < 0) {
+        errno = saved_errno;
+        return -1;
+    }
+    return clone_fd;
+}
+
 int64_t sys_clone(hv_vcpu_t vcpu,
                   guest_t *g,
                   uint64_t flags,
@@ -1163,13 +1209,13 @@ int64_t sys_clone(hv_vcpu_t vcpu,
                                 verbose);
     }
 
-    /* Rosetta fork takes the helper-process IPC path. The CoW shm fast-path
-     * is gated off in use_shm because HVF caches VA->PA at hv_vm_map time and
-     * the parent's MAP_SHARED mapping cannot be safely remapped under the
-     * running vCPU. The TTBR1 kbuf tree, translator image, and kbuf bytes
-     * ride along as primary-buffer used regions; the child restores
-     * TCR_EL1 / TTBR1_EL1 from ipc_registers_t and recomputes kbuf_base
-     * from kbuf_gpa.
+    /* Rosetta fork takes the helper-process IPC path. The parent cannot remap
+     * its live guest memory under the running vCPU because HVF caches VA->PA at
+     * hv_vm_map time; instead, the fork path snapshots shm with clonefile when
+     * available and otherwise falls back to region copy. The TTBR1 kbuf tree,
+     * translator image, and kbuf bytes ride along as primary-buffer used
+     * regions; the child restores TCR_EL1 / TTBR1_EL1 from ipc_registers_t and
+     * recomputes kbuf_base from kbuf_gpa.
      */
 
     /* elfuse only supports fork-like clone (SIGCHLD) and posix_spawn-like
@@ -1291,10 +1337,17 @@ int64_t sys_clone(hv_vcpu_t vcpu,
         return -LINUX_ENOMEM;
     }
 
-    /* The parent keeps only its end of the control channel. */
+    /* The parent keeps only its end of the control channel. Reset the closed
+     * write end to -1 so the fail_snapshot guarded close at the bottom of the
+     * function cannot double-close it. In a multithreaded guest, another vCPU
+     * could open a new fd between the two closes and get the same number,
+     * which the second close would then steal.
+     */
     close(sock_fds[1]);
-    if (vfork_notify_fds[1] >= 0)
+    if (vfork_notify_fds[1] >= 0) {
         close(vfork_notify_fds[1]);
+        vfork_notify_fds[1] = -1;
+    }
     int ipc_sock = sock_fds[0];
 
     /* Allocate guest PID before serialization so the child header carries its
@@ -1314,6 +1367,10 @@ int64_t sys_clone(hv_vcpu_t vcpu,
     mmap_fork_anon_shared_txn_t *anon_shared_txn = NULL;
     guest_region_t *regions_snapshot = NULL;
     guest_region_t preannounced_snapshot[GUEST_MAX_PREANNOUNCED];
+    /* APFS clone fd for the CoW snapshot sent to the child. Declared up front
+     * so early goto fail_snapshot exits do not read an uninitialized local.
+     */
+    int snapshot_shm_fd = -1;
 
     /* Convert MAP_SHARED|MAP_ANONYMOUS regions that have no backing fd
      * into memfd-backed overlay regions. The conversion seeds a private
@@ -1328,31 +1385,87 @@ int64_t sys_clone(hv_vcpu_t vcpu,
     if (mmap_fork_prepare_anon_shared(g, &anon_shared_txn) < 0)
         goto fail_snapshot;
 
-    /* Determine if elfuse can use the CoW (shm) fast path.
-     * If shm_fd >= 0, elfuse freezes a snapshot via MAP_PRIVATE and sends the
-     * shm fd to the child. Otherwise fall back to region-by-region copy.
+    /* CoW fast path: if shm_fd >= 0, send a snapshot of guest memory to the
+     * child instead of the per-region copy. The child maps that snapshot
+     * MAP_PRIVATE; subsequent writes on either side are private.
      *
-     * Rosetta guests are excluded from CoW even when shm-backed: rosetta's
-     * JIT state (TLS slabs, code caches, indirect-call tables, block lists)
-     * is process-local and corrupts when CoW-shared. The legacy region-copy
-     * path preserves the parent's JIT state independently per child.
+     * The parent's own mapping cannot be flipped to MAP_PRIVATE here: hv_vm_map
+     * caches the host VA->PA mapping, and a MAP_FIXED remap invalidates it
+     * (the parent then reads stale memory and writev returns EFAULT). So the
+     * parent stays on MAP_SHARED and the snapshot is what isolates the child.
+     *
+     * Two snapshot sources, in preference order (selected just below):
+     *   1. fclonefileat of g->shm_fd to an independent APFS clone. The clone
+     *      shares blocks with the parent until either side writes, so the
+     *      parent's subsequent writes never reach the child's backing.
+     *   2. The live g->shm_fd. Any page the child has not yet COW'd reads the
+     *      parent's current bytes -- benign for typical guest state, but
+     *      corrupts Rosetta's translator-internal structures (TLS slabs, code
+     *      caches, indirect-call tables) on mid-update reads. Issue #45.
+     *
+     * Rosetta therefore requires path 1 and falls back to region copy if
+     * fclonefileat fails; native guests accept path 2 as a fallback so a
+     * non-APFS /tmp does not silently slow forks down to per-region copy cost.
      */
-    bool use_shm = (g->shm_fd >= 0) && !g->is_rosetta;
+    bool use_shm = (g->shm_fd >= 0);
 
-    /* elfuse does not remap the parent to MAP_PRIVATE here. The parent
-     * stays on MAP_SHARED; its vCPU continues writing to the shared file.
-     * The child maps MAP_PRIVATE, getting a CoW snapshot.
-     *
-     * This is safe because the IPC is synchronous: the child maps MAP_PRIVATE
-     * before the parent's vCPU resumes. After that, the child's CoW pages are
-     * frozen (child writes are private, parent writes to MAP_SHARED do not
-     * affect CoW'd child pages).
-     *
-     * an earlier implementation tried remapping the parent to MAP_PRIVATE here,
-     * but that breaks HVF: hv_vm_map caches the host VA->PA mapping, and
-     * MAP_FIXED remap invalidates it. The parent's vCPU then reads stale
-     * memory, causing corrupted syscall data (EFAULT on writev).
+    /* Overlay sync runs before the snapshot so the cloned file picks up the
+     * overlay-backed bytes. The parent's host VA for each overlay region maps
+     * the overlay file, not shm_fd, so shm_fd's contents at those offsets are
+     * stale (typically zero) until the pwrite below copies them in. Both the
+     * clone-fd path and the live-shm_fd fallback consume this sync.
      */
+    if (use_shm) {
+        for (int i = 0; i < g->nregions; i++) {
+            const guest_region_t *r = &g->regions[i];
+            if (!r->overlay_active)
+                continue;
+            uint64_t len = r->end - r->start;
+            const uint8_t *src = (const uint8_t *) g->host_base + r->start;
+            uint64_t off = r->start;
+            while (len > 0) {
+                size_t chunk = len > (uint64_t) SSIZE_MAX ? (size_t) SSIZE_MAX
+                                                          : (size_t) len;
+                ssize_t nw = pwrite(g->shm_fd, src, chunk, (off_t) off);
+                if (nw < 0) {
+                    if (errno == EINTR)
+                        continue;
+                    log_error("clone: shm overlay sync pwrite failed: %s",
+                              strerror(errno));
+                    goto fail_snapshot;
+                }
+                if (nw == 0) {
+                    log_error("clone: shm overlay sync pwrite returned 0");
+                    goto fail_snapshot;
+                }
+                src += nw;
+                off += (uint64_t) nw;
+                len -= (uint64_t) nw;
+            }
+        }
+        /* Attempt the APFS clone snapshot for every guest, not just Rosetta:
+         * the clone gives POSIX-style isolation at O(metadata) cost and avoids
+         * torn-snapshot reads in guests that snapshot their own state across
+         * fork (Redis BGSAVE, checkpointing runtimes). On failure the fallback
+         * differs per design above: Rosetta drops use_shm so the region-copy
+         * path runs; native guests keep use_shm and send the live g->shm_fd.
+         */
+        snapshot_shm_fd = fork_snapshot_shm_via_clonefile(g->shm_fd);
+        if (snapshot_shm_fd < 0) {
+            if (g->is_rosetta) {
+                log_warn(
+                    "clone: rosetta CoW snapshot via fclonefileat failed "
+                    "(%s); falling back to region-copy path",
+                    strerror(errno));
+                use_shm = false;
+            } else {
+                log_debug(
+                    "clone: CoW snapshot via fclonefileat failed (%s); "
+                    "sending live shm fd as fallback",
+                    strerror(errno));
+            }
+        }
+    }
 
     /* Snapshot of the semantic region array, populated after the memory dump
      * but before sibling vCPUs resume. Declared up front so all goto paths to
@@ -1401,46 +1514,13 @@ int64_t sys_clone(hv_vcpu_t vcpu,
         goto fail_snapshot;
     }
 
-    /* CoW path: sync MAP_SHARED file overlays back into shm_fd before
-     * sending it to the child. The parent's host VA at each overlay
-     * region maps the overlay file, not shm_fd, so shm_fd's content at
-     * those IPAs is stale (typically zero). The child's MAP_PRIVATE
-     * snapshot would expose that stale data at the overlay IPAs. Copy
-     * the live overlay bytes into shm_fd at the matching offsets so the
-     * child snapshot reflects the parent's view at fork time. Live
-     * cross-fork MAP_SHARED coherence (parent and child both seeing
-     * subsequent writes through the same file) is left to the cross-fork
-     * coherence TODO; this fix only avoids the stale-snapshot regression.
+    /* Send the snapshot fd if fclonefileat succeeded, otherwise the live
+     * g->shm_fd. The Rosetta-failure case already cleared use_shm above so it
+     * never reaches this branch with snapshot_shm_fd < 0.
      */
     if (use_shm) {
-        for (int i = 0; i < g->nregions; i++) {
-            const guest_region_t *r = &g->regions[i];
-            if (!r->overlay_active)
-                continue;
-            uint64_t len = r->end - r->start;
-            const uint8_t *src = (const uint8_t *) g->host_base + r->start;
-            uint64_t off = r->start;
-            while (len > 0) {
-                size_t chunk = len > (uint64_t) SSIZE_MAX ? (size_t) SSIZE_MAX
-                                                          : (size_t) len;
-                ssize_t nw = pwrite(g->shm_fd, src, chunk, (off_t) off);
-                if (nw < 0) {
-                    if (errno == EINTR)
-                        continue;
-                    log_error("clone: shm overlay sync pwrite failed: %s",
-                              strerror(errno));
-                    goto fail_snapshot;
-                }
-                if (nw == 0) {
-                    log_error("clone: shm overlay sync pwrite returned 0");
-                    goto fail_snapshot;
-                }
-                src += nw;
-                off += (uint64_t) nw;
-                len -= (uint64_t) nw;
-            }
-        }
-        if (fork_ipc_send_fds(ipc_sock, &g->shm_fd, 1) < 0) {
+        int fd_to_send = (snapshot_shm_fd >= 0) ? snapshot_shm_fd : g->shm_fd;
+        if (fork_ipc_send_fds(ipc_sock, &fd_to_send, 1) < 0) {
             log_error("clone: failed to send shm fd");
             goto fail_snapshot;
         }
@@ -1555,10 +1635,14 @@ int64_t sys_clone(hv_vcpu_t vcpu,
               child_host_pid);
 
     free(regions_snapshot);
+    if (snapshot_shm_fd >= 0)
+        close(snapshot_shm_fd);
     return child_guest_pid;
 
 fail_snapshot:
     free(regions_snapshot);
+    if (snapshot_shm_fd >= 0)
+        close(snapshot_shm_fd);
     /* Roll back the in-place anon-shared overlay conversion while
      * siblings are still parked. A partial rollback failure (e.g.,
      * region drift past the quiesce timeout) leaves the parent in a
@@ -1578,6 +1662,23 @@ fail_snapshot:
         close(vfork_notify_fds[0]);
     if (vfork_notify_fds[1] >= 0)
         close(vfork_notify_fds[1]);
+    /* posix_spawn at the top of sys_clone always succeeds before any goto
+     * fail_snapshot fires, so child_host_pid is a live process here. The
+     * IPC socket just closed; the child reads EOF on fork_ipc_read_all and
+     * returns nonzero from fork_child_main. Without an explicit waitpid the
+     * exited child becomes a zombie: proc_register_child only runs on the
+     * success path, so neither proc_reap_finished nor sys_wait4 will ever
+     * pick this PID up, and the guest's fork(2) already reported failure.
+     * Reap it here to keep host PIDs from accumulating across repeated
+     * failures.
+     */
+    pid_t reaped;
+    do {
+        reaped = waitpid(child_host_pid, NULL, 0);
+    } while (reaped < 0 && errno == EINTR);
+    if (reaped < 0)
+        log_warn("clone: failed to reap fork-child pid=%d: %s",
+                 (int) child_host_pid, strerror(errno));
     return -LINUX_ENOMEM;
 }
 
