@@ -45,6 +45,7 @@
 #define PT_LOAD 1
 #define PT_DYNAMIC 2
 #define PT_INTERP 3
+#define PT_NOTE 4
 
 /* Program header flags */
 #define PF_X 1

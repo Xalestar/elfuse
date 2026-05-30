@@ -35,12 +35,23 @@
  */
 uint64_t vdso_build(guest_t *g);
 
-/* If the vvar anchor has not been seeded yet, install the supplied cntvct as
- * the guest-frame anchor paired with the given monotonic and realtime
- * wall_clock values. Idempotent: subsequent calls with initialized==1 are
- * no-ops. Used by sys_clock_gettime to upgrade the first
- * __kernel_clock_gettime SVC fallback into a permanent vvar fast path that
- * serves both CLOCK_MONOTONIC and CLOCK_REALTIME.
+/* Publish a new vvar anchor under the seqlock. Handles both the initial
+ * seed (seq 0 -> 1 -> 2) and refresh (seq 2K -> 2K+1 -> 2K+2) atomically
+ * through one CAS-then-release-store sequence. Concurrent publishers
+ * either lose the CAS or observe an odd seq and bail without blocking;
+ * trampoline readers detect mid-write tearing via their own LDAR
+ * snapshot/recheck. Callers (sys_clock_gettime / sys_gettimeofday) only
+ * need to invoke this when an SVC trap from the vDSO trampoline carries a
+ * trustworthy guest CNTVCT in X9.
+ *
+ * Overflow invariant: this function, the trampoline math, and
+ * vdso_realtime_drift_exceeded all depend on VDSO_ANCHOR_AGE_SHIFT == 22
+ * capping the per-call CNTVCT delta below 2^22. That bound keeps
+ * (delta * 699050666) below 2^52 (no uint64 overflow) and keeps
+ * anchor_nsec + delta_ns below 2e9 (so the trampoline's sub-1e9 carry
+ * collapses to a single SUBS + CSEL + CINC instead of a UDIV). The
+ * host-side drift check must apply the same formula and the same cap;
+ * any divergence lets the trampoline interpolate from a stale anchor.
  */
 void vdso_seed_anchor(guest_t *g,
                       uint64_t guest_cntvct,
@@ -56,12 +67,13 @@ void vdso_seed_anchor(guest_t *g,
  * + 4, so callers compare ELR_EL1 against that.
  */
 uint64_t vdso_clock_gettime_svc_pc(void);
+uint64_t vdso_gettimeofday_svc_pc(void);
 
-/* Returns true once the vvar anchor has been published (initialized==1) and
- * the fast path can never be reseeded. Lets the post-SVC handler in
- * sys_clock_gettime skip the ELR_EL1 + X9 HVF reads it otherwise needs for
- * the seeding gate, since the second-call onward gate is moot once seeded.
- * Uses acquire ordering paired with vdso_seed_anchor's release store.
+/* Returns true when the seqlock counter is at a stable (nonzero, even)
+ * generation, i.e. the anchor is currently publishable. Uses acquire
+ * ordering paired with vdso_seed_anchor's release store of the next
+ * even generation. Callers use this to gate the age / drift checks
+ * that decide whether to publish a refresh.
  */
 bool vdso_anchor_is_seeded(guest_t *g);
 
@@ -72,3 +84,20 @@ bool vdso_anchor_is_seeded(guest_t *g);
  */
 void vdso_attention_or(guest_t *g, uint32_t bits);
 void vdso_attention_and(guest_t *g, uint32_t mask);
+
+/* True iff the anchor is currently stable AND (current_cntvct -
+ * anchor_cntvct) has exceeded the trampoline's age cap. The host uses
+ * this with a freshly-sampled CNTVCT to decide whether to publish a
+ * refresh through vdso_seed_anchor.
+ */
+bool vdso_anchor_age_exceeded(guest_t *g, uint64_t current_cntvct);
+
+/* True iff the anchor is seeded AND the wall-clock value predicted from
+ * the anchor + CNTVCT delta differs from the supplied freshly-sampled
+ * REALTIME (real_sec, real_nsec) by more than VDSO_ANCHOR_MAX_DRIFT_NS.
+ * Catches macOS NTP steps that shift wall time without bumping CNTVCT.
+ */
+bool vdso_realtime_drift_exceeded(guest_t *g,
+                                  uint64_t current_cntvct,
+                                  int64_t real_sec,
+                                  int64_t real_nsec);

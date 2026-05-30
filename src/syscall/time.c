@@ -221,6 +221,27 @@ typedef struct {
 
 /* Time/timer syscall handlers. */
 
+#define LINUX_COARSE_CLOCK_RES_NS 1000000
+
+static bool linux_clock_getres_fixed(int clockid, linux_timespec_t *ts)
+{
+    switch (clockid) {
+    case 0: /* CLOCK_REALTIME */
+    case 1: /* CLOCK_MONOTONIC */
+    case 4: /* CLOCK_MONOTONIC_RAW */
+    case 7: /* CLOCK_BOOTTIME */
+        *ts = (linux_timespec_t) {.tv_sec = 0, .tv_nsec = 1};
+        return true;
+    case 5: /* CLOCK_REALTIME_COARSE */
+    case 6: /* CLOCK_MONOTONIC_COARSE */
+        *ts = (linux_timespec_t) {.tv_sec = 0,
+                                  .tv_nsec = LINUX_COARSE_CLOCK_RES_NS};
+        return true;
+    default:
+        return false;
+    }
+}
+
 int64_t sys_clock_getres(guest_t *g, int clockid, uint64_t tp_gva)
 {
     int mac_clockid = translate_clockid(clockid);
@@ -231,9 +252,16 @@ int64_t sys_clock_getres(guest_t *g, int clockid, uint64_t tp_gva)
     if (!tp_gva)
         return 0;
 
-    struct timespec ts;
-    if (clock_getres(mac_clockid, &ts) < 0)
-        return linux_errno();
+    linux_timespec_t ts;
+    if (!linux_clock_getres_fixed(clockid, &ts)) {
+        struct timespec host_ts;
+        if (clock_getres(mac_clockid, &host_ts) < 0)
+            return linux_errno();
+        ts = (linux_timespec_t) {
+            .tv_sec = host_ts.tv_sec,
+            .tv_nsec = host_ts.tv_nsec,
+        };
+    }
 
     if (guest_write_small(g, tp_gva, &ts, sizeof(ts)) < 0)
         return -LINUX_EFAULT;
@@ -247,64 +275,46 @@ int64_t sys_clock_gettime(guest_t *g, int clockid, uint64_t tp_gva)
     if (mac_clockid < 0)
         return -LINUX_EINVAL;
 
-    /* If this trap came from the __kernel_clock_gettime vDSO svc_fallback,
-     * the trampoline parked the guest's CNTVCT_EL0 read in X9 before
-     * issuing SVC, and ELR_EL1 holds the address immediately after that
-     * SVC. Pair X9 with both the MONOTONIC and REALTIME wall_clocks and
-     * seed the vvar so subsequent calls hit the fast path for either
-     * clockid. Skip the seed for any other trap (raw
-     * syscall(SYS_clock_gettime, ...) from guest code, etc.): X9 is
-     * then arbitrary guest state, and seeding from it would poison the
-     * anchor and break every later fast-path call.
+    /* When the trap came from the __kernel_clock_gettime vDSO
+     * svc_fallback, the trampoline parked the guest's CNTVCT_EL0 read in
+     * X9 before SVC, and ELR_EL1 holds SVC_PC + 4. Use X9 to seed (or
+     * refresh) the vvar anchor so subsequent calls hit the fast path.
+     * Reject any other trap: X9 would then be arbitrary guest state and
+     * seeding from it would poison the anchor.
      *
-     * Skip the gate entirely once the anchor is published: vdso_seed_anchor
-     * is a one-shot CAS that can never fire again, so the HVF reads of
-     * ELR_EL1 and X9 below would be pure waste on every subsequent trap.
-     * Both clockid 0 (REALTIME) and clockid 1 (MONOTONIC) take the vDSO
-     * fast path, so either may be the first caller; either way both
-     * anchor pairs are seeded from a single set of host clock_gettime
-     * calls.
-     *
-     * Order matters: read X9 first, then sample both host wall clocks
-     * back-to-back, then write to guest and seed. Sampling host clocks
-     * before checking X9 would bake a permanent positive bias (~50-200 ns)
-     * into the anchor because every host call ages the X9 timestamp by
-     * the seeding gate's HVF round-trip. The back-to-back wall-clock
-     * reads minimize MONO/REAL skew within the anchor.
+     * Order matters: read X9 first, then sample host wall clocks
+     * back-to-back, then write the guest result and seed. Sampling host
+     * clocks before checking X9 would bake a permanent positive bias
+     * into the anchor from the HVF round-trip in the seeding gate.
      */
-    bool seed_eligible = (clockid == 0 /* CLOCK_REALTIME */ ||
-                          clockid == 1 /* CLOCK_MONOTONIC */) &&
-                         current_thread && !vdso_anchor_is_seeded(g);
+    bool from_trampoline = (clockid == 0 /* CLOCK_REALTIME */ ||
+                            clockid == 1 /* CLOCK_MONOTONIC */) &&
+                           current_thread;
 
     uint64_t guest_cntvct = 0;
-    if (seed_eligible) {
+    if (from_trampoline) {
         uint64_t elr = 0;
         if (hv_vcpu_get_sys_reg(current_thread->vcpu, HV_SYS_REG_ELR_EL1,
                                 &elr) != HV_SUCCESS ||
             elr != vdso_clock_gettime_svc_pc() + 4 ||
             hv_vcpu_get_reg(current_thread->vcpu, HV_REG_X9, &guest_cntvct) !=
                 HV_SUCCESS ||
-            guest_cntvct == 0) {
-            /* Trap came from a path other than the vDSO trampoline; X9 is
-             * arbitrary, fall through to the non-seeding path.
-             */
-            seed_eligible = false;
-        }
+            guest_cntvct == 0)
+            from_trampoline = false;
     }
 
     struct timespec ts;
     if (clock_gettime(mac_clockid, &ts) < 0)
         return linux_errno();
 
-    /* For the seeding path, sample the OTHER clockid back-to-back so both
-     * anchor pairs reflect roughly the same host moment. If the second
-     * clock_gettime fails (unreachable on macOS but defensive), skip
-     * seeding rather than fail the user's request: the user already has
-     * the value they asked for.
+    /* Sample the OTHER clockid back-to-back so both anchor pairs reflect
+     * roughly the same host moment. If the second clock_gettime fails
+     * (defensive; unreachable on macOS), skip seeding rather than fail
+     * the user's request.
      */
     struct timespec ts_other;
     bool can_seed = false;
-    if (seed_eligible) {
+    if (from_trampoline) {
         int other_mac = (clockid == 1) ? CLOCK_REALTIME : CLOCK_MONOTONIC;
         if (clock_gettime(other_mac, &ts_other) == 0)
             can_seed = true;
@@ -316,8 +326,17 @@ int64_t sys_clock_gettime(guest_t *g, int clockid, uint64_t tp_gva)
     if (can_seed) {
         const struct timespec *ts_mono = (clockid == 1) ? &ts : &ts_other;
         const struct timespec *ts_real = (clockid == 0) ? &ts : &ts_other;
-        vdso_seed_anchor(g, guest_cntvct, ts_mono->tv_sec, ts_mono->tv_nsec,
-                         ts_real->tv_sec, ts_real->tv_nsec);
+
+        /* Publish when the vvar is unseeded, has aged out, or has
+         * drifted relative to the freshly-sampled REALTIME (catches
+         * macOS NTP steps).
+         */
+        if (!vdso_anchor_is_seeded(g) ||
+            vdso_anchor_age_exceeded(g, guest_cntvct) ||
+            vdso_realtime_drift_exceeded(g, guest_cntvct, ts_real->tv_sec,
+                                         ts_real->tv_nsec))
+            vdso_seed_anchor(g, guest_cntvct, ts_mono->tv_sec, ts_mono->tv_nsec,
+                             ts_real->tv_sec, ts_real->tv_nsec);
     }
 
     return 0;
@@ -391,13 +410,55 @@ int64_t sys_clock_nanosleep(guest_t *g,
 
 int64_t sys_gettimeofday(guest_t *g, uint64_t tv_gva, uint64_t tz_gva)
 {
-    (void) tz_gva; /* timezone is obsolete */
+    bool from_trampoline = current_thread;
+    uint64_t guest_cntvct = 0;
+    if (from_trampoline) {
+        uint64_t elr = 0;
+        if (hv_vcpu_get_sys_reg(current_thread->vcpu, HV_SYS_REG_ELR_EL1,
+                                &elr) != HV_SUCCESS ||
+            elr != vdso_gettimeofday_svc_pc() + 4 ||
+            hv_vcpu_get_reg(current_thread->vcpu, HV_REG_X9, &guest_cntvct) !=
+                HV_SUCCESS ||
+            guest_cntvct == 0)
+            from_trampoline = false;
+    }
+
     struct timeval tv;
     if (gettimeofday(&tv, NULL) < 0)
         return linux_errno();
 
-    if (tv_gva && guest_write_small(g, tv_gva, &tv, sizeof(tv)) < 0)
+    struct timespec ts_mono;
+    struct timespec ts_real;
+    bool can_seed = false;
+    if (from_trampoline && clock_gettime(CLOCK_MONOTONIC, &ts_mono) == 0 &&
+        clock_gettime(CLOCK_REALTIME, &ts_real) == 0)
+        can_seed = true;
+
+    linux_timeval_t ltv = {
+        .tv_sec = tv.tv_sec,
+        .tv_usec = tv.tv_usec,
+    };
+    if (tv_gva && guest_write_small(g, tv_gva, &ltv, sizeof(ltv)) < 0)
         return -LINUX_EFAULT;
+
+    /* tz is obsolete on Linux but the kernel still zeroes a non-null
+     * pointer (struct timezone has two int32 fields, 8 bytes total).
+     * Matching the vDSO fast path's `str xzr, [tz]` here keeps SVC and
+     * fast-path callers observationally identical.
+     */
+    if (tz_gva) {
+        const uint64_t tz_zero = 0;
+        if (guest_write_small(g, tz_gva, &tz_zero, sizeof(tz_zero)) < 0)
+            return -LINUX_EFAULT;
+    }
+
+    if (can_seed && (!vdso_anchor_is_seeded(g) ||
+                     vdso_anchor_age_exceeded(g, guest_cntvct) ||
+                     vdso_realtime_drift_exceeded(
+                         g, guest_cntvct, ts_real.tv_sec, ts_real.tv_nsec)))
+        vdso_seed_anchor(g, guest_cntvct, ts_mono.tv_sec, ts_mono.tv_nsec,
+                         ts_real.tv_sec, ts_real.tv_nsec);
+
     return 0;
 }
 

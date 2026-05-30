@@ -51,6 +51,28 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage
 	@$(MAKE) --no-print-directory test-timeout-disable
 	@printf "\n$(BLUE)━━━ rosetta CLI gating ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-rosetta-cli
+	@printf "\n$(BLUE)━━━ hot-syscall guardrail ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-bench-guardrail
+
+## Hot-syscall performance guardrail: ensure getpid, libc clock_gettime,
+## and 1-byte /dev/urandom reads stay under their TODO ns/op ceilings.
+## Builds the dynamic-glibc variant opportunistically; the script skips
+## that arm when the cross-toolchain sysroot is missing.
+BENCH_GUARDRAIL_DEPS := $(ELFUSE_BIN)
+BENCH_GUARDRAIL_REQUIRE_STATIC := 0
+ifndef GUEST_TEST_BINARIES
+  BENCH_GUARDRAIL_DEPS += $(BUILD_DIR)/bench-hot-guard
+  BENCH_GUARDRAIL_REQUIRE_STATIC := 1
+  ifneq ($(wildcard $(LINUX_TOOLCHAIN)/aarch64-unknown-linux-gnu/sysroot/.),)
+    BENCH_GUARDRAIL_DEPS += $(BUILD_DIR)/bench-hot-guard-glibc
+  endif
+endif
+test-bench-guardrail: $(BENCH_GUARDRAIL_DEPS)
+	@ELFUSE="$(ELFUSE_BIN)" \
+	    BENCH_GUARDRAIL_DIR="$(TEST_DIR)" \
+	    BENCH_GUARDRAIL_REQUIRE_STATIC="$(BENCH_GUARDRAIL_REQUIRE_STATIC)" \
+	    LINUX_TOOLCHAIN="$(LINUX_TOOLCHAIN)" \
+	    bash tests/test-bench-guardrail.sh
 
 test-sysroot-rename: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-rename
 	@set -e; \
