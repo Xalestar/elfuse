@@ -248,6 +248,36 @@ static void test_pwritev2_append(void)
     EXPECT_TRUE(nr == 6 && !memcmp(buf, "baseXY", 6), "append data mismatch");
 }
 
+/* Test 7: zero iovcnt must not move the append file offset */
+
+static void test_pwritev2_append_zero_iovcnt(void)
+{
+    TEST("pwritev2 RWF_APPEND zero iovcnt");
+
+    const char *path = "/tmp/elfuse-test-pwritev2-append-zero.txt";
+    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        FAIL("open");
+        return;
+    }
+
+    if (write(fd, "base", 4) != 4 || lseek(fd, 1, SEEK_SET) != 1) {
+        FAIL("setup");
+        close(fd);
+        unlink(path);
+        return;
+    }
+
+    struct iovec wv = {.iov_base = (void *) "X", .iov_len = 1};
+    long ret =
+        raw_syscall6(__NR_pwritev2, fd, (long) &wv, 0, -1, 0, RWF_APPEND);
+    off_t pos = lseek(fd, 0, SEEK_CUR);
+    close(fd);
+    unlink(path);
+
+    EXPECT_TRUE(ret == -EINVAL && pos == 1, "zero iovcnt changed offset");
+}
+
 /* Main */
 
 int main(void)
@@ -260,6 +290,7 @@ int main(void)
     test_zero_length_iovec();
     test_many_iovecs();
     test_pwritev2_append();
+    test_pwritev2_append_zero_iovcnt();
 
     SUMMARY("test-readv-writev");
     return fails > 0 ? 1 : 0;

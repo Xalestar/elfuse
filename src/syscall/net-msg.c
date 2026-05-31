@@ -174,41 +174,22 @@ int64_t sys_sendmsg(guest_t *g, int fd, uint64_t msg_gva, int linux_flags)
         dest_len = (socklen_t) ml;
     }
 
-    if (lmsg.msg_iovlen > 64) {
+    /* msg_iovlen is uint64_t on Linux; bound it against SYSCALL_IOV_MAX
+     * before the int narrowing below so a 64-bit value whose low 32 bits
+     * fall inside [0, SYSCALL_IOV_MAX] cannot slip past the cap.
+     */
+    if (lmsg.msg_iovlen > SYSCALL_IOV_MAX) {
         host_fd_ref_close(&host_ref);
         return -LINUX_EINVAL;
     }
+    int send_iovcnt = (int) lmsg.msg_iovlen;
 
-    struct {
-        uint64_t iov_base, iov_len;
-    } guest_iov[64];
-
-    if (lmsg.msg_iovlen > 0) {
-        if (guest_read(g, lmsg.msg_iov, guest_iov, lmsg.msg_iovlen * 16) < 0) {
-            host_fd_ref_close(&host_ref);
-            return -LINUX_EFAULT;
-        }
-    }
-
-    struct iovec host_iov[64];
-    for (uint64_t i = 0; i < lmsg.msg_iovlen; i++) {
-        if (guest_iov[i].iov_len == 0) {
-            host_iov[i].iov_base = NULL;
-            host_iov[i].iov_len = 0;
-            continue;
-        }
-        uint64_t avail = 0;
-        void *base = guest_ptr_bound(g, guest_iov[i].iov_base, &avail,
-                                     MEM_PERM_R, guest_iov[i].iov_len);
-        if (!base) {
-            host_fd_ref_close(&host_ref);
-            return -LINUX_EFAULT;
-        }
-        uint64_t len = guest_iov[i].iov_len;
-        if (len > avail)
-            len = avail;
-        host_iov[i].iov_base = base;
-        host_iov[i].iov_len = len;
+    host_iov_buf_t host_iov;
+    int64_t iov_err = host_iov_prepare_msg(g, lmsg.msg_iov, send_iovcnt,
+                                           MEM_PERM_R, &host_iov);
+    if (iov_err < 0) {
+        host_fd_ref_close(&host_ref);
+        return iov_err;
     }
 
     uint8_t linux_ctrl_stack[512], mac_ctrl_stack[512];
@@ -223,6 +204,7 @@ int64_t sys_sendmsg(guest_t *g, int fd, uint64_t msg_gva, int linux_flags)
     if (lmsg.msg_control && lmsg.msg_controllen > 0) {
         size_t clen = lmsg.msg_controllen;
         if (clen > 65536) {
+            host_iov_free(&host_iov);
             host_fd_ref_close(&host_ref);
             return -LINUX_EINVAL;
         }
@@ -232,6 +214,7 @@ int64_t sys_sendmsg(guest_t *g, int fd, uint64_t msg_gva, int linux_flags)
             if (!linux_ctrl_heap || !mac_ctrl_heap) {
                 free(linux_ctrl_heap);
                 free(mac_ctrl_heap);
+                host_iov_free(&host_iov);
                 host_fd_ref_close(&host_ref);
                 return -LINUX_ENOMEM;
             }
@@ -242,6 +225,7 @@ int64_t sys_sendmsg(guest_t *g, int fd, uint64_t msg_gva, int linux_flags)
         if (guest_read(g, lmsg.msg_control, linux_ctrl, clen) < 0) {
             free(linux_ctrl_heap);
             free(mac_ctrl_heap);
+            host_iov_free(&host_iov);
             host_fd_ref_close(&host_ref);
             return -LINUX_EFAULT;
         }
@@ -300,6 +284,7 @@ int64_t sys_sendmsg(guest_t *g, int fd, uint64_t msg_gva, int linux_flags)
                 if (rc < 0) {
                     free(linux_ctrl_heap);
                     free(mac_ctrl_heap);
+                    host_iov_free(&host_iov);
                     host_fd_ref_close(&host_ref);
                     return rc;
                 }
@@ -318,8 +303,8 @@ int64_t sys_sendmsg(guest_t *g, int fd, uint64_t msg_gva, int linux_flags)
     struct msghdr msg = {
         .msg_name = dest_sa,
         .msg_namelen = dest_len,
-        .msg_iov = host_iov,
-        .msg_iovlen = (int) lmsg.msg_iovlen,
+        .msg_iov = host_iov.iov,
+        .msg_iovlen = send_iovcnt,
         .msg_control = ctrl_ptr,
         .msg_controllen = ctrl_len,
         .msg_flags = 0,
@@ -328,6 +313,7 @@ int64_t sys_sendmsg(guest_t *g, int fd, uint64_t msg_gva, int linux_flags)
     ssize_t ret = sendmsg(host_ref.fd, &msg, mac_flags);
     free(linux_ctrl_heap);
     free(mac_ctrl_heap);
+    host_iov_free(&host_iov);
     host_fd_ref_close(&host_ref);
     if (ret < 0) {
         if (errno == EPIPE && !suppress_sigpipe)
@@ -410,41 +396,19 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags)
         return ret;
     }
 
-    if (lmsg.msg_iovlen > 64) {
+    /* See sys_sendmsg above: bound msg_iovlen before the int narrowing. */
+    if (lmsg.msg_iovlen > SYSCALL_IOV_MAX) {
         host_fd_ref_close(&host_ref);
         return -LINUX_EINVAL;
     }
+    int recv_iovcnt = (int) lmsg.msg_iovlen;
 
-    struct {
-        uint64_t iov_base, iov_len;
-    } guest_iov[64];
-
-    if (lmsg.msg_iovlen > 0) {
-        if (guest_read(g, lmsg.msg_iov, guest_iov, lmsg.msg_iovlen * 16) < 0) {
-            host_fd_ref_close(&host_ref);
-            return -LINUX_EFAULT;
-        }
-    }
-
-    struct iovec host_iov[64];
-    for (uint64_t i = 0; i < lmsg.msg_iovlen; i++) {
-        if (guest_iov[i].iov_len == 0) {
-            host_iov[i].iov_base = NULL;
-            host_iov[i].iov_len = 0;
-            continue;
-        }
-        uint64_t avail = 0;
-        void *base = guest_ptr_bound(g, guest_iov[i].iov_base, &avail,
-                                     MEM_PERM_W, guest_iov[i].iov_len);
-        if (!base) {
-            host_fd_ref_close(&host_ref);
-            return -LINUX_EFAULT;
-        }
-        uint64_t len = guest_iov[i].iov_len;
-        if (len > avail)
-            len = avail;
-        host_iov[i].iov_base = base;
-        host_iov[i].iov_len = len;
+    host_iov_buf_t host_iov;
+    int64_t iov_err = host_iov_prepare_msg(g, lmsg.msg_iov, recv_iovcnt,
+                                           MEM_PERM_W, &host_iov);
+    if (iov_err < 0) {
+        host_fd_ref_close(&host_ref);
+        return iov_err;
     }
 
     struct sockaddr_storage mac_sa;
@@ -477,8 +441,8 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags)
     struct msghdr msg = {
         .msg_name = lmsg.msg_name ? &mac_sa : NULL,
         .msg_namelen = lmsg.msg_name ? sa_len : 0,
-        .msg_iov = host_iov,
-        .msg_iovlen = (int) lmsg.msg_iovlen,
+        .msg_iov = host_iov.iov,
+        .msg_iovlen = recv_iovcnt,
         .msg_control = ctrl_alloc > 0 ? mac_ctrl : NULL,
         .msg_controllen = ctrl_alloc,
         .msg_flags = 0,
@@ -491,6 +455,7 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags)
     ssize_t ret = recvmsg(host_ref.fd, &msg, mac_flags);
     if (ret < 0) {
         free(mac_ctrl_heap);
+        host_iov_free(&host_iov);
         host_fd_ref_close(&host_ref);
         return linux_errno();
     }
@@ -508,6 +473,7 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags)
                 if (guest_write_small(g, lmsg.msg_name, linux_sa, write_len) <
                     0) {
                     free(mac_ctrl_heap);
+                    host_iov_free(&host_iov);
                     host_fd_ref_close(&host_ref);
                     return -LINUX_EFAULT;
                 }
@@ -518,6 +484,7 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags)
                               msg_gva + offsetof(linux_msghdr_t, msg_namelen),
                               &nl, sizeof(nl)) < 0) {
             free(mac_ctrl_heap);
+            host_iov_free(&host_iov);
             host_fd_ref_close(&host_ref);
             return -LINUX_EFAULT;
         }
@@ -534,6 +501,7 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags)
             lctrl_heap = malloc(lctrl_size);
             if (!lctrl_heap) {
                 free(mac_ctrl_heap);
+                host_iov_free(&host_iov);
                 host_fd_ref_close(&host_ref);
                 return -LINUX_ENOMEM;
             }
@@ -581,6 +549,7 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags)
                     recvmsg_cleanup_scm_rights(scm_gfds, scm_hfds, scm_nfds);
                     free(lctrl_heap);
                     free(mac_ctrl_heap);
+                    host_iov_free(&host_iov);
                     host_fd_ref_close(&host_ref);
                     return -LINUX_EINVAL;
                 }
@@ -654,6 +623,7 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags)
                 recvmsg_cleanup_scm_rights(scm_gfds, scm_hfds, scm_nfds);
                 free(lctrl_heap);
                 free(mac_ctrl_heap);
+                host_iov_free(&host_iov);
                 host_fd_ref_close(&host_ref);
                 return -LINUX_EFAULT;
             }
@@ -664,6 +634,7 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags)
                 recvmsg_cleanup_scm_rights(scm_gfds, scm_hfds, scm_nfds);
                 free(lctrl_heap);
                 free(mac_ctrl_heap);
+                host_iov_free(&host_iov);
                 host_fd_ref_close(&host_ref);
                 return -LINUX_EFAULT;
             }
@@ -674,6 +645,7 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags)
                     &zero64, sizeof(zero64)) < 0) {
                 free(lctrl_heap);
                 free(mac_ctrl_heap);
+                host_iov_free(&host_iov);
                 host_fd_ref_close(&host_ref);
                 return -LINUX_EFAULT;
             }
@@ -722,6 +694,7 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags)
                 g, msg_gva + offsetof(linux_msghdr_t, msg_controllen), &zero64,
                 sizeof(zero64)) < 0) {
             free(mac_ctrl_heap);
+            host_iov_free(&host_iov);
             host_fd_ref_close(&host_ref);
             return -LINUX_EFAULT;
         }
@@ -734,11 +707,13 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags)
                           &mflags, sizeof(mflags)) < 0) {
         recvmsg_cleanup_scm_rights(scm_gfds, scm_hfds, scm_nfds);
         free(mac_ctrl_heap);
+        host_iov_free(&host_iov);
         host_fd_ref_close(&host_ref);
         return -LINUX_EFAULT;
     }
 
     free(mac_ctrl_heap);
+    host_iov_free(&host_iov);
     host_fd_ref_close(&host_ref);
     return ret;
 }

@@ -24,6 +24,7 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <stdbool.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 #include "syscall/abi.h"
@@ -311,6 +312,51 @@ static inline int64_t host_fd_ref_open_io(guest_fd_t guest_fd,
         return -LINUX_EBADF;
     return 0;
 }
+
+/* iov limits shared between readv/writev/preadv/pwritev and sendmsg/recvmsg.
+ * SYSCALL_IOV_MAX matches the Linux UIO_MAXIOV cap; SYSCALL_IOV_STACK_MAX
+ * keeps the typical case on the call-site stack.
+ */
+#define SYSCALL_IOV_MAX 1024
+#define SYSCALL_IOV_STACK_MAX 64
+
+/* Resolved host iov vector backed by an inline stack buffer with a heap
+ * fallback for large iovcnt. Pair host_iov_prepare with host_iov_free.
+ */
+typedef struct {
+    struct iovec stack[SYSCALL_IOV_STACK_MAX];
+    struct iovec *iov;
+} host_iov_buf_t;
+
+/* Translate a guest iovec array at iov_gva (iovcnt entries) into the host
+ * iovec layout in buf->iov, resolving each guest_base to a contiguous host
+ * pointer with the requested permissions. On a non-contiguous iov entry the
+ * helper truncates that entry to the contiguous prefix and zeros every
+ * subsequent entry; the host readv/writev/sendmsg/recvmsg then returns a
+ * POSIX-compliant short I/O instead of silently packing bytes from the next
+ * guest buffer into the truncated tail.
+ *
+ * iovcnt <= 0 or > SYSCALL_IOV_MAX returns -LINUX_EINVAL.
+ *
+ * Returns 0 on success or a negative Linux errno on failure. The caller must
+ * pair every successful prepare with host_iov_free to release any heap
+ * spillover.
+ */
+int64_t host_iov_prepare(guest_t *g,
+                         uint64_t iov_gva,
+                         int iovcnt,
+                         int required_perms,
+                         host_iov_buf_t *buf);
+
+/* sendmsg/recvmsg variant: iovcnt == 0 is legal for ancillary-only messages. */
+int64_t host_iov_prepare_msg(guest_t *g,
+                             uint64_t iov_gva,
+                             int iovcnt,
+                             int required_perms,
+                             host_iov_buf_t *buf);
+
+/* Release any heap spillover backing a host_iov_buf_t. Idempotent. */
+void host_iov_free(host_iov_buf_t *buf);
 
 /* Read a guest path string with small-buffer optimization.
  *

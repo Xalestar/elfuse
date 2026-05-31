@@ -43,8 +43,6 @@
 #include "syscall/proc.h"
 #include "syscall/signal.h"
 
-#define SYSCALL_IOV_MAX 1024
-#define SYSCALL_IOV_STACK_MAX 64
 #define URANDOM_CACHE_SIZE 4096
 
 /* Linux terminal struct types. */
@@ -1098,21 +1096,17 @@ static int64_t build_host_iov(guest_t *g,
     return 0;
 }
 
-typedef struct {
-    struct iovec stack[SYSCALL_IOV_STACK_MAX];
-    struct iovec *iov;
-} host_iov_buf_t;
-
-static int64_t host_iov_prepare(guest_t *g,
-                                uint64_t iov_gva,
-                                int iovcnt,
-                                int required_perms,
-                                host_iov_buf_t *buf)
+int64_t host_iov_prepare(guest_t *g,
+                         uint64_t iov_gva,
+                         int iovcnt,
+                         int required_perms,
+                         host_iov_buf_t *buf)
 {
     if (iovcnt <= 0 || iovcnt > SYSCALL_IOV_MAX)
         return -LINUX_EINVAL;
 
     buf->iov = buf->stack;
+
     if (iovcnt > SYSCALL_IOV_STACK_MAX) {
         buf->iov = malloc((size_t) iovcnt * sizeof(*buf->iov));
         if (!buf->iov)
@@ -1130,7 +1124,20 @@ static int64_t host_iov_prepare(guest_t *g,
     return 0;
 }
 
-static void host_iov_free(host_iov_buf_t *buf)
+int64_t host_iov_prepare_msg(guest_t *g,
+                             uint64_t iov_gva,
+                             int iovcnt,
+                             int required_perms,
+                             host_iov_buf_t *buf)
+{
+    if (iovcnt == 0) {
+        buf->iov = buf->stack;
+        return 0;
+    }
+    return host_iov_prepare(g, iov_gva, iovcnt, required_perms, buf);
+}
+
+void host_iov_free(host_iov_buf_t *buf)
 {
     if (buf->iov != buf->stack)
         free(buf->iov);
