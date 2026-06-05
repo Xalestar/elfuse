@@ -30,31 +30,53 @@
  * = 64GiB on M2, 40-bit = 1TiB on M3+). See guest.c for the runtime probe that
  * selects the correct size.
  *
- * Infrastructure layout (page-table pool, shim code, shim data): a 4MiB reserve
- * placed just below g->interp_base, in the dead zone between g->mmap_limit and
- * g->interp_base. The exact base is computed at guest_init time and stored in
- * guest_t.pt_pool_base / pt_pool_end / shim_base / shim_data_base. EL0 user
- * binaries are therefore free to load at low addresses (down to 64KiB) without
- * colliding with the runtime.
+ * Infrastructure layout (page-table pool, shim code, shim data): a 16MiB
+ * reserve placed just below g->interp_base, in the dead zone between
+ * g->mmap_limit and g->interp_base. The exact base is computed at guest_init
+ * time and stored in guest_t.pt_pool_base / pt_pool_end / shim_base /
+ * shim_data_base. EL0 user binaries are therefore free to load at low
+ * addresses (down to 64KiB) without colliding with the runtime.
  *
- * Internal layout within the 4MiB reserve:
- *   +0x000000 .. +0x010000  unused (64KiB null guard)
- *   +0x010000 .. +0x100000  page-table pool (960KiB, RW)
- *   +0x100000 .. +0x200000  shim code slot (1MiB, RX). Sits in the same
- *                           2MiB L2 block as the PT pool, so that block
- *                           is split into 4KiB L3 pages (mixed RX/RW).
- *   +0x200000 .. +0x400000  shim data + EL1 stack (full 2MiB L2 block, RW)
+ * The reserve is demand-paged (MAP_ANON): unused page-table-pool pages cost no
+ * host RAM, and the whole reserve consumes a negligible slice of the ~4 GiB
+ * dead zone, so the pool is sized generously and gets every byte not spoken for
+ * by the null guard, the shim code, and the shim data. Each split 2MiB block
+ * draws one 4KiB L3 page from the pool and the bump allocator never reclaims
+ * it, so a ~13.9MiB pool (3558 pages, ~7 GiB of split address space) hosts the
+ * many V8 isolates a Node worker_threads pool / cluster spins up; a 960KiB pool
+ * exhausted after only ~3 isolates and hard-aborted the guest. See
+ * issue-pt-pool-exhaustion.md.
+ *
+ * The shim code slot is tight (40KiB, ~6x the ~7KiB shim blob) rather than a
+ * round 1MiB so the freed space falls through to the pool; main.c
+ * _Static_asserts the real shim blob fits, and bootstrap.c re-checks at load.
+ *
+ * Internal layout within the 16MiB reserve:
+ *   +0x0000000 .. +0x0010000  unused (64KiB null guard)
+ *   +0x0010000 .. +0x0DF6000  page-table pool (~13.9MiB, RW)
+ *   +0x0DF6000 .. +0x0E00000  shim code slot (40KiB, RX). Sits in the same
+ *                             2MiB L2 block as the PT pool tail, so that block
+ *                             is split into 4KiB L3 pages (mixed RX/RW).
+ *   +0x0E00000 .. +0x1000000  shim data + EL1 stack (full 2MiB L2 block, RW)
+ *
+ * Invariant: shim_data occupies the top 2MiB block of the reserve, so
+ * INFRA_SHIM_DATA_OFF == INFRA_RESERVE - BLOCK_2MIB and
+ * shim_data_base + BLOCK_2MIB == interp_base. The PT pool ends where the shim
+ * code slot begins (INFRA_PT_POOL_END_OFF == INFRA_SHIM_OFF), and the slot is
+ * INFRA_SHIM_SLOT == INFRA_SHIM_DATA_OFF - INFRA_SHIM_OFF wide.
  */
 
 /* Total size of the runtime infrastructure reserve. Shifted to
  * [g->interp_base - INFRA_RESERVE, g->interp_base) at guest_init.
  */
-#define INFRA_RESERVE 0x00400000ULL         /* 4MiB */
-#define INFRA_PT_POOL_OFF 0x00010000ULL     /* offset of PT pool */
-#define INFRA_PT_POOL_END_OFF 0x00100000ULL /* PT pool end (960KiB) */
-#define INFRA_SHIM_OFF 0x00100000ULL        /* offset of shim code slot */
-#define INFRA_SHIM_DATA_OFF 0x00200000ULL   /* offset of shim data slot */
-#define ELF_DEFAULT_BASE 0x00400000ULL      /* Typical ELF load base */
+#define INFRA_RESERVE 0x01000000ULL         /* 16MiB */
+#define INFRA_PT_POOL_OFF 0x00010000ULL     /* PT pool start */
+#define INFRA_PT_POOL_END_OFF 0x00DF6000ULL /* pool end == shim base */
+#define INFRA_SHIM_OFF 0x00DF6000ULL        /* shim code slot base */
+#define INFRA_SHIM_DATA_OFF 0x00E00000ULL   /* shim data block base */
+/* Shim slot width; main.c _Static_asserts the shim blob fits. */
+#define INFRA_SHIM_SLOT (INFRA_SHIM_DATA_OFF - INFRA_SHIM_OFF)
+#define ELF_DEFAULT_BASE 0x00400000ULL /* Typical ELF load base */
 #define PIE_LOAD_BASE 0x00400000ULL    /* PIE (ET_DYN) executable base (4MiB) */
 #define BRK_BASE_DEFAULT 0x01000000ULL /* Default brk start (16MiB) */
 
@@ -701,7 +723,7 @@ static inline uint64_t guest_ipa(const guest_t *g, uint64_t offset)
 }
 
 /* True iff [start, end) overlaps the runtime infra reserve
- * [interp_base - INFRA_RESERVE, interp_base). Covers the full 4 MiB
+ * [interp_base - INFRA_RESERVE, interp_base). Covers the full
  * reserve including the 64 KiB null-guard slot at the bottom (which
  * has no PT entries but must not become semantically reachable from
  * guest mmap state). Used by sys_mmap (MAP_FIXED), sys_munmap, and
@@ -719,7 +741,7 @@ static inline bool guest_range_hits_infra(const guest_t *g,
 
 /* True iff a single address (PC, hint, etc.) falls inside the infra reserve.
  * Used by rt_sigreturn to reject forged frames that would redirect EL0 PC into
- * EL1 shim or page-table memory. Covers the full 4 MiB reserve, matching
+ * EL1 shim or page-table memory. Covers the full reserve, matching
  * guest_range_hits_infra.
  */
 static inline bool guest_addr_in_infra(const guest_t *g, uint64_t addr)

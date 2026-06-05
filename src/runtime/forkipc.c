@@ -129,7 +129,7 @@ int fork_child_main(int ipc_fd,
      * pt_at. Reject impossible layouts up front.
      *
      * Lower bound: guest_size must leave room for both mmap_limit
-     * (size - 8 GiB) and interp_base (size - 4 GiB) plus the 4 MiB infra
+     * (size - 8 GiB) and interp_base (size - 4 GiB) plus the 16 MiB infra
      * reserve below it. 8 GiB satisfies all three with margin.
      * Upper bound: guest_size must fit in the negotiated IPA width.
      * IPA bits: 36 (M1/M2) and 40 (M3+) for native aarch64; 48 for

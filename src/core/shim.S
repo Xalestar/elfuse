@@ -4,8 +4,8 @@
  * Copyright 2025 Moritz Angermann, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  *
- * Loaded at g->shim_base (a 4MiB infra reserve placed just below g->interp_base;
- * computed at guest_init time). Runs at EL1.
+ * Loaded at g->shim_base (a 16MiB infra reserve placed just below
+ * g->interp_base; computed at guest_init time). Runs at EL1.
  * All system registers (VBAR, MAIR, TCR, TTBR0, SCTLR, etc.) are configured by
  * the host before vCPU start. The shim entry point transitions to EL0 via ERET.
  * Exception vectors handle SVC #0 (Linux syscall) forwarding to the host via

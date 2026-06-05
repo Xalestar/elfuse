@@ -136,7 +136,7 @@ static void guest_region_clip_overlay(guest_region_t *r)
 /* Compute infra reserve placement from guest_size and store derived fields in
  * @g. Called from guest_init and guest_init_from_shm.
  *
- * Layout: a 4MiB region anchored at [interp_base - INFRA_RESERVE, interp_base)
+ * Layout: a 16MiB region anchored at [interp_base - INFRA_RESERVE, interp_base)
  * sits in the dead zone between mmap_limit and interp_base. PT pool, shim, and
  * shim data fall at fixed offsets within the reserve (see guest.h).
  *

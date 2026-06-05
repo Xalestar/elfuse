@@ -462,8 +462,9 @@ int guest_bootstrap_prepare(guest_t *g,
         startup_trace_step("load_interpreter", t0);
     }
 
-    if (shim_bin_len > BLOCK_2MIB) {
-        log_error("shim binary too large (%zu bytes)", shim_bin_len);
+    if (shim_bin_len > INFRA_SHIM_SLOT) {
+        log_error("shim binary too large (%zu bytes, slot %llu)", shim_bin_len,
+                  (unsigned long long) INFRA_SHIM_SLOT);
         return -1;
     }
 
