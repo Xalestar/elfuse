@@ -154,7 +154,7 @@ run_elfuse()
             "${FIXTURES}/aarch64-musl/dyn-bin"/*) args+=(--sysroot "$GUEST_SYSROOT") ;;
         esac
     fi
-    timeout 30 "$ELFUSE" "${args[@]}" "$@" 2> /dev/null
+    timeout 30 "$ELFUSE" ${args[@]+"${args[@]}"} "$@" 2> /dev/null
 }
 
 # 'timeout' cannot wrap a shell function, so this runner inlines the path
@@ -168,12 +168,14 @@ run_qemu()
     local args=() a
     for a in "$@"; do
         case "$a" in
-            "${REPO_ROOT}"/*) args+=("/mnt/host/${a#${REPO_ROOT}/}") ;;
+            "${REPO_ROOT}"/*) args+=("/mnt/host/${a#"${REPO_ROOT}"/}") ;;
             *) args+=("$a") ;;
         esac
     done
-    local quoted
-    printf -v quoted '%q ' "${args[@]}"
+    local quoted=""
+    if [ "${#args[@]}" -gt 0 ]; then
+        printf -v quoted '%q ' "${args[@]}"
+    fi
     timeout 60 ssh \
         -o StrictHostKeyChecking=no \
         -o UserKnownHostsFile=/dev/null \
@@ -865,36 +867,60 @@ run_suite()
 # Baselines". Bump these counts in the same commit that grows or trims
 # any sub-suite's Results line so the matrix gate stays in sync.
 #
-# Keys MUST match the lookup strings exactly. Every subscript here is
-# explicitly quoted ("elfuse-aarch64", etc.) because shfmt parses
-# unquoted bareword subscripts as arithmetic, which expands [a-b] to
-# [a - b]. Bash then treats the spaced and unspaced forms as different
-# keys, so the baseline gate silently goes dead. This regression has
-# bitten the tree three times; keep the quotes and do not rewrite this
-# block back into the 'declare -A NAME=( ... )' initialiser form
-# either (the same arithmetic-rewrite hits subscripts in that form).
-declare -A EXPECTED_MIN_PASS
-declare -A EXPECTED_FAIL
-EXPECTED_MIN_PASS["elfuse-aarch64"]=180
-EXPECTED_FAIL["elfuse-aarch64"]=0
-EXPECTED_MIN_PASS["qemu-aarch64"]=180
-EXPECTED_FAIL["qemu-aarch64"]=1
+# Per-mode baseline gate. Encoded as "key|min_pass|max_fail" tuples in a
+# single indexed array so stock macOS bash 3.2 (which lacks 'declare -A')
+# works the same as bash 4+.
+#
+# The bareword-subscript hazard the prior 'declare -A' form had to dodge
+# (shfmt rewriting [a-b] into [a - b] inside subscripts) does not apply
+# to this encoding: keys live inside a quoted string, never as a
+# subscript expression.
+#
+# Order: aarch64 baselines first, then x86_64 baselines keyed by detected
+# host SoC class. The two M-series classes diverge inside
+# sys_mmap_fixed_high_va on IPA width (apple-m1-m2 is 36-bit, the
+# overflow-segment path; apple-m3-plus is 40-bit, the bisected-slab
+# path on M5). The seven Rosetta sub-suites currently emit fixed pass
+# counts regardless of IPA width, so both rows start at 71; an operator
+# with M3+ hardware updates the apple-m3-plus row in place when their
+# observed counts diverge. apple-unknown is the fallback row for SoC
+# strings the detector does not recognize yet.
+EXPECTED_BASELINES=(
+    "elfuse-aarch64|180|0"
+    "qemu-aarch64|180|1"
+    "elfuse-x86_64:apple-m1-m2|71|0"
+    "elfuse-x86_64:apple-m3-plus|71|0"
+    "elfuse-x86_64:apple-unknown|71|0"
+)
 
-# x86_64 baselines are keyed by detected host SoC class
-# (see detect_x86_64_host_class below). The two M-series classes
-# diverge inside sys_mmap_fixed_high_va on IPA width: apple-m1-m2 is
-# 36-bit (overflow-segment path), apple-m3-plus is 40-bit (bisected
-# -slab path on M5). The seven Rosetta sub-suites currently emit fixed
-# pass counts regardless of IPA width, so both rows start at 71; an
-# operator with M3+ hardware updates the apple-m3-plus row in place
-# when their observed counts diverge. apple-unknown is the fallback
-# row for SoC strings the detector does not recognise yet.
-EXPECTED_MIN_PASS["elfuse-x86_64:apple-m1-m2"]=71
-EXPECTED_FAIL["elfuse-x86_64:apple-m1-m2"]=0
-EXPECTED_MIN_PASS["elfuse-x86_64:apple-m3-plus"]=71
-EXPECTED_FAIL["elfuse-x86_64:apple-m3-plus"]=0
-EXPECTED_MIN_PASS["elfuse-x86_64:apple-unknown"]=71
-EXPECTED_FAIL["elfuse-x86_64:apple-unknown"]=0
+# Look up the (min_pass, max_fail) baseline for a mode key. Writes the
+# values into the named output variables and returns 0 on hit, 1 on
+# miss. Callers use the rc=1 path as "no recorded baseline for this key,
+# stay silent".
+#
+# Parses from the right so a key containing a literal '|' would still
+# split correctly (today the schema has none, but the right-anchored
+# form is no harder to read and removes the trap). printf -v sets the
+# named output without eval; printf -v exists in bash 3.1+.
+expected_baseline_get()
+{
+    local target="$1"
+    local out_min="$2"
+    local out_fail="$3"
+    local entry head key min max
+    for entry in "${EXPECTED_BASELINES[@]}"; do
+        max="${entry##*|}"
+        head="${entry%|*}"
+        min="${head##*|}"
+        key="${head%|*}"
+        if [ "$key" = "$target" ]; then
+            printf -v "$out_min" '%s' "$min"
+            printf -v "$out_fail" '%s' "$max"
+            return 0
+        fi
+    done
+    return 1
+}
 
 # Host SoC class detector for x86_64 baseline selection. Reads
 # machdep.cpu.brand_string (sysctl), which Apple Silicon Macs publish
@@ -961,9 +987,8 @@ verify_expected_counts()
         key="${mode}:${host_class}"
     fi
 
-    local exp_min="${EXPECTED_MIN_PASS[$key]:-}"
-    local exp_fail="${EXPECTED_FAIL[$key]:-}"
-    if [ -z "$exp_min" ] || [ -z "$exp_fail" ]; then
+    local exp_min="" exp_fail=""
+    if ! expected_baseline_get "$key" exp_min exp_fail; then
         # No recorded baseline for this key (experimental local mode, or
         # an x86_64 host class the detector did not classify). Stay
         # silent so the matrix runner remains usable as a smoke probe.

@@ -195,8 +195,8 @@ run_pipe()
     # that fails after emitting matching text would silently pass.
     out="$(
         set -o pipefail
-        "$TIMEOUT" 15 "$ELFUSE" "${args_a[@]}" 2> /dev/null \
-            | "$TIMEOUT" 15 "$ELFUSE" "${args_b[@]}" 2> /dev/null
+        "$TIMEOUT" 15 "$ELFUSE" ${args_a[@]+"${args_a[@]}"} 2> /dev/null \
+            | "$TIMEOUT" 15 "$ELFUSE" ${args_b[@]+"${args_b[@]}"} 2> /dev/null
     )"
     rc=$?
     set -e

@@ -32,6 +32,9 @@
 
 set -euo pipefail
 
+# shellcheck source=tests/lib/bash-compat.sh
+. "$(dirname "$0")/lib/bash-compat.sh"
+
 ALPINE_VERSION="${ALPINE_VERSION:-3.21}"
 ALPINE_PATCH="${ALPINE_PATCH:-3.21.0}"
 ALPINE_ARCH="${ALPINE_ARCH:-aarch64}"
@@ -50,47 +53,69 @@ KEYS_DIR="${FIXTURES}/keys"
 STATICBIN="${FIXTURES}/aarch64-musl/staticbin/bin"
 INITRAMFS="${FIXTURES}/initramfs.cpio.gz"
 
-# Pinned package versions (Alpine 3.21).  When bumping ALPINE_VERSION, refresh
-# these by querying the repo's APKINDEX.
-declare -A PKGS=(
-    ["main:linux-virt"]="6.12.91-r0"
-    ["main:busybox-static"]="1.37.0-r14"
-    ["main:dropbear"]="2024.86-r0"
-    ["main:zlib"]="1.3.2-r0"
-    ["main:utmps-libs"]="0.1.2.3-r2"
-    ["main:skalibs-libs"]="2.14.3.0-r0"
-    ["main:musl"]="1.2.5-r11"
-    ["main:musl-dev"]="1.2.5-r11"
-    ["main:musl-utils"]="1.2.5-r11"
-    ["main:libgcc"]="14.2.0-r4"
-    ["main:libcrypto3"]="3.3.7-r0"
-    ["main:acl-libs"]="2.3.2-r1"
-    ["main:libattr"]="2.5.2-r2"
-    ["main:pcre2"]="10.43-r0"
-    ["main:coreutils"]="9.5-r2"
-    ["main:coreutils-env"]="9.5-r2"
-    ["main:coreutils-fmt"]="9.5-r2"
-    ["main:coreutils-sha512sum"]="9.5-r2"
-    ["main:bash"]="5.2.37-r0"
-    ["main:dash"]="0.5.12-r2"
-    ["main:findutils"]="4.10.0-r0"
-    ["main:diffutils"]="3.10-r0"
-    ["main:grep"]="3.11-r0"
-    ["main:sed"]="4.9-r2"
-    ["main:gawk"]="5.3.1-r0"
-    ["main:gmp"]="6.3.0-r2"
-    ["main:readline"]="8.2.13-r0"
-    ["main:libncursesw"]="6.5_p20241006-r3"
-    ["main:ncurses-terminfo-base"]="6.5_p20241006-r3"
-    ["main:lua5.4"]="5.4.7-r0"
-    ["main:lua5.4-libs"]="5.4.7-r0"
-    ["main:luajit"]="2.1_p20240815-r0"
-    ["main:jq"]="1.7.1-r0"
-    ["main:oniguruma"]="6.9.9-r0"
-    ["main:sqlite"]="3.48.0-r4"
-    ["main:sqlite-libs"]="3.48.0-r4"
-    ["main:tree"]="2.2.1-r0"
+# Pinned package versions (Alpine 3.21). When bumping ALPINE_VERSION,
+# refresh these by querying the repo's APKINDEX.
+#
+# Encoded as "repo:name:version" tuples so bash 3.2 hosts (stock macOS
+# /bin/bash) do not need associative arrays. Lookup goes through
+# pkg_version below.
+PKGS=(
+    "main:linux-virt:6.12.91-r0"
+    "main:busybox-static:1.37.0-r14"
+    "main:dropbear:2024.86-r0"
+    "main:zlib:1.3.2-r0"
+    "main:utmps-libs:0.1.2.3-r2"
+    "main:skalibs-libs:2.14.3.0-r0"
+    "main:musl:1.2.5-r11"
+    "main:musl-dev:1.2.5-r11"
+    "main:musl-utils:1.2.5-r11"
+    "main:libgcc:14.2.0-r4"
+    "main:libcrypto3:3.3.7-r0"
+    "main:acl-libs:2.3.2-r1"
+    "main:libattr:2.5.2-r2"
+    "main:pcre2:10.43-r0"
+    "main:coreutils:9.5-r2"
+    "main:coreutils-env:9.5-r2"
+    "main:coreutils-fmt:9.5-r2"
+    "main:coreutils-sha512sum:9.5-r2"
+    "main:bash:5.2.37-r0"
+    "main:dash:0.5.12-r2"
+    "main:findutils:4.10.0-r0"
+    "main:diffutils:3.10-r0"
+    "main:grep:3.11-r0"
+    "main:sed:4.9-r2"
+    "main:gawk:5.3.1-r0"
+    "main:gmp:6.3.0-r2"
+    "main:readline:8.2.13-r0"
+    "main:libncursesw:6.5_p20241006-r3"
+    "main:ncurses-terminfo-base:6.5_p20241006-r3"
+    "main:lua5.4:5.4.7-r0"
+    "main:lua5.4-libs:5.4.7-r0"
+    "main:luajit:2.1_p20240815-r0"
+    "main:jq:1.7.1-r0"
+    "main:oniguruma:6.9.9-r0"
+    "main:sqlite:3.48.0-r4"
+    "main:sqlite-libs:3.48.0-r4"
+    "main:tree:2.2.1-r0"
 )
+
+# Look up a package version by its "repo:name" prefix. Returns the
+# version on stdout and rc=0 on hit, rc=1 (silently) on miss so the
+# old ${PKGS[key]:-} fallback callers keep working.
+pkg_version()
+{
+    local target="$1:"
+    local entry
+    for entry in "${PKGS[@]}"; do
+        case "$entry" in
+            "$target"*)
+                printf '%s\n' "${entry#"$target"}"
+                return 0
+                ;;
+        esac
+    done
+    return 1
+}
 
 # Subset whose binaries are exposed as standalone "static-bins" suite paths.
 # Most are dynamic but link only against musl/zlib/etc., already in rootfs/.
@@ -185,8 +210,12 @@ main()
     mkdir -p "$CACHE" "$KERNEL_DIR" "$KEYS_DIR" "$STATICBIN" "$ROOTFS"
 
     # Download all required apk packages.
-    for key in "${!PKGS[@]}"; do
-        local repo="${key%%:*}" name="${key##*:}" version="${PKGS[$key]}"
+    local entry repo name version
+    for entry in "${PKGS[@]}"; do
+        repo="${entry%%:*}"
+        name="${entry#*:}"
+        name="${name%:*}"
+        version="${entry##*:}"
         fetch "$(apk_url "$repo" "$name" "$version")" "$(apk_path "$name" "$version")"
     done
 
@@ -201,16 +230,20 @@ main()
 
         # Overlay every cached apk except linux-virt (kernel goes elsewhere).
         # The kernel apk's lib/modules/ tree IS overlayed (needed for modprobe).
-        for key in "${!PKGS[@]}"; do
-            local name="${key##*:}" version="${PKGS[$key]}"
+        local entry name version
+        for entry in "${PKGS[@]}"; do
+            name="${entry#*:}"
+            name="${name%:*}"
+            version="${entry##*:}"
             [ "$name" = "linux-virt" ] && continue
             extract_apk_to "$(apk_path "$name" "$version")" "$ROOTFS"
         done
 
         # Extract just the kernel-modules subtree from linux-virt.
-        local modstage
+        local modstage linux_virt_ver
+        linux_virt_ver="$(pkg_version "main:linux-virt")"
         modstage="$(mktemp -d)"
-        tar xzf "$(apk_path linux-virt "${PKGS["main:linux-virt"]}")" \
+        tar xzf "$(apk_path linux-virt "$linux_virt_ver")" \
             -C "$modstage" 'lib/modules' 2> /dev/null
         cp -R "$modstage/lib/modules" "$ROOTFS/lib/" 2> /dev/null
         rm -rf "$modstage"
@@ -295,9 +328,11 @@ EOF
     # Extract the kernel from linux-virt.
     if [ ! -s "${KERNEL_DIR}/vmlinuz-virt" ] || [ "${FORCE:-0}" = "1" ]; then
         log "extract kernel"
+        local linux_virt_ver
+        linux_virt_ver="$(pkg_version "main:linux-virt")"
         rm -rf "${KERNEL_DIR}/work"
         mkdir -p "${KERNEL_DIR}/work"
-        tar xzf "$(apk_path linux-virt "${PKGS["main:linux-virt"]}")" \
+        tar xzf "$(apk_path linux-virt "$linux_virt_ver")" \
             -C "${KERNEL_DIR}/work" boot/vmlinuz-virt 2> /dev/null
         mv "${KERNEL_DIR}/work/boot/vmlinuz-virt" "${KERNEL_DIR}/vmlinuz-virt"
         rm -rf "${KERNEL_DIR}/work"
@@ -340,11 +375,13 @@ EOF
     # Stage the static-bin tree.
     if [ ! -s "${STATICBIN}/busybox" ] || [ "${FORCE:-0}" = "1" ]; then
         log "stage static-bin tree"
+        local busybox_ver
+        busybox_ver="$(pkg_version "main:busybox-static")"
         rm -rf "${STATICBIN}"
         mkdir -p "${STATICBIN}"
         local stage
         stage="$(mktemp -d)"
-        tar xzf "$(apk_path busybox-static "${PKGS["main:busybox-static"]}")" -C "$stage" 2> /dev/null
+        tar xzf "$(apk_path busybox-static "$busybox_ver")" -C "$stage" 2> /dev/null
         mv "${stage}/bin/busybox.static" "${STATICBIN}/busybox"
         chmod 755 "${STATICBIN}/busybox"
         rm -rf "$stage"
@@ -388,11 +425,15 @@ fetch_x86_64_userspace()
     local x86_minirootfs="alpine-minirootfs-${ALPINE_PATCH}-x86_64.tar.gz"
 
     log "x86_64: fetch packages"
-    for key in "${!PKGS[@]}"; do
-        local repo="${key%%:*}" name="${key##*:}" version="${PKGS[$key]}"
+    local entry repo name version x86_url x86_dest
+    for entry in "${PKGS[@]}"; do
+        repo="${entry%%:*}"
+        name="${entry#*:}"
+        name="${name%:*}"
+        version="${entry##*:}"
         [ "$repo" = "main" ] || continue
-        local x86_url="${x86_main}/${name}-${version}.apk"
-        local x86_dest="${x86_cache}/${name}-${version}.apk"
+        x86_url="${x86_main}/${name}-${version}.apk"
+        x86_dest="${x86_cache}/${name}-${version}.apk"
         fetch "$x86_url" "$x86_dest"
     done
     fetch "${x86_releases}/${x86_minirootfs}" "${x86_cache}/${x86_minirootfs}"
@@ -402,11 +443,15 @@ fetch_x86_64_userspace()
         rm -rf "$x86_rootfs"
         mkdir -p "$x86_rootfs"
         tar xzf "${x86_cache}/${x86_minirootfs}" -C "$x86_rootfs" 2> /dev/null
-        for key in "${!PKGS[@]}"; do
-            local repo="${key%%:*}" name="${key##*:}" version="${PKGS[$key]}"
-            [ "$repo" = "main" ] || continue
-            [ "$name" = "linux-virt" ] && continue
-            extract_apk_to "${x86_cache}/${name}-${version}.apk" "$x86_rootfs"
+        local stage_entry stage_repo stage_name stage_version
+        for stage_entry in "${PKGS[@]}"; do
+            stage_repo="${stage_entry%%:*}"
+            stage_name="${stage_entry#*:}"
+            stage_name="${stage_name%:*}"
+            stage_version="${stage_entry##*:}"
+            [ "$stage_repo" = "main" ] || continue
+            [ "$stage_name" = "linux-virt" ] && continue
+            extract_apk_to "${x86_cache}/${stage_name}-${stage_version}.apk" "$x86_rootfs"
         done
         touch "${x86_rootfs}/.staged"
     fi
@@ -414,11 +459,13 @@ fetch_x86_64_userspace()
 
     if [ ! -s "${x86_staticbin}/busybox" ] || [ "${FORCE:-0}" = "1" ]; then
         log "x86_64: stage static-bin tree"
+        local busybox_ver
+        busybox_ver="$(pkg_version "main:busybox-static")"
         rm -rf "$x86_staticbin"
         mkdir -p "$x86_staticbin"
         local stage
         stage="$(mktemp -d)"
-        tar xzf "${x86_cache}/busybox-static-${PKGS["main:busybox-static"]}.apk" \
+        tar xzf "${x86_cache}/busybox-static-${busybox_ver}.apk" \
             -C "$stage" 2> /dev/null
         mv "${stage}/bin/busybox.static" "${x86_staticbin}/busybox"
         chmod 755 "${x86_staticbin}/busybox"

@@ -7,6 +7,9 @@
 # shellcheck shell=bash
 # shellcheck disable=SC2034
 
+# shellcheck source=tests/lib/bash-compat.sh
+. "$(dirname "${BASH_SOURCE[0]}")/bash-compat.sh"
+
 : "${TEST_LABEL_WIDTH:=14}"
 : "${TEST_TIMEOUT:=10}"
 
@@ -45,20 +48,13 @@ elif ! command -v timeout > /dev/null 2>&1; then
     unset _timeout_bin _candidate
 fi
 
-# Convert bash $EPOCHREALTIME (seconds.microseconds) to integer microseconds.
-# run() uses this to disambiguate guest timeout(1) returning rc=124 from a
-# harness watchdog firing at TEST_TIMEOUT; SECONDS resolution would mistake
-# either case at short caps. Requires bash 5.0+, already assumed elsewhere
-# (e.g. tests/test-perf.sh epoch_us).
-_test_runner_epoch_us()
-{
-    local t="$EPOCHREALTIME"
-    local sec="${t%%.*}"
-    local frac="${t##*.}"
-    frac="${frac}000000"
-    frac="${frac:0:6}"
-    printf '%s' "$((sec * 1000000 + 10#$frac))"
-}
+# epoch_us is provided by bash-compat.sh: it picks the lowest-cost
+# microsecond clock the host supports ($EPOCHREALTIME on bash 5.0+,
+# 'date +%s %N' on macOS 14+/GNU coreutils, python3, perl, or a
+# whole-second fallback). run() uses it to disambiguate the guest
+# timeout(1) returning rc=124 from the harness watchdog firing at
+# TEST_TIMEOUT; SECONDS resolution would mistake either case at short
+# caps.
 
 if [ -t 1 ]; then
     # Use ANSI-C quoting so the variables hold real ESC bytes, not the literal
@@ -147,20 +143,19 @@ run()
     # alone cannot tell the two apart, so wall-clock elapsed time is
     # used as an out-of-band marker: a harness firing means elapsed is
     # at or above TEST_TIMEOUT, while the guest case completes well
-    # under it. EPOCHREALTIME (bash 5.0+, already required elsewhere in
-    # this suite) is microsecond-resolution; comparing seconds alone
-    # via SECONDS could undercount by almost a full second and let a
-    # real harness timeout slip through as a guest-OK at small
-    # TEST_TIMEOUT values.
+    # under it. epoch_us (from bash-compat.sh) gives microsecond
+    # resolution; comparing seconds alone via SECONDS could undercount
+    # by almost a full second and let a real harness timeout slip
+    # through as a guest-OK at small TEST_TIMEOUT values.
     local start_us end_us elapsed_us limit_us
-    start_us=$(_test_runner_epoch_us)
-    if output=$(timeout "$TEST_TIMEOUT" "${TEST_RUNNER[@]}" \
+    start_us=$(epoch_us)
+    if output=$(timeout "$TEST_TIMEOUT" ${TEST_RUNNER[@]+"${TEST_RUNNER[@]}"} \
         "$(test_tool_path "$tool")" "$@" 2>&1); then
         rc=0
     else
         rc=$?
     fi
-    end_us=$(_test_runner_epoch_us)
+    end_us=$(epoch_us)
     elapsed_us=$((end_us - start_us))
     limit_us=$((TEST_TIMEOUT * 1000000))
     local harness_timed_out=0
@@ -203,7 +198,7 @@ run_check()
     # See run() for the timeout-vs-expected ordering rationale. run_check
     # has no explicit expect_rc parameter (zero is implied), so any rc=124
     # here is treated as a harness timeout.
-    if output=$(timeout "$TEST_TIMEOUT" "${TEST_RUNNER[@]}" \
+    if output=$(timeout "$TEST_TIMEOUT" ${TEST_RUNNER[@]+"${TEST_RUNNER[@]}"} \
         "$(test_tool_path "$tool")" "$@" 2>&1); then
         rc=0
     else
@@ -261,7 +256,7 @@ run_pipe()
     fi
 
     if output=$(printf '%s' "$input" \
-        | timeout "$TEST_TIMEOUT" "${TEST_RUNNER[@]}" "$(test_tool_path "$tool")" "$@" 2>&1); then
+        | timeout "$TEST_TIMEOUT" ${TEST_RUNNER[@]+"${TEST_RUNNER[@]}"} "$(test_tool_path "$tool")" "$@" 2>&1); then
         rc=0
     else
         rc=$?
@@ -295,7 +290,7 @@ run_timeout()
         return
     fi
 
-    if output=$(timeout "$secs" "${TEST_RUNNER[@]}" "$(test_tool_path "$tool")" "$@" 2>&1); then
+    if output=$(timeout "$secs" ${TEST_RUNNER[@]+"${TEST_RUNNER[@]}"} "$(test_tool_path "$tool")" "$@" 2>&1); then
         rc=0
     else
         rc=$?

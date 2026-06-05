@@ -10,7 +10,10 @@
 # comes from VM startup (~1-3ms) and per-syscall vmexits (~1-5us each).
 # Pure computation (regex matching etc.) runs at native speed.
 #
-# Timing uses bash $EPOCHREALTIME (microsecond precision, no external deps).
+# Timing uses the epoch_us helper from tests/lib/bash-compat.sh, which
+# prefers $EPOCHREALTIME (bash 5.0+) and falls back to 'date +%s %N'
+# (macOS 14+/GNU coreutils) or python3 / perl so the script works on
+# stock macOS bash 3.2 too.
 #
 # Usage: tests/test-perf.sh <elfuse-binary> <tool-bin-dir>
 # Example: tests/test-perf.sh build/elfuse /path/to/tool/bin
@@ -20,6 +23,9 @@ set -euo pipefail
 # elfuse-hosted producer (e.g. cat) into a native consumer (e.g. wc).
 # Without pipefail, a producer crash returns rc=0 from the pipeline,
 # so the elfuse-side failure was silently smoothed into a "fast" sample.
+
+# shellcheck source=tests/lib/bash-compat.sh
+. "$(dirname "$0")/lib/bash-compat.sh"
 
 ELFUSE="${1:?Usage: $0 <elfuse-binary> <tool-bin-dir>}"
 TOOL_BIN="${2:?Usage: $0 <elfuse-binary> <tool-bin-dir>}"
@@ -35,19 +41,6 @@ RESET='\033[0m'
 
 RUNS=10
 PATTERN="syscall"
-
-# Convert $EPOCHREALTIME (seconds.microseconds) to integer microseconds.
-# Bash arithmetic can't handle floats, so we split on '.' and combine.
-epoch_us()
-{
-    local t="$EPOCHREALTIME"
-    local sec="${t%%.*}"
-    local frac="${t##*.}"
-    # Pad/truncate frac to 6 digits
-    frac="${frac}000000"
-    frac="${frac:0:6}"
-    echo $((sec * 1000000 + 10#$frac))
-}
 
 PERF_FAILED=0
 

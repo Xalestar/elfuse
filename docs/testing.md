@@ -13,6 +13,16 @@ Host build requirements:
 - `codesign`
 - GNU `make`
 - GNU `objcopy` or `llvm-objcopy`
+- `bash` 3.2+ (the version Apple ships as `/bin/bash`) is sufficient for
+  the test harness; no Homebrew `bash` is required. See
+  `tests/lib/bash-compat.sh` for the cross-version shims (a portable
+  microsecond clock and the parallel-array lookup pattern that replaces
+  associative arrays). When editing a shell script under `tests/` or
+  `scripts/`, the conventions in that file's header are the source of
+  truth: no `EPOCHREALTIME`, no `declare -A`, no `mapfile`, no
+  `${var^^}` / `${var,,}` case-conversion, and guard any potentially
+  empty array expansion with `${arr[@]+"${arr[@]}"}` so `set -u` does
+  not trip on it.
 
 Guest test builds additionally require:
 

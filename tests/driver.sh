@@ -299,13 +299,16 @@ for i in "${filtered_idx[@]}"; do
 
     read -r -a argv <<< "$cmd_line"
     binary="${argv[0]}"
-    unset 'argv[0]'
     if [[ "$binary" != /* ]]; then
         binary="$TESTDIR_ABS/$binary"
     fi
 
+    # bash 3.2 + set -u rejects "${argv[@]}" after 'unset argv[0]' has
+    # left the array empty ("unbound variable"). The offset form
+    # "${argv[@]:1}" is well-defined to produce zero elements when the
+    # array has only one slot, so it works in every supported bash.
     args=()
-    for arg in "${argv[@]}"; do
+    for arg in "${argv[@]:1}"; do
         arg="${arg//\$TESTDIR/$TESTDIR_ABS}"
         args+=("$arg")
     done
@@ -344,7 +347,10 @@ for i in "${filtered_idx[@]}"; do
     fi
 
     output=""
-    if output=$(timeout "$TIMEOUT" "$ELFUSE" "$binary" "${args[@]}" 2>&1); then
+    # ${args[@]+...} guards the array expansion so a test with no extra
+    # arguments (args=()) does not trip bash 3.2's set -u rejection of
+    # an empty "${array[@]}".
+    if output=$(timeout "$TIMEOUT" "$ELFUSE" "$binary" ${args[@]+"${args[@]}"} 2>&1); then
         rc=0
     else
         rc=$?
