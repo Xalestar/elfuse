@@ -62,8 +62,11 @@ test-signalfd
 test-signalfd-hardening
 test-epoll
 test-epoll-edge
+test-epoll-mt
+test-epoll-aba
 test-timerfd
 test-large-io-boundary
+test-ioctl-cloexec
 
 [section] /proc and /dev emulation tests
 test-proc

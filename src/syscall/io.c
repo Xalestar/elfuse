@@ -1476,6 +1476,33 @@ int64_t sys_pwritev2(guest_t *g,
 
 int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg)
 {
+    /* FIOCLEX/FIONCLEX are the ioctl form of fcntl(F_SETFD): they set/clear the
+     * guest close-on-exec flag, which lives in fd_table linux_flags (not the
+     * host fd's FD_CLOEXEC, which is per-descriptor and would be lost on the
+     * dup that host_fd_ref hands multi-threaded callers, so mirror the F_SETFD
+     * path in sys_fcntl). They need no host fd, so dispatch them before
+     * host_fd_ref_open_regular_io(): that helper rejects O_PATH (FD_PATH) fds
+     * with EBADF, but Linux allows these ioctls -- like fcntl(F_SETFD) -- on
+     * O_PATH descriptors. Validate the slot and mutate the flag in a single
+     * fd_lock section so there is no validate-then-mutate window in which a
+     * concurrent close/reuse could flip CLOEXEC on a different file that took
+     * the slot. The arg is ignored. */
+    if (request == LINUX_FIOCLEX || request == LINUX_FIONCLEX) {
+        if (!RANGE_CHECK(fd, 0, FD_TABLE_SIZE))
+            return -LINUX_EBADF;
+        pthread_mutex_lock(&fd_lock);
+        if (fd_table[fd].type == FD_CLOSED) {
+            pthread_mutex_unlock(&fd_lock);
+            return -LINUX_EBADF;
+        }
+        if (request == LINUX_FIOCLEX)
+            fd_table[fd].linux_flags |= LINUX_O_CLOEXEC;
+        else
+            fd_table[fd].linux_flags &= ~LINUX_O_CLOEXEC;
+        pthread_mutex_unlock(&fd_lock);
+        return 0;
+    }
+
     host_fd_ref_t host_ref;
     int64_t err = host_fd_ref_open_regular_io(fd, &host_ref);
     if (err < 0)
@@ -1686,6 +1713,29 @@ int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg)
         }
         host_fd_ref_close(&host_ref);
         return 0;
+    }
+
+    case LINUX_FIONBIO: {
+        /* Set/clear O_NONBLOCK on the fd. Linux FIONBIO takes an int* arg:
+         * nonzero enables non-blocking, zero disables it. libuv's
+         * uv__nonblock_ioctl() (its default on Linux) issues this on pipe and
+         * socket fds at setup; without it the guest's uv_pipe_open() fails with
+         * ENOTTY and Node's stdio stream construction throws.
+         */
+        int32_t on = 0;
+        if (guest_read_small(g, arg, &on, sizeof(on)) < 0) {
+            host_fd_ref_close(&host_ref);
+            return -LINUX_EFAULT;
+        }
+        int flags = fcntl(host_fd, F_GETFL);
+        if (flags < 0) {
+            host_fd_ref_close(&host_ref);
+            return linux_errno();
+        }
+        flags = on ? (flags | O_NONBLOCK) : (flags & ~O_NONBLOCK);
+        int r = fcntl(host_fd, F_SETFL, flags);
+        host_fd_ref_close(&host_ref);
+        return r < 0 ? linux_errno() : 0;
     }
 
     default:

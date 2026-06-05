@@ -692,14 +692,19 @@ typedef struct {
 
 /* Per-fd registration entry within an epoll instance. */
 typedef struct {
-    uint32_t events;    /* Registered EPOLL* events mask */
-    uint64_t data;      /* User data to return in epoll_wait */
-    bool active;        /* Registered in this instance */
-    bool oneshot_armed; /* EPOLLONESHOT and event already fired,
-                         * waiting for EPOLL_CTL_MOD re-arm.
-                         * kqueue removed the event, so poll emulation prevents
-                         * reporting but allow MOD.
-                         */
+    uint32_t events;     /* Registered EPOLL* events mask */
+    uint64_t data;       /* User data to return in epoll_wait */
+    uint64_t generation; /* fd_entry_t.generation captured at ADD/MOD. Detects a
+                          * close+reopen ABA: if the guest fd's current
+                          * generation no longer matches, the registered open
+                          * file is gone and this stale entry must not drive
+                          * kevent against the reused host fd. */
+    bool active;         /* Registered in this instance */
+    bool oneshot_armed;  /* EPOLLONESHOT and event already fired,
+                          * waiting for EPOLL_CTL_MOD re-arm.
+                          * kqueue removed the event, so poll emulation prevents
+                          * reporting but allow MOD.
+                          */
 } epoll_reg_t;
 
 /* Per-epoll-instance data, stored in fd_table[epfd].dir. Each instance
@@ -781,18 +786,43 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd, uint64_t event_gva)
         return -LINUX_EINVAL;
     }
 
-    host_fd_ref_t target_ref;
-    if (host_fd_ref_open(fd, &target_ref) < 0) {
+    /* Validate the target fd and read its persistent host fd in a single
+     * fd_lock snapshot, so the kqueue knote ident is taken from the same entry
+     * that was validated. A kqueue knote is keyed by the fd number and the
+     * kernel drops it the moment that fd is closed, so the ident must be the
+     * persistent host fd from the fd table -- not the dup that
+     * host_fd_ref_open() hands multi-threaded callers, which
+     * host_fd_ref_close() closes when the syscall returns (silently tearing the
+     * registration down). Snapshotting (rather than host_fd_ref_open() + a
+     * separate fd_to_host()) keeps the validate and the ident read atomic under
+     * one fd_lock. The snapshot's generation then guards the cross-call ABA
+     * below. Result mapping uses udata (the guest fd), so the ident only needs
+     * to stay open and refer to the same open file description. */
+    fd_entry_t target_snap;
+    if (!fd_snapshot(fd, &target_snap)) {
         host_fd_ref_close(&epoll_ref);
         return -LINUX_EBADF;
     }
+    int target_host_fd = target_snap.host_fd;
 
     epoll_reg_t *reg = &inst->regs[fd];
+
+    /* Cross-call ABA guard. If the guest closed this fd and reopened it (or the
+     * slot was reused) since the registration was stamped, the kernel already
+     * dropped the original knote when the old host fd closed, yet the guest fd
+     * number -- and thus reg->active -- still looks live. Acting on it would
+     * EV_DELETE/EV_MOD the wrong knote on the reused host fd. A mismatched
+     * generation means the registration is gone: drop it so DEL/MOD report
+     * ENOENT (matching Linux's auto-removal on close) and ADD starts fresh. */
+    if ((reg->active || reg->oneshot_armed) &&
+        reg->generation != target_snap.generation) {
+        reg->active = false;
+        reg->oneshot_armed = false;
+    }
 
     if (op == LINUX_EPOLL_CTL_DEL) {
         /* Linux returns ENOENT when removing an unregistered fd */
         if (!reg->active) {
-            host_fd_ref_close(&target_ref);
             host_fd_ref_close(&epoll_ref);
             return -LINUX_ENOENT;
         }
@@ -804,12 +834,12 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd, uint64_t event_gva)
         int nchanges = 0;
         {
             if (reg->events & (LINUX_EPOLLIN | LINUX_EPOLLRDHUP)) {
-                EV_SET(&changes[nchanges], target_ref.fd, EVFILT_READ,
+                EV_SET(&changes[nchanges], target_host_fd, EVFILT_READ,
                        EV_DELETE, 0, 0, NULL);
                 nchanges++;
             }
             if (reg->events & LINUX_EPOLLOUT) {
-                EV_SET(&changes[nchanges], target_ref.fd, EVFILT_WRITE,
+                EV_SET(&changes[nchanges], target_host_fd, EVFILT_WRITE,
                        EV_DELETE, 0, 0, NULL);
                 nchanges++;
             }
@@ -819,7 +849,6 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd, uint64_t event_gva)
             /* Clear stale state for potential re-add */
             reg->oneshot_armed = false;
         }
-        host_fd_ref_close(&target_ref);
         host_fd_ref_close(&epoll_ref);
         return 0;
     }
@@ -829,12 +858,10 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd, uint64_t event_gva)
      * (EPOLLONESHOT fired, waiting for re-arm) are still valid for MOD.
      */
     if (op == LINUX_EPOLL_CTL_ADD && reg->active) {
-        host_fd_ref_close(&target_ref);
         host_fd_ref_close(&epoll_ref);
         return -LINUX_EEXIST;
     }
     if (op == LINUX_EPOLL_CTL_MOD && !reg->active && !reg->oneshot_armed) {
-        host_fd_ref_close(&target_ref);
         host_fd_ref_close(&epoll_ref);
         return -LINUX_ENOENT;
     }
@@ -842,7 +869,6 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd, uint64_t event_gva)
     /* ADD or MOD: read the epoll_event from guest */
     linux_epoll_event_t ev;
     if (guest_read_small(g, event_gva, &ev, sizeof(ev)) < 0) {
-        host_fd_ref_close(&target_ref);
         host_fd_ref_close(&epoll_ref);
         return -LINUX_EFAULT;
     }
@@ -860,11 +886,11 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd, uint64_t event_gva)
     if (op == LINUX_EPOLL_CTL_MOD && reg->active) {
         struct kevent del;
         if (reg->events & (LINUX_EPOLLIN | LINUX_EPOLLRDHUP)) {
-            EV_SET(&del, target_ref.fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
+            EV_SET(&del, target_host_fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
             kevent(epoll_ref.fd, &del, 1, NULL, 0, NULL);
         }
         if (reg->events & LINUX_EPOLLOUT) {
-            EV_SET(&del, target_ref.fd, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
+            EV_SET(&del, target_host_fd, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
             kevent(epoll_ref.fd, &del, 1, NULL, 0, NULL);
         }
     }
@@ -894,33 +920,34 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd, uint64_t event_gva)
     void *udata = (void *) (uintptr_t) fd;
 
     if (ev.events & (LINUX_EPOLLIN | LINUX_EPOLLRDHUP)) {
-        EV_SET(&changes[nchanges], target_ref.fd, EVFILT_READ, kflags, 0, 0,
+        EV_SET(&changes[nchanges], target_host_fd, EVFILT_READ, kflags, 0, 0,
                udata);
         nchanges++;
     }
     if (ev.events & LINUX_EPOLLOUT) {
-        EV_SET(&changes[nchanges], target_ref.fd, EVFILT_WRITE, kflags, 0, 0,
+        EV_SET(&changes[nchanges], target_host_fd, EVFILT_WRITE, kflags, 0, 0,
                udata);
         nchanges++;
     }
 
     if (nchanges > 0) {
         if (kevent(epoll_ref.fd, changes, nchanges, NULL, 0, NULL) < 0) {
-            host_fd_ref_close(&target_ref);
             host_fd_ref_close(&epoll_ref);
             return linux_errno();
         }
     }
 
     /* Store registration data in per-instance table.
-     * Clear oneshot_armed when MOD successfully re-arms.
+     * Clear oneshot_armed when MOD successfully re-arms. Stamp the snapshot's
+     * generation so a later close+reopen of this guest fd is detected as a
+     * stale registration by the ABA guard above.
      */
     reg->events = ev.events;
     reg->data = ev.data;
+    reg->generation = target_snap.generation;
     reg->active = true;
     reg->oneshot_armed = false;
 
-    host_fd_ref_close(&target_ref);
     host_fd_ref_close(&epoll_ref);
     return 0;
 }

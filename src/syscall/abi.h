@@ -352,6 +352,9 @@ typedef struct {
 #define LINUX_TIOCSCTTY 0x540E  /* -> macOS TIOCSCTTY (same semantics) */
 #define LINUX_TIOCGWINSZ 0x5413 /* -> macOS TIOCGWINSZ (same struct) */
 #define LINUX_FIONREAD 0x541B   /* -> macOS FIONREAD (same semantics) */
+#define LINUX_FIONBIO 0x5421    /* set/clear O_NONBLOCK (arg: int *) */
+#define LINUX_FIONCLEX 0x5450   /* clear close-on-exec on fd */
+#define LINUX_FIOCLEX 0x5451    /* set close-on-exec on fd */
 #define LINUX_TIOCNOTTY 0x5422  /* -> macOS TIOCNOTTY (same semantics) */
 #define LINUX_TIOCGSID 0x5429   /* -> macOS TIOCGSID (same semantics) */
 /* termios2 variant (adds c_ispeed/c_ospeed) */
@@ -705,7 +708,10 @@ typedef struct {
 typedef struct {
     int type;            /* FD_CLOSED, FD_STDIO, FD_REGULAR, FD_DIR */
     int host_fd;         /* Underlying macOS file descriptor */
-    uint64_t generation; /* Bumped each time this guest fd slot is reused. */
+    uint64_t generation; /* Bumped each time this guest fd slot is reused. Lets
+                          * long-lived references (e.g. epoll registrations)
+                          * detect a close+reopen ABA where the slot now holds a
+                          * different open file. */
     int linux_flags;     /* Linux open flags (for CLOEXEC tracking) */
     void *dir;           /* DIR* for FD_DIR entries (NULL otherwise) */
     char proc_path[FD_VIRTUAL_PATH_MAX]; /* Virtual /proc dir root for *at */
