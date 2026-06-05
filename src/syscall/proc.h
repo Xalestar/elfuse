@@ -126,22 +126,31 @@ const void *proc_get_auxv(size_t *len_out);
 /* Set guest identity (called from fork_child_main). */
 void proc_set_identity(int64_t pid, int64_t ppid);
 
-/* Session / process-group state.
- * Accessors are lock-free (_Atomic); writers are single-threaded
- * (called from startup, fork child init, or setsid/setpgid).
+/* Session / process-group state. Accessors are lock-free (_Atomic); syscall
+ * writers serialize with session_lock.
  */
 int64_t proc_get_sid(void);
 int64_t proc_get_pgid(void);
 int64_t proc_get_fg_pgrp(void);
 
+/* Publish the current pgid/sid pair into the shim cache while holding
+ * session_lock. Use this at cache initialization points so an external
+ * snapshot cannot overwrite a newer setpgid/setsid publish.
+ */
+void proc_publish_pgsid_snapshot(guest_t *g);
+
 /* Restore session/pgid from fork IPC. */
 void proc_set_session(int64_t sid, int64_t pgid);
 
-/* setsid: create new session. Returns SID or -LINUX_EPERM. */
-int64_t proc_sys_setsid(void);
+/* setsid: create new session and publish pgid/sid cache under session_lock.
+ * Returns SID or -LINUX_EPERM.
+ */
+int64_t proc_sys_setsid(guest_t *g);
 
-/* setpgid: set process group. Returns 0 or negative errno. */
-int64_t proc_sys_setpgid(int64_t pid, int64_t pgid);
+/* setpgid: set process group and publish pgid/sid cache under session_lock.
+ * Returns 0 or negative errno.
+ */
+int64_t proc_sys_setpgid(guest_t *g, int64_t pid, int64_t pgid);
 
 /* getsid: query session ID. Returns SID or -LINUX_ESRCH. */
 int64_t proc_sys_getsid(int64_t pid);

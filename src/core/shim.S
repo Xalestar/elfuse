@@ -175,6 +175,79 @@
     .endr
 .endm
 
+/* Counter byte offsets within shim_data. Mirror SHIM_COUNTER_* indices in
+ * src/core/shim-globals.h; the static_asserts in shim-globals.c keep both
+ * sides locked together. Byte offset = SHIM_COUNTERS_OFF + 8 * slot_index.
+ *
+ * SHIM_COUNTERS_OFF is 0x10C8, beyond AArch64's 12-bit add immediate range.
+ * Split it explicitly so COUNTER_INC can fold the carry into one shifted add
+ * and the low half plus the slot offset into the load/store immediate. The
+ * shim-globals.c static_assert pins both halves.
+ */
+.equ SHIM_COUNTERS_OFF_HI,   0x1000
+.equ SHIM_COUNTERS_OFF_LO12, 0xC8
+
+/* Gate byte (uint8) inside the attention/identity padding. Loaded by
+ * COUNTER_INC; zero (the default after shim_globals_init) skips the
+ * counter body so disabled stats pay one cache-hot ldrb instead of a
+ * full load-add-store on the shared counter line. The host publishes
+ * via shim_globals_publish_stats_gate during bring-up.
+ */
+.equ SHIM_STATS_EN_OFF,      0x04
+
+.equ CB_ATTN_BAIL,           0
+.equ CB_URANDOM_FD_OOR,      8
+.equ CB_URANDOM_FD_BMISS,    16
+.equ CB_URANDOM_LEN_ZERO,    24
+.equ CB_URANDOM_LEN_OVER,    32
+.equ CB_URANDOM_RING_LOW,    40
+.equ CB_URANDOM_PROBE_FAIL,  56
+.equ CB_IDENTITY_HIT,        64
+.equ CB_URANDOM_HIT,         72
+.equ CB_GETRANDOM_HIT,       80
+.equ CB_PGSID_HIT,           88
+/* Slot 48 (SHIM_COUNTER_URANDOM_RING_WRAP) deliberately omitted: wrap
+ * is handled inline by urandom_copy_loop, so no assembly path bumps it.
+ * The C-side enum keeps the index for ABI stability.
+ */
+
+/* COUNTER_INC: bump diagnostic counter at byte offset
+ * (SHIM_COUNTERS_OFF_LO12 + \byte_off) from TPIDR_EL1 by 1, only when
+ * the host has published a nonzero stats gate at SHIM_STATS_EN_OFF.
+ *
+ * The gate keeps every fast-path tail from touching the counter cache
+ * line in the common case (ELFUSE_SHIM_STATS unset). Without it, each
+ * getpid / getuid / urandom hit drove a non-atomic load-add-store on
+ * a single shared line, generating multi-vCPU coherence ping-pong on
+ * top of the unconditional five-instruction tax.
+ *
+ * One shifted add carries the SHIM_COUNTERS_OFF_HI (#0x1000) high half;
+ * the ldr/str fold the LO12 + slot-byte offset into the immediate (well
+ * within the imm12*8 = 32760 byte range).
+ *
+ * Non-atomic ldr/add/str. Even with the gate enabled, multi-vCPU
+ * concurrent bails may race and lose a small fraction of counts;
+ * acceptable for diagnostic ratios. The gate-disabled tail expands to
+ * three instructions (mrs + ldrb + cbz); the gate-enabled tail adds
+ * the original five.
+ *
+ * x29/x30 are clobbered. svc_restore_eret's RESTORE_GPRS_KEEP_X0
+ * reloads X1..X30 from the saved frame, so the clobber is safe on any
+ * fast path. The end label uses GAS .L\@ macro-local naming so every
+ * expansion gets a unique symbol -- nested or interleaved macros
+ * cannot collide with a bare numeric label.
+ */
+.macro COUNTER_INC byte_off
+    mrs x29, tpidr_el1
+    ldrb w30, [x29, #SHIM_STATS_EN_OFF]
+    cbz w30, .Lctr_skip_\@
+    add x29, x29, #SHIM_COUNTERS_OFF_HI
+    ldr x30, [x29, #(SHIM_COUNTERS_OFF_LO12 + \byte_off)]
+    add x30, x30, #1
+    str x30, [x29, #(SHIM_COUNTERS_OFF_LO12 + \byte_off)]
+.Lctr_skip_\@:
+.endm
+
 /* BAD_VEC: vector-table entry that reports an unexpected exception.
  * Each table slot is 128 bytes; the leading .align 7 places this entry at the
  * next 128-byte boundary.
@@ -348,30 +421,63 @@ svc_handler:
     b.lo identity_class_fast          /* 172..178 -> identity / gettid */
     cmp x10, #63                       /* SYS_read? */
     b.eq urandom_read_fast
+    cmp x10, #155                      /* SYS_getpgid? */
+    b.eq getpgid_fast
+    cmp x10, #156                      /* SYS_getsid? */
+    b.eq getsid_fast
+    cmp x10, #278                      /* SYS_getrandom? */
+    b.eq getrandom_fast
     b handle_svc_0
 
 identity_class_fast:
     mrs x12, tpidr_el1               /* shim-globals base */
     ldar w13, [x12]                  /* attention flag, acquire */
-    cbnz w13, handle_svc_0           /* slow-path required */
+    cbnz w13, attn_bail              /* slow-path required */
     cmp x11, #6                       /* bias == 6 ==> gettid (178) */
     b.eq gettid_fast
     add x12, x12, #8                 /* skip attention -> identity[0] */
     ldr x0, [x12, x11, lsl #3]       /* identity[bias] for 172..177 */
+    COUNTER_INC CB_IDENTITY_HIT
     b svc_restore_eret
 
 gettid_fast:
     mrs x0, contextidr_el1            /* per-vCPU tid */
+    COUNTER_INC CB_IDENTITY_HIT
     b svc_restore_eret
 
-    /* Urandom-read fast path (Slice D / P3). Serves
-     * read(urandom_fd, buf, len) with len in [1, 64] by popping
-     * len bytes from the shim-globals entropy ring (TPIDR_EL1 base +
-     * 0xC0) into the guest-supplied buffer (X1), advancing the ring
-     * head atomically. If the requested fd is not FD_URANDOM, or
-     * the ring is low, or the read would cross a ring-wrap boundary,
-     * falls through to handle_svc_0 so the host serves the read and
-     * refills the ring.
+/* getpgid_fast / getsid_fast: serve getpgid(0) and getsid(0) from
+ * shim-globals slots. Any non-zero pid argument or set attention bit
+ * falls through to the host so per-pid lookups and post-setpgid/setsid
+ * publish ordering remain authoritative.
+ */
+getpgid_fast:
+    ldr x14, [sp, #0]                /* saved X0 = pid arg */
+    cbnz x14, handle_svc_0           /* pid != 0: not a pure cache read */
+    mrs x12, tpidr_el1
+    ldar w13, [x12]
+    cbnz w13, attn_bail
+    ldr x0, [x12, #0x1148]            /* SHIM_IDENTITY_OFF_PGID */
+    COUNTER_INC CB_PGSID_HIT
+    b svc_restore_eret
+
+getsid_fast:
+    ldr x14, [sp, #0]
+    cbnz x14, handle_svc_0
+    mrs x12, tpidr_el1
+    ldar w13, [x12]
+    cbnz w13, attn_bail
+    ldr x0, [x12, #0x1150]            /* SHIM_IDENTITY_OFF_SID */
+    COUNTER_INC CB_PGSID_HIT
+    b svc_restore_eret
+
+    /* Urandom-read fast path. Serves read(urandom_fd, buf, len) with
+     * len in [1, SHIM_URANDOM_INLINE_LIMIT (256)] by popping len bytes
+     * from the shim-globals entropy ring (TPIDR_EL1 base + 0xC0) into
+     * the guest-supplied buffer (X1), advancing the ring head
+     * atomically. The 4 KiB ring boundary is handled inline via a
+     * split-copy with a one-shot wrap flag. If the requested fd is not
+     * FD_URANDOM or the ring is below the requested fill, falls through
+     * to handle_svc_0 so the host serves the read and refills the ring.
      *
      * Layout offsets (match core/shim-globals.h SHIM_URANDOM_OFF_*):
      *   0x0038  URANDOM_FD_BITMAP   1024 bits = 128 bytes
@@ -383,15 +489,15 @@ gettid_fast:
 urandom_read_fast:
     mrs x12, tpidr_el1
     ldar w13, [x12]                  /* attention flag */
-    cbnz w13, handle_svc_0
+    cbnz w13, attn_bail
 
     ldr x14, [sp, #0]                /* saved X0 = fd */
     cmp x14, #1024                    /* FD_TABLE_SIZE */
-    b.hs handle_svc_0
+    b.hs urandom_fd_oor_bail
     ldr x15, [sp, #16]               /* saved X2 = len */
-    cbz x15, handle_svc_0            /* host handles len == 0 */
-    cmp x15, #64                      /* URANDOM_INLINE_LIMIT */
-    b.hi handle_svc_0
+    cbz x15, urandom_len_zero_bail   /* host handles len == 0 */
+    cmp x15, #256                     /* SHIM_URANDOM_INLINE_LIMIT */
+    b.hi urandom_len_over_bail
 
     /* Bitmap test: word = fd >> 6, bit = fd & 63. */
     add x16, x12, #0x38              /* SHIM_URANDOM_OFF_BITMAP */
@@ -399,7 +505,7 @@ urandom_read_fast:
     ldr x17, [x16, x17, lsl #3]
     and x18, x14, #63
     lsr x17, x17, x18
-    tbz w17, #0, handle_svc_0
+    tbz w17, #0, urandom_fd_bmiss_bail
 
     ldr x20, [sp, #8]                /* saved X1 = buf */
     /* Probe the guest buffer for stage-1 EL0-write translations before
@@ -410,25 +516,40 @@ urandom_read_fast:
      * entry). The DYNAMIC case where a sibling vCPU munmaps the buffer
      * in the window between probe and strb is caught later by the
      * EL1 data abort vector routing into handle_el1_data_abort_recover
-     * (which rolls back the ring head, releases the lock, and returns
-     * -EFAULT). Without that recovery the EL1 strb would fault into
-     * BAD_VEC and halt the VM.
+     * (which discards the reserved entropy, releases the lock, and
+     * returns -EFAULT to EL0; the ring head is not rolled back -- the
+     * already-published bytes are simply skipped on the next read).
+     * Without that recovery the EL1 strb would fault into BAD_VEC and
+     * halt the VM.
      *
-     * len is in [1, 64]. Probing the first and last byte covers every page
-     * the inline copy can touch on Linux/AArch64, whose base page size is
-     * much larger than the inline limit.
+     * len is in [1, SHIM_URANDOM_INLINE_LIMIT=256]. Probing the first
+     * and last byte covers every page the inline copy can touch: even
+     * at the smaller 4 KiB host page size a 256-byte buffer straddles
+     * at most one page boundary, so probe(buf) + probe(buf+len-1) hits
+     * both pages. The second probe is skipped when buf and buf+len-1
+     * fall in the same 4 KiB page -- the dominant case for small
+     * crypto/SSH-handshake reads. Detected via xor + mask.
      */
+    sub x16, x15, #1                 /* len - 1 */
+    adds x17, x20, x16               /* last_byte = buf + len - 1 */
+    b.cs urandom_probe_fail_bail     /* overflow */
     at s1e0w, x20
     isb
     mrs x16, par_el1
-    tbnz x16, #0, urandom_slow_no_clrex
-    sub x16, x15, #1
-    adds x16, x20, x16
-    b.cs urandom_slow_no_clrex
-    at s1e0w, x16
+    tbnz x16, #0, urandom_probe_fail_bail
+    /* Same 4 KiB page? If (buf ^ last_byte) & ~0xFFF == 0, skip the
+     * second probe. eor + tst against the page mask is two scalar ops
+     * and one fused branch; cheaper than the full AT/ISB/MRS sequence
+     * (~5-15 ns).
+     */
+    eor x18, x20, x17
+    tst x18, #~0xFFF
+    b.eq 7f
+    at s1e0w, x17
     isb
     mrs x16, par_el1
-    tbnz x16, #0, urandom_slow_no_clrex
+    tbnz x16, #0, urandom_probe_fail_bail
+7:
 
     /* Serialize host refill against the shim's reserve-then-copy window.
      * Lock word lives after the 4096-byte ring at offset 0x10C0.
@@ -437,13 +558,17 @@ urandom_read_fast:
     add x19, x19, #0xC0              /* &ring_lock */
     mov w18, #1
 urandom_lock_spin:
-    ldaxr w17, [x19]
+    /* LSE swpal: atomic exchange. w17 receives the previous lock value;
+     * w18 (1) is stored unconditionally. If the previous was 0, we
+     * acquired. If it was 1, a sibling holds it; yield and retry.
+     * Apple Silicon implements ARMv8.1 LSE atomics, so swpal is one
+     * instruction (vs the prior ldaxr/stxr exclusive sequence). Release
+     * on unlock stays as stlr wzr, [x19].
+     */
+    swpal w18, w17, [x19]
     cbnz w17, urandom_lock_busy
-    stxr w17, w18, [x19]
-    cbnz w17, urandom_lock_spin
     b urandom_locked
 urandom_lock_busy:
-    clrex
     yield
     b urandom_lock_spin
 
@@ -454,12 +579,12 @@ urandom_locked:
     ldar w24, [x22]                  /* tail (host release-store) */
     sub  w25, w24, w23                /* fill = tail - head */
     cmp  w25, w15
-    b.lo urandom_clrex_slow           /* ring too low */
+    b.lo urandom_ring_low_bail        /* ring too low */
     and  w26, w23, #(4096 - 1)        /* pos = head & (RING_SIZE - 1) */
-    add  w27, w26, w15
-    cmp  w27, #4096
-    b.hi urandom_clrex_slow           /* would wrap: let slow path serve */
-    add  w27, w23, w15                /* new head = head + len */
+    add  w27, w23, w15                /* new head = head + len (wraps via mask
+                                       * at the next read; the copy below
+                                       * splits at the 4 KiB boundary).
+                                       */
     stxr w28, w27, [x21]
     cbnz w28, 0b
 
@@ -477,7 +602,7 @@ urandom_locked:
     mrs x30, spsr_el1
     stp x29, x30, [sp, #-16]!
 
-    /* Copy bytes from ring[pos] to buf. len is in [1, 64].
+    /* Copy bytes from ring[pos] to buf. len is in [1, 256].
      * w26 holds pos in [0, 4096); writing to w26 above zero-extends
      * into x26, so a plain reg add (no extension) is correct.
      */
@@ -486,7 +611,10 @@ urandom_locked:
     cmp  x15, #1
     b.ne urandom_copy_loop
 
-    /* Common case: 1-byte read. Single byte transfer. */
+    /* Common case: 1-byte read. Single byte transfer. 1-byte reads
+     * never wrap (a single byte at pos is always within the ring),
+     * so the split-copy logic in urandom_copy_loop is skipped.
+     */
 .globl urandom_strb_1byte_start
 .globl urandom_strb_1byte_end
 urandom_strb_1byte_start:
@@ -496,45 +624,273 @@ urandom_strb_1byte_end:
     add  sp, sp, #16                 /* pop ELR/SPSR recovery slot */
     mov  x0, #1
     stlr wzr, [x19]                  /* release ring_lock */
+    /* x10 still holds the syscall nr loaded by the svc_handler
+     * dispatcher; none of the urandom/getrandom fast-path body writes
+     * x10, so it remains 63 for read and 278 for getrandom. Use it to
+     * pick the matching hit counter without burning a scratch register.
+     * RESTORE_GPRS_KEEP_X0 reloads x10 from the saved frame.
+     */
+    cmp  x10, #63
+    b.ne 1f
+    COUNTER_INC CB_URANDOM_HIT
+    b svc_restore_eret
+1:  COUNTER_INC CB_GETRANDOM_HIT
     b svc_restore_eret
 
 urandom_copy_loop:
-    /* Byte-wise copy for len in [2, 64]. Unrolling would help but
-     * the slow path is the realistic target for large reads. The
-     * loop runs at most 64 times; total cost is dwarfed by the EL0
-     * entry/exit transitions.
+    /* Bulk + tail copy for len in [2, 256] with split-at-4-KiB wrap
+     * handling.
+     *
+     * Bulk pass moves 16 bytes per ldp/stp on Apple Silicon; tail
+     * peels the remaining 0..15 bytes via tbz on the bits of the
+     * residue. The wrap split runs the same code twice with rebased
+     * dst/src/limit. Unaligned ldp/stp on normal memory is supported
+     * by M-series with minimal penalty (one extra cycle when crossing
+     * a 64-byte cache line); the small penalty is dwarfed by the win
+     * from collapsing the byte loop's ~5 inst/byte into ldp/stp at
+     * 16 bytes/cycle peak.
+     *
+     * handle_el1_data_abort_recover covers a single PC range
+     * (urandom_strb_loop_start..urandom_strb_loop_end) that spans both
+     * the bulk loop and the tail copies, so any sibling-vCPU munmap
+     * mid-copy still routes to the EFAULT recovery path.
      */
-    mov  x29, #0
+    mov  w17, #4096
+    sub  w17, w17, w26                /* w17 = 4096 - pos */
+    cmp  w15, w17
+    csel w17, w15, w17, ls            /* w17 = first segment length */
+    /* Wrap-done flag: 0 on the first segment, set to 1 before re-
+     * entering for the second segment. With len <= 256 and ring size
+     * 4096, exactly one wrap is possible, so the flag guarantees the
+     * loop runs at most twice (vs comparing x17 to x15, which would
+     * infinitely re-wrap once the segment counter is rebased).
+     */
+    mov  w14, #0
+urandom_copy_segment:
+    /* Inputs: x16 = src cursor, x20 = dst cursor, x17 = segment bytes.
+     * ldp/stp lack a register-offset form, so we use post-incremented
+     * addressing. x16 and x20 advance through the segment; the wrap
+     * rebase below recomputes x16 (ring base) and lets x20 keep its
+     * post-increment position (exactly where segment 2 must start
+     * writing).
+     */
+    cmp  x17, #16
+    b.lo urandom_copy_tail_entry      /* < 16 bytes -> tail only */
+    and  x28, x17, #~15               /* bulk byte count = w17 & ~15 */
+    add  x28, x16, x28                /* bulk_end = src + bulk_count */
 .globl urandom_strb_loop_start
 .globl urandom_strb_loop_end
 urandom_strb_loop_start:
-1:  ldrb w0, [x16, x29]
-    strb w0, [x20, x29]
-    add  x29, x29, #1
-    cmp  x29, x15
-    b.ne 1b
+1:  ldp  x9, x11, [x16], #16
+    stp  x9, x11, [x20], #16
+    cmp  x16, x28
+    b.lo 1b
+urandom_copy_tail_entry:
+    and  x27, x17, #15                /* tail = segment_len % 16 */
+    cbz  x27, urandom_copy_segment_done
+    tbz  w27, #3, 2f                  /* 8-byte chunk */
+    ldr  x9, [x16], #8
+    str  x9, [x20], #8
+2:  tbz  w27, #2, 3f                  /* 4-byte chunk */
+    ldr  w9, [x16], #4
+    str  w9, [x20], #4
+3:  tbz  w27, #1, 4f                  /* 2-byte chunk */
+    ldrh w9, [x16], #2
+    strh w9, [x20], #2
+4:  tbz  w27, #0, urandom_copy_segment_done
+    ldrb w9, [x16], #1
+    strb w9, [x20], #1
 urandom_strb_loop_end:
+urandom_copy_segment_done:
+    cbnz w14, urandom_loop_done       /* second segment already ran */
+    cmp  x17, x15                     /* first_copy_len == total? */
+    b.eq urandom_loop_done            /* yes: no wrap needed */
+    /* Wrap rebase: src goes back to ring base; dst is already at
+     * (original buf + first_len) thanks to post-increment, so no
+     * rebase needed there. Segment limit becomes the remaining count.
+     */
+    mov  w14, #1
+    add  x16, x12, #0xC0              /* ring base = tpidr_el1 + 0xC0 */
+    sub  x17, x15, x17                /* loop limit = remaining */
+    b    urandom_copy_segment
+urandom_loop_done:
     add  sp, sp, #16                 /* pop ELR/SPSR recovery slot */
     mov  x0, x15
     stlr wzr, [x19]                  /* release ring_lock */
+    cmp  x10, #63
+    b.ne 1f
+    COUNTER_INC CB_URANDOM_HIT
+    b svc_restore_eret
+1:  COUNTER_INC CB_GETRANDOM_HIT
     b svc_restore_eret
 
-urandom_clrex_slow:
-    /* LDXR opened an exclusive monitor that the slow path will not
-     * release on its own. CLREX drops the monitor so subsequent
-     * LDXR/STXR sequences (including this shim's own next entry)
-     * are not poisoned. Release ring_lock before handing the read to
-     * the host; the host may need the same lock to refill the ring.
+/* Named bail labels: branch targets for every fast-path exit that gives
+ * up. Each increments the matching diagnostic counter and routes into
+ * the right slow-path predecessor: probe failures jump into the no-
+ * clrex tail (no exclusive monitor was opened); ring_low jumps into
+ * the clrex tail (the LDXR opened a monitor and the lock is held).
+ * Ring wrap is no longer a bail reason now that urandom_copy_loop
+ * splits the byte copy at the 4 KiB boundary inline.
+ *
+ * attn_bail is shared by identity/pgsid/urandom/getrandom because the
+ * ATTN check predates any path-specific state setup; routing every
+ * attention-set fast path through the same CB_ATTN_BAIL counter and
+ * the same handle_svc_0 branch keeps the bail cluster compact.
+ */
+attn_bail:
+    COUNTER_INC CB_ATTN_BAIL
+    b handle_svc_0
+urandom_fd_oor_bail:
+    COUNTER_INC CB_URANDOM_FD_OOR
+    b handle_svc_0
+urandom_fd_bmiss_bail:
+    COUNTER_INC CB_URANDOM_FD_BMISS
+    b handle_svc_0
+urandom_len_zero_bail:
+    COUNTER_INC CB_URANDOM_LEN_ZERO
+    b handle_svc_0
+urandom_len_over_bail:
+    COUNTER_INC CB_URANDOM_LEN_OVER
+    b handle_svc_0
+urandom_probe_fail_bail:
+    COUNTER_INC CB_URANDOM_PROBE_FAIL
+    b urandom_slow_no_clrex
+urandom_ring_low_bail:
+    /* Release the spinlock and clear the exclusive monitor BEFORE the
+     * stats-mode counter bump. Otherwise a sibling vCPU waiting on the
+     * lock pays for this vCPU's counter cache-line ping-pong while it
+     * spins -- the counter write lands on a line the sibling does not
+     * need but the lock holder does not release until after the bump.
+     * Bailing through urandom_clrex_slow only clears the monitor and
+     * drops the lock; it does no further work that depends on the
+     * counter slot, so hoisting the unlock above COUNTER_INC is safe.
      */
     clrex
     stlr wzr, [x19]                  /* release ring_lock */
+    COUNTER_INC CB_URANDOM_RING_LOW
+    b handle_svc_0
+    /* SHIM_COUNTER_URANDOM_RING_WRAP (C-side index 6) has no assembly
+     * binding now that urandom_copy_loop splits the byte copy at the
+     * 4 KiB ring boundary inline. The slot stays in the C enum for
+     * ABI stability; a non-zero dump reading flags a regression that
+     * re-introduced a wrap bail.
+     */
 
 urandom_slow_no_clrex:
-    /* Reached on probe failure (no exclusive monitor open yet) or
-     * via the above clrex path. Both route into handle_svc_0 which
-     * runs the regular HVC #5 sys_read. The host then returns
-     * -EFAULT for the bad pointer or fulfills the read normally.
+    /* Probe-failure bails land here with no exclusive monitor open and
+     * no lock held; route into handle_svc_0 so the host's HVC #5
+     * sys_read either returns -EFAULT for the bad pointer or fulfills
+     * the read normally. The post-lock ring_low bails handle their own
+     * clrex + unlock inline so the stats counter bump stays outside the
+     * spinlock critical section; they branch straight to handle_svc_0.
      */
+    b handle_svc_0
+
+/* getrandom_fast: serve getrandom(buf, len, flags) with len in
+ * [1, SHIM_URANDOM_INLINE_LIMIT (256)] and flags in {0, GRND_NONBLOCK
+ * (0x1)} by reusing the same urandom ring as the /dev/urandom fast
+ * path. Shares the copy + ring epilogue at urandom_strb_1byte_start
+ * and urandom_copy_loop (including the 4 KiB wrap split); the success
+ * path discriminates GETRANDOM_HIT vs URANDOM_HIT off the syscall
+ * number left in x10 by the dispatcher. Any other flag bit set
+ * (GRND_RANDOM, GRND_INSECURE, conflicting combinations, or any
+ * future kernel flag) falls through to sys_getrandom so the host
+ * preserves the full Linux contract.
+ */
+getrandom_fast:
+    mrs x12, tpidr_el1
+    ldar w13, [x12]
+    cbnz w13, attn_bail
+
+    ldr x15, [sp, #8]                /* saved X1 = len */
+    cbz x15, getrandom_len_zero_bail
+    cmp x15, #256                     /* SHIM_URANDOM_INLINE_LIMIT */
+    b.hi getrandom_len_over_bail
+
+    ldr x16, [sp, #16]               /* saved X2 = flags */
+    /* Accept flags == 0 and flags == GRND_NONBLOCK (0x1); both behave
+     * identically against our arc4random-backed ring (always non-
+     * blocking, always seeded). Any other bit set -- GRND_RANDOM (0x2),
+     * GRND_INSECURE (0x4), the invalid combination of the two, or any
+     * future kernel flag -- falls through to sys_getrandom so the host
+     * preserves the full Linux contract (EINVAL on conflict, etc.).
+     */
+    cmp x16, #1
+    b.hi handle_svc_0
+
+    ldr x20, [sp, #0]                /* saved X0 = buf */
+    /* See urandom_read_fast for the probe rationale; same shape, with
+     * the single-page skip path so single-page reads pay only one AT.
+     */
+    sub x16, x15, #1
+    adds x17, x20, x16
+    b.cs getrandom_probe_fail_bail
+    at s1e0w, x20
+    isb
+    mrs x16, par_el1
+    tbnz x16, #0, getrandom_probe_fail_bail
+    eor x18, x20, x17
+    tst x18, #~0xFFF
+    b.eq 7f
+    at s1e0w, x17
+    isb
+    mrs x16, par_el1
+    tbnz x16, #0, getrandom_probe_fail_bail
+7:
+
+    add x19, x12, #0x1, lsl #12
+    add x19, x19, #0xC0              /* &ring_lock */
+    mov w18, #1
+getrandom_lock_spin:
+    swpal w18, w17, [x19]            /* see urandom_lock_spin notes */
+    cbnz w17, getrandom_lock_busy
+    b getrandom_locked
+getrandom_lock_busy:
+    yield
+    b getrandom_lock_spin
+
+getrandom_locked:
+    add x21, x12, #0xB8
+    add x22, x12, #0xBC
+0:  ldxr w23, [x21]
+    ldar w24, [x22]
+    sub  w25, w24, w23
+    cmp  w25, w15
+    b.lo getrandom_ring_low_bail
+    and  w26, w23, #(4096 - 1)
+    add  w27, w23, w15                /* new head = head + len; wrap handled
+                                       * inline by the shared copy epilogue.
+                                       */
+    stxr w28, w27, [x21]
+    cbnz w28, 0b
+
+    mrs x29, elr_el1
+    mrs x30, spsr_el1
+    stp x29, x30, [sp, #-16]!
+
+    add  x16, x12, #0xC0
+    add  x16, x16, x26
+    cmp  x15, #1
+    b.eq urandom_strb_1byte_start
+    b urandom_copy_loop
+
+getrandom_len_zero_bail:
+    COUNTER_INC CB_URANDOM_LEN_ZERO
+    b handle_svc_0
+getrandom_len_over_bail:
+    COUNTER_INC CB_URANDOM_LEN_OVER
+    b handle_svc_0
+getrandom_probe_fail_bail:
+    COUNTER_INC CB_URANDOM_PROBE_FAIL
+    b urandom_slow_no_clrex
+getrandom_ring_low_bail:
+    /* Same hoist as urandom_ring_low_bail: drop the lock + clrex first
+     * so the counter ping-pong in stats-enabled mode stays outside the
+     * spinlock critical section.
+     */
+    clrex
+    stlr wzr, [x19]                  /* release ring_lock */
+    COUNTER_INC CB_URANDOM_RING_LOW
     b handle_svc_0
 
 not_svc:

@@ -9,6 +9,7 @@
 #include <pthread.h>
 
 #include "syscall/abi.h"
+#include "core/shim-globals.h"
 #include "syscall/proc-identity.h"
 #include "syscall/proc.h"
 
@@ -210,6 +211,18 @@ int64_t proc_get_pgid(void)
     return guest_pgid;
 }
 
+static void proc_publish_pgsid_locked(guest_t *g)
+{
+    shim_globals_publish_pgsid(g, guest_pgid, guest_sid);
+}
+
+void proc_publish_pgsid_snapshot(guest_t *g)
+{
+    pthread_mutex_lock(&session_lock);
+    proc_publish_pgsid_locked(g);
+    pthread_mutex_unlock(&session_lock);
+}
+
 int64_t proc_get_fg_pgrp(void)
 {
     return guest_fg_pgrp;
@@ -232,7 +245,7 @@ void proc_set_ctty(int has_ctty)
     guest_has_ctty = has_ctty;
 }
 
-int64_t proc_sys_setsid(void)
+int64_t proc_sys_setsid(guest_t *g)
 {
     int64_t pid = guest_pid;
 
@@ -246,11 +259,12 @@ int64_t proc_sys_setsid(void)
     guest_pgid = pid;
     guest_fg_pgrp = pid;
     guest_has_ctty = 0;
+    proc_publish_pgsid_locked(g);
     pthread_mutex_unlock(&session_lock);
     return pid;
 }
 
-int64_t proc_sys_setpgid(int64_t pid, int64_t pgid)
+int64_t proc_sys_setpgid(guest_t *g, int64_t pid, int64_t pgid)
 {
     int64_t self = guest_pid;
 
@@ -268,6 +282,7 @@ int64_t proc_sys_setpgid(int64_t pid, int64_t pgid)
     }
 
     guest_pgid = pgid;
+    proc_publish_pgsid_locked(g);
     pthread_mutex_unlock(&session_lock);
     return 0;
 }

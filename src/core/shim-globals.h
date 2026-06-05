@@ -61,6 +61,23 @@
  */
 #define SHIM_GLOBALS_OFF_ATTN 0x00
 
+/* Stats gate: single byte at offset 0x04 (inside the natural 4-byte pad
+ * between the uint32 attention flag and the 8-byte-aligned identity
+ * slots at 0x08). Nonzero enables the COUNTER_INC body in the EL1 shim;
+ * zero (the default) makes COUNTER_INC a single ldrb + cbz so disabled
+ * stats cost one cache-hot byte load instead of the full
+ * load-add-store-to-shared-counter-line that was paid on every fast
+ * path before. The byte lives in the same 64-byte cache line as the
+ * attention flag, so the gate load piggybacks on the line the shim's
+ * LDAR already pulls into L1 -- no extra coherence traffic in the
+ * common case.
+ *
+ * Plain release-store on publish: the gate is read once per fast-path
+ * tail with relaxed semantics, and we accept a window after env-var
+ * resolution where an in-flight syscall still sees the old value.
+ */
+#define SHIM_GLOBALS_OFF_STATS_EN 0x04
+
 /* Attention is a bitmask, not a boolean. Splitting it by owner lets the
  * HVC #5 epilogue's recompute (which polls signal/itimer state) coexist
  * with the cred-publish bracket without clobbering it. The shim still
@@ -128,7 +145,63 @@
 #define SHIM_URANDOM_RING_SIZE 4096
 #define SHIM_URANDOM_OFF_RING_LOCK 0x10C0
 
-#define SHIM_GLOBALS_SIZE 0x10C4
+/* Upper bound on the per-call byte count served by the shim's
+ * urandom/getrandom fast paths. The probe coverage assumes the buffer
+ * spans at most two host pages so a first+last byte AT probe suffices;
+ * 256 fits comfortably within both 4 KiB and 16 KiB page sizes. The
+ * shim itself hardcodes the literal; a static_assert in shim-globals.c
+ * pins the C macro to the assembly. Ring wraps are handled inline by
+ * splitting the byte copy at the 4 KiB boundary, so this cap is bounded
+ * only by probe coverage and per-call ring-fill cost (256 keeps the
+ * 4 KiB ring serviceable for 16 sequential reads before host refill).
+ */
+#define SHIM_URANDOM_INLINE_LIMIT 256
+
+/* Fast-path hit / miss counters.
+ *
+ * 16 uint64 slots placed after the urandom ring lock. The shim's
+ * identity_class_fast and urandom_read_fast paths bump the relevant
+ * slot on every entry and at every bail point so the host can attribute
+ * fast-path activity instead of guessing. Counters are non-atomic plain
+ * load-add-store -- under multi-vCPU concurrent bails a small fraction
+ * of increments race and are lost, which is acceptable for diagnostic
+ * ratios. Slots 0..7 cover the eight bail reasons the shim distinguishes
+ * (sticky attention, fd out of range, fd not in urandom bitmap, len zero,
+ * len over inline cap, ring fill below request, ring wrap, EL0 buffer
+ * probe failure). Slots 8..11 record fast-path hits so bail rates can be
+ * computed against a hit denominator. Slots 12..15 are reserved.
+ *
+ * The shim hardcodes the byte offset of each slot; the static_asserts
+ * in shim-globals.c keep the C-side macros and the assembly in sync.
+ */
+#define SHIM_COUNTERS_OFF 0x10C8
+#define SHIM_COUNTERS_N 16
+
+#define SHIM_COUNTER_ATTN_BAIL 0
+#define SHIM_COUNTER_URANDOM_FD_OOR 1
+#define SHIM_COUNTER_URANDOM_FD_BMISS 2
+#define SHIM_COUNTER_URANDOM_LEN_ZERO 3
+#define SHIM_COUNTER_URANDOM_LEN_OVER 4
+#define SHIM_COUNTER_URANDOM_RING_LOW 5
+#define SHIM_COUNTER_URANDOM_RING_WRAP 6
+#define SHIM_COUNTER_URANDOM_PROBE_FAIL 7
+#define SHIM_COUNTER_IDENTITY_HIT 8
+#define SHIM_COUNTER_URANDOM_HIT 9
+#define SHIM_COUNTER_GETRANDOM_HIT 10
+#define SHIM_COUNTER_PGSID_HIT 11
+
+/* Extended identity slots: pgid and sid.
+ *
+ * getpgid(0) and getsid(0) are pure cache reads when the argument is
+ * zero; the shim serves them out of these slots whenever X0 == 0 and
+ * the syscall number matches. The host re-publishes after setpgid /
+ * setsid / exec / fork so the slots match guest_pgid / guest_sid in
+ * proc-identity.c.
+ */
+#define SHIM_IDENTITY_OFF_PGID 0x1148
+#define SHIM_IDENTITY_OFF_SID 0x1150
+
+#define SHIM_GLOBALS_SIZE 0x1158
 
 /* Initialize the cache region to all-zero. Called once per process at
  * the same time the shim_data block is set up (initial bootstrap and
@@ -157,6 +230,21 @@ void shim_globals_publish_creds(guest_t *g,
                                 uint32_t euid,
                                 uint32_t gid,
                                 uint32_t egid);
+
+/* Publish pgid + sid so the shim's getpgid(0) / getsid(0) inline service
+ * sees the current session/process-group state. Call from process init,
+ * fork-child receive, exec, setsid, and setpgid. Slot writes are
+ * independent 64-bit atomic release stores.
+ *
+ * No attention bit guards this publish: setpgid / setsid are infrequent
+ * and the model accepts a brief window in which a concurrent
+ * getpgid(0) / getsid(0) on a sibling vCPU observes the pre-publish
+ * value (consistent with Linux's lockless session lookups). Session
+ * mutators and cache-initialization callers publish through proc-identity
+ * while holding session_lock, so successful setpgid / setsid calls cannot
+ * overwrite the cache out of order.
+ */
+void shim_globals_publish_pgsid(guest_t *g, int64_t pgid, int64_t sid);
 
 /* GVA of the cache base. Equal to g->shim_data_base. Exposed so the
  * TPIDR_EL1 setup site and tests can reference one source of truth.
@@ -306,3 +394,31 @@ void shim_globals_rebuild_urandom_bitmap(void);
  * forced through the host SVC.
  */
 void shim_globals_refill_urandom_ring(guest_t *g);
+
+/* Counter access for diagnostics. shim_globals_counter_get returns the
+ * cumulative slot value (lossy under multi-vCPU bail contention; see the
+ * comment block on SHIM_COUNTERS_OFF). slot must be in [0, SHIM_COUNTERS_N).
+ * shim_globals_counters_dump writes a one-line-per-slot summary to out
+ * with the SHIM_COUNTER_* names and current values; intended for use at
+ * process exit when ELFUSE_SHIM_STATS is set.
+ */
+uint64_t shim_globals_counter_get(const guest_t *g, unsigned slot);
+void shim_globals_counters_dump(const guest_t *g);
+
+/* ELFUSE_SHIM_STATS env-var gate (idempotent / cached). When enabled the
+ * exit path dumps the counter table to stderr so a single bench run
+ * attributes every fast-path bail without rebuilds. Mirrors the
+ * ELFUSE_STARTUP_TRACE pattern in core/startup-trace.h.
+ */
+bool shim_globals_stats_enabled(void);
+
+/* Publish the stats gate byte at SHIM_GLOBALS_OFF_STATS_EN based on
+ * shim_globals_stats_enabled(). The EL1 shim's COUNTER_INC loads this
+ * byte and skips the counter increment when zero, so an unset
+ * ELFUSE_SHIM_STATS pays only a single cache-hot ldrb on each fast-path
+ * tail instead of a full load-add-store on a shared counter line.
+ * Call after every shim_globals_init: bootstrap, fork-child receive,
+ * and execve. The byte stays zero on a fresh shim_globals_init unless
+ * this publisher runs.
+ */
+void shim_globals_publish_stats_gate(guest_t *g);

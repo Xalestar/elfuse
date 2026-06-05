@@ -23,6 +23,7 @@
 
 #include "utils.h"
 
+#include "core/shim-globals.h"
 #include "syscall/abi.h"
 #include "syscall/internal.h"
 #include "syscall/proc.h"
@@ -221,6 +222,7 @@ int64_t sys_getrandom(guest_t *g,
         offset += chunk;
     }
 
+    shim_globals_refill_urandom_ring(g);
     return (int64_t) buflen;
 }
 

@@ -705,10 +705,12 @@ int guest_bootstrap_create_vcpu(guest_t *g,
      * identity.
      */
     shim_globals_init(g);
+    shim_globals_publish_stats_gate(g);
     shim_globals_set_trace_enabled(g, verbose);
     shim_globals_publish_pid(g, proc_get_pid(), proc_get_ppid());
     shim_globals_publish_creds(g, proc_get_uid(), proc_get_euid(),
                                proc_get_gid(), proc_get_egid());
+    proc_publish_pgsid_snapshot(g);
     /* Pre-fill the entropy ring so the first read(/dev/urandom) from the guest
      * is served by the shim fast path with no cold-start HVC for refill.
      */

@@ -30,6 +30,7 @@
 #include "core/bootstrap.h"
 #include "core/guest.h"
 #include "core/rosetta.h"
+#include "core/shim-globals.h"
 #include "core/sysroot.h"
 
 #include "runtime/forkipc.h"
@@ -506,6 +507,14 @@ int main(int argc, char **argv)
 
     /* Tear down debugger state before freeing guest/vCPU resources. */
     gdb_stub_shutdown();
+
+    /* Diagnostic counter dump runs before guest_destroy so the shim_data
+     * mapping is still valid. ELFUSE_SHIM_STATS is the gate; an unset
+     * variable produces no output.
+     */
+    if (shim_globals_stats_enabled())
+        shim_globals_counters_dump(&g);
+
     cleanup_main_resources(&g, guest_initialized, &sysroot_mount,
                            have_host_cwd ? host_cwd : NULL, guest_argv,
                            guest_argc, elf_path, sysroot_path);

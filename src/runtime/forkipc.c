@@ -357,9 +357,17 @@ int fork_child_main(int ipc_fd,
      * the bootstrap uses.
      */
     shim_globals_init(&g);
+    shim_globals_publish_stats_gate(&g);
     shim_globals_set_trace_enabled(&g, verbose);
     shim_globals_publish_pid(&g, hdr.child_pid, hdr.parent_pid);
     shim_globals_publish_creds(&g, hdr.uid, hdr.euid, hdr.gid, hdr.egid);
+    /* proc_set_session above committed hdr.pgid/sid into proc-identity;
+     * mirror into the shim cache so the child's getpgid(0)/getsid(0)
+     * fast paths see the inherited session state from the first syscall.
+     * Publish via proc-identity to keep parity with the syscall-time
+     * session_lock ordering even though no sibling vCPU exists at this point.
+     */
+    proc_publish_pgsid_snapshot(&g);
     /* Fresh entropy for the child. Linux's vDSO getrandom epoch-bumps
      * across fork; here we just re-fill the ring from arc4random_buf
      * which seeds from the host kernel's RNG, so parent and child do

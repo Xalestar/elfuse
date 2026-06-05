@@ -72,6 +72,7 @@ static void exec_republish_shim_globals_or_die(hv_vcpu_t vcpu,
      * cache state after exec.
      */
     shim_globals_init(g);
+    shim_globals_publish_stats_gate(g);
     shim_globals_set_trace_enabled(g, verbose);
 
     /* TPIDR_EL1 carries the shim_globals base. Past PNR, failure leaves the
@@ -88,6 +89,7 @@ static void exec_republish_shim_globals_or_die(hv_vcpu_t vcpu,
     shim_globals_publish_pid(g, proc_get_pid(), proc_get_ppid());
     shim_globals_publish_creds(g, proc_get_uid(), proc_get_euid(),
                                proc_get_gid(), proc_get_egid());
+    proc_publish_pgsid_snapshot(g);
     shim_globals_rebuild_urandom_bitmap();
     shim_globals_refill_urandom_ring(g);
     shim_globals_recompute_attention(g);

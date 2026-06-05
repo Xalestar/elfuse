@@ -52,6 +52,7 @@ test-shim-verbose-trace
 test-shim-data-el1
 test-shim-urandom-smp
 test-shim-urandom-toctou
+test-shim-urandom-wrap
 test-poll                      # diff=skip
 
 [section] I/O subsystem tests
