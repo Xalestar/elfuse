@@ -42,6 +42,7 @@ test-socket
 
 [section] Syscall coverage tests
 test-file-ops
+test-flock
 test-sysinfo
 test-io-opt
 test-syscall-smoke

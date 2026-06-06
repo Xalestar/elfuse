@@ -768,11 +768,33 @@ int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg)
         memcpy(&l_start, lflock + 8, 8); /* offset 8 due to padding */
         memcpy(&l_len, lflock + 16, 8);
 
+        /* l_type constants differ between Linux and macOS/BSD:
+         *   Linux: F_RDLCK=0, F_WRLCK=1, F_UNLCK=2
+         *   macOS: F_RDLCK=1, F_UNLCK=2, F_WRLCK=3
+         * Passing the Linux value straight through makes a Linux F_RDLCK (0)
+         * an invalid type on macOS, which fcntl() rejects with EINVAL. This is
+         * the lock POSIX databases (e.g. SQLite) take first, so it must map. */
+        short mac_type;
+        switch (l_type) {
+        case 0: /* LINUX_F_RDLCK */
+            mac_type = F_RDLCK;
+            break;
+        case 1: /* LINUX_F_WRLCK */
+            mac_type = F_WRLCK;
+            break;
+        case 2: /* LINUX_F_UNLCK */
+            mac_type = F_UNLCK;
+            break;
+        default:
+            host_fd_ref_close(&host_ref);
+            return -LINUX_EINVAL;
+        }
+
         struct flock mac_fl = {
             .l_start = l_start,
             .l_len = l_len,
             .l_pid = 0,
-            .l_type = l_type, /* F_RDLCK=0, F_WRLCK=1, F_UNLCK=2 same on both */
+            .l_type = mac_type,
             .l_whence = l_whence, /* SEEK_SET=0, SEEK_CUR=1, SEEK_END=2 same */
         };
 
@@ -784,7 +806,20 @@ int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg)
 
         /* For F_GETLK, write back the result */
         if (cmd == 5) {
-            int16_t rt = mac_fl.l_type, rw = mac_fl.l_whence;
+            /* Map macOS l_type back to Linux constants (see above). */
+            int16_t rt;
+            switch (mac_fl.l_type) {
+            case F_RDLCK:
+                rt = 0; /* LINUX_F_RDLCK */
+                break;
+            case F_WRLCK:
+                rt = 1; /* LINUX_F_WRLCK */
+                break;
+            default:
+                rt = 2; /* LINUX_F_UNLCK */
+                break;
+            }
+            int16_t rw = mac_fl.l_whence;
             int64_t rs = mac_fl.l_start, rl = mac_fl.l_len;
             int32_t rp = mac_fl.l_pid;
             memset(lflock, 0, sizeof(lflock));
