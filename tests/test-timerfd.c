@@ -16,6 +16,7 @@
 #include <unistd.h>
 #include <time.h>
 #include <poll.h>
+#include <fcntl.h>
 #include <sys/timerfd.h>
 
 #include "test-harness.h"
@@ -179,6 +180,70 @@ int main(void)
             ssize_t r = read(fd, &count, sizeof(count));
             EXPECT_TRUE(r == -1 && errno == EAGAIN,
                         "non-blocking read did not return EAGAIN");
+            close(fd);
+        } else
+            FAIL("timerfd_create");
+    }
+
+    /* fcntl coherence: F_GETFL must surface O_RDWR plus the writable bits
+     * Linux honors on a timerfd (O_APPEND, O_NONBLOCK, O_NOATIME).
+     * F_SETFL persists the writable bits and silently drops everything
+     * else; O_DIRECT returns EINVAL.
+     */
+    TEST("fcntl F_GETFL/F_SETFL match Linux setfl semantics");
+    {
+        int fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
+        if (fd >= 0) {
+            int fl = fcntl(fd, F_GETFL);
+            EXPECT_TRUE(
+                fl >= 0 && (fl & O_NONBLOCK) && (fl & O_ACCMODE) == O_RDWR,
+                "F_GETFL did not surface O_RDWR | O_NONBLOCK");
+
+            /* Stray O_CLOEXEC and O_WRONLY must not land in the shadow. */
+            EXPECT_TRUE(
+                fcntl(fd, F_SETFL,
+                      O_APPEND | O_NONBLOCK | O_WRONLY | O_CLOEXEC) == 0,
+                "F_SETFL accepted-plus-stray bits failed");
+            fl = fcntl(fd, F_GETFL);
+            EXPECT_TRUE(fl >= 0 && (fl & O_APPEND) && (fl & O_NONBLOCK) &&
+                            (fl & O_ACCMODE) == O_RDWR && !(fl & O_CLOEXEC),
+                        "F_GETFL leaked stray F_SETFL bits");
+
+            errno = 0;
+            EXPECT_TRUE(
+                fcntl(fd, F_SETFL, fl | O_DIRECT) == -1 && errno == EINVAL,
+                "F_SETFL accepted unsupported O_DIRECT");
+
+            /* Round-trip O_NOATIME. */
+            EXPECT_TRUE(fcntl(fd, F_SETFL, O_NOATIME) == 0,
+                        "F_SETFL O_NOATIME failed");
+            fl = fcntl(fd, F_GETFL);
+            EXPECT_TRUE(fl >= 0 && (fl & O_NOATIME),
+                        "F_GETFL did not surface O_NOATIME");
+            close(fd);
+        } else
+            FAIL("timerfd_create");
+    }
+
+    /* dup must carry the linux_flags shadow's NONBLOCK bit through; without
+     * the preserved-mask fix the new fd's F_GETFL would report blocking.
+     * (The timerfd slot table is keyed by guest_fd with no alias support,
+     * so read/settime through the dup return EBADF -- that pre-existing
+     * limitation is outside #82's scope.)
+     */
+    TEST("dup preserves O_NONBLOCK and O_RDWR in linux_flags");
+    {
+        int fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
+        if (fd >= 0) {
+            int dfd = dup(fd);
+            EXPECT_TRUE(dfd >= 0, "dup failed");
+            if (dfd >= 0) {
+                int fl = fcntl(dfd, F_GETFL);
+                EXPECT_TRUE(
+                    fl >= 0 && (fl & O_NONBLOCK) && (fl & O_ACCMODE) == O_RDWR,
+                    "dup lost O_NONBLOCK or O_RDWR");
+                close(dfd);
+            }
             close(fd);
         } else
             FAIL("timerfd_create");

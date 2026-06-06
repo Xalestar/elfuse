@@ -501,10 +501,15 @@ static bool install_fd_alias_metadata_atomic(int dst_fd,
                                              int linux_flags,
                                              DIR *dir)
 {
+    /* LINUX_O_NONBLOCK is a file-status flag preserved by dup(2)/dup2(2).
+     * Required for FD_TIMERFD (and any other type that stores NONBLOCK in
+     * linux_flags rather than on the host fd) so a duplicated non-blocking
+     * timerfd does not silently turn blocking.
+     */
     int preserved_flags =
         src_snap->linux_flags &
         (LINUX_O_ACCMODE | LINUX_O_PATH | LINUX_O_DIRECTORY | LINUX_O_NOFOLLOW |
-         LINUX_O_DIRECT | LINUX_O_LARGEFILE);
+         LINUX_O_DIRECT | LINUX_O_LARGEFILE | LINUX_O_NONBLOCK);
     int final_flags = preserved_flags | linux_flags;
 
     bool installed = false;
@@ -701,6 +706,16 @@ int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg)
     case 3: { /* F_GETFL */
         if (fuse_fd)
             return fd_table[fd].linux_flags;
+        /* Linux timerfd F_GETFL reports O_RDWR plus the writable status bits
+         * the kernel honors. Surface only those bits from the shadow rather
+         * than echoing arbitrary linux_flags bits so stray F_SETFL args
+         * cannot leak through here. O_ASYNC stays off because timerfd_fops
+         * lacks ->fasync, so generic_setfl drops it.
+         */
+        if (fd_type == FD_TIMERFD)
+            return LINUX_O_RDWR |
+                   (fd_table[fd].linux_flags &
+                    (LINUX_O_APPEND | LINUX_O_NONBLOCK | LINUX_O_NOATIME));
         fd_entry_t snap;
         if (!fd_snapshot(fd, &snap))
             return -LINUX_EBADF;
@@ -732,6 +747,26 @@ int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg)
                 ((int) arg &
                  ~(LINUX_O_CLOEXEC | LINUX_O_PATH | LINUX_O_DIRECTORY |
                    LINUX_O_NOFOLLOW | LINUX_O_DIRECT | LINUX_O_LARGEFILE));
+            return 0;
+        }
+        /* Timerfd: kqueue host fd rejects fcntl(F_SETFL), so mirror Linux's
+         * file-status word in the linux_flags shadow. Of Linux's writable
+         * status flags (O_APPEND, O_ASYNC, O_DIRECT, O_NOATIME, O_NONBLOCK)
+         * the timerfd kernel object honors O_APPEND, O_NONBLOCK, and
+         * O_NOATIME. O_ASYNC is silently dropped (timerfd_fops lacks
+         * ->fasync). O_DIRECT returns -EINVAL because the inode lacks
+         * FMODE_CAN_ODIRECT. Bits outside the writable set (access mode,
+         * CLOEXEC, O_PATH/DIRECTORY/NOFOLLOW/etc.) are silently ignored,
+         * matching how Linux F_SETFL drops them.
+         */
+        if (fd_type == FD_TIMERFD) {
+            if ((int) arg & LINUX_O_DIRECT)
+                return -LINUX_EINVAL;
+            const int setfl_mask =
+                LINUX_O_APPEND | LINUX_O_NONBLOCK | LINUX_O_NOATIME;
+            fd_table[fd].linux_flags =
+                (fd_table[fd].linux_flags & ~setfl_mask) |
+                ((int) arg & setfl_mask);
             return 0;
         }
         host_fd_ref_t host_ref;

@@ -2607,9 +2607,14 @@ int fuse_dup_fd(int src_fd,
         }
     }
 
-    int preserved_flags = fd_table[src_fd].linux_flags &
-                          (LINUX_O_PATH | LINUX_O_DIRECTORY | LINUX_O_NOFOLLOW |
-                           LINUX_O_DIRECT | LINUX_O_LARGEFILE);
+    /* O_NONBLOCK is a file-status flag preserved by dup(2)/dup2(2); without
+     * it a duplicated non-blocking FUSE fd would silently become blocking
+     * because nothing else carries the flag forward.
+     */
+    int preserved_flags =
+        fd_table[src_fd].linux_flags &
+        (LINUX_O_PATH | LINUX_O_DIRECTORY | LINUX_O_NOFOLLOW | LINUX_O_DIRECT |
+         LINUX_O_LARGEFILE | LINUX_O_NONBLOCK);
     fd_table[guest_fd].linux_flags = preserved_flags | linux_flags;
     pthread_mutex_unlock(&fuse_lock);
     return guest_fd;

@@ -219,7 +219,7 @@ int mac_to_linux_status_flags(int mac_flags)
     if (mac_flags & O_APPEND)
         linux_flags |= LINUX_O_APPEND;
     if (mac_flags & O_ASYNC)
-        linux_flags |= 0x2000; /* LINUX_O_ASYNC */
+        linux_flags |= LINUX_O_ASYNC;
     return linux_flags;
 }
 
@@ -233,7 +233,7 @@ int linux_to_mac_status_flags(int linux_flags)
         mac_flags |= O_NONBLOCK;
     if (linux_flags & LINUX_O_APPEND)
         mac_flags |= O_APPEND;
-    if (linux_flags & 0x2000)
-        mac_flags |= O_ASYNC; /* LINUX_O_ASYNC */
+    if (linux_flags & LINUX_O_ASYNC)
+        mac_flags |= O_ASYNC;
     return mac_flags;
 }

@@ -378,6 +378,7 @@ typedef struct {
 #define LINUX_O_TRUNC 0x0200
 #define LINUX_O_APPEND 0x0400
 #define LINUX_O_NONBLOCK 0x0800
+#define LINUX_O_ASYNC 0x2000
 /* aarch64-linux open flag values (from asm-generic/fcntl.h).
  * These differ from x86_64-linux values.
  */
@@ -385,6 +386,7 @@ typedef struct {
 #define LINUX_O_NOFOLLOW 0x8000   /* 0100000 octal */
 #define LINUX_O_DIRECT 0x10000    /* 0200000 octal */
 #define LINUX_O_LARGEFILE 0x20000 /* 0400000 octal, ignored on LP64 */
+#define LINUX_O_NOATIME 0x40000   /* 01000000 octal */
 #define LINUX_O_CLOEXEC 0x80000   /* 02000000 octal */
 #define LINUX_O_PATH 0x200000     /* 010000000 octal */
 

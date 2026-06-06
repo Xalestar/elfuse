@@ -214,8 +214,12 @@ int64_t sys_timerfd_create(int clockid, int flags)
     timerfd_state[slot].clockid = clockid;
     pthread_mutex_unlock(&sfd_lock);
 
+    /* Linux opens the timerfd inode O_RDWR (anon_inode_getfd in
+     * fs/timerfd.c). Stamp O_RDWR into linux_flags so the F_GETFL branch
+     * below can surface the access mode without re-deriving it.
+     */
     fd_table[gfd].linux_flags =
-        ((flags & LINUX_TFD_CLOEXEC) ? LINUX_O_CLOEXEC : 0) |
+        LINUX_O_RDWR | ((flags & LINUX_TFD_CLOEXEC) ? LINUX_O_CLOEXEC : 0) |
         ((flags & LINUX_TFD_NONBLOCK) ? LINUX_O_NONBLOCK : 0);
     return gfd;
 }
