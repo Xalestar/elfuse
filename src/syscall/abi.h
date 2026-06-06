@@ -358,6 +358,7 @@ typedef struct {
 #define LINUX_FIONBIO 0x5421    /* set/clear O_NONBLOCK (arg: int *) */
 #define LINUX_FIONCLEX 0x5450   /* clear close-on-exec on fd */
 #define LINUX_FIOCLEX 0x5451    /* set close-on-exec on fd */
+#define LINUX_FIOASYNC 0x5452   /* set/clear O_ASYNC (arg: int *) */
 #define LINUX_TIOCNOTTY 0x5422  /* -> macOS TIOCNOTTY (same semantics) */
 #define LINUX_TIOCGSID 0x5429   /* -> macOS TIOCGSID (same semantics) */
 /* termios2 variant (adds c_ispeed/c_ospeed) */

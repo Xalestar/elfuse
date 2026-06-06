@@ -1768,6 +1768,26 @@ int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg)
         host_fd_ref_close(&host_ref);
         return 0;
     }
+
+    case LINUX_FIOASYNC: {
+        /* Set/clear O_ASYNC (SIGIO-driven I/O). nginx's ngx_spawn_process arms
+         * this on the master's channel socket right before fork() and treats a
+         * failure as fatal (ngx_close_channel + return NGX_INVALID_PID), so
+         * answering ENOTTY here aborts worker spawning entirely -- the master
+         * is left with no workers and accepted connections are never serviced.
+         * elfuse does not forward host SIGIO into the guest, and nginx workers
+         * receive both client I/O and channel commands via epoll rather than
+         * SIGIO, so accept the request as a no-op: read the int arg for EFAULT
+         * parity and report success without arming host async delivery. */
+        int32_t on = 0;
+        if (guest_read_small(g, arg, &on, sizeof(on)) < 0) {
+            host_fd_ref_close(&host_ref);
+            return -LINUX_EFAULT;
+        }
+        host_fd_ref_close(&host_ref);
+        return 0;
+    }
+
     case LINUX_TIOCSPTLCK: {
         /* Lock/unlock the slave side of a pty. glibc unlockpt() always passes 0
          * (unlock); util-linux's setlock(1) passes 1 to lock. macOS exposes

@@ -1116,6 +1116,40 @@ int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg)
         host_fd_ref_close(&host_ref);
         return 0;
     }
+    case 8: /* F_SETOWN */
+        /* SIGIO/SIGURG delivery owner. nginx's ngx_spawn_process pairs
+         * ioctl(FIOASYNC) with fcntl(F_SETOWN) on the channel socket before
+         * fork() and aborts the worker (NGX_INVALID_PID) if either fails.
+         * elfuse does not deliver host SIGIO into the guest (see LINUX_FIOASYNC
+         * in sys_ioctl), so no owner is tracked: accept the request as a no-op.
+         * F_SETOWN's arg is the owner pid passed by value, so there is no user
+         * pointer to validate. */
+        return 0;
+    case 15: { /* F_SETOWN_EX */
+        /* Same no-op owner semantics as F_SETOWN, but the arg is a
+         * struct f_owner_ex { int type; int pid; } pointer that Linux reads
+         * before applying. Read it through so a bad guest pointer faults with
+         * EFAULT rather than silently succeeding; the value is then discarded.
+         */
+        int32_t owner_ex[2];
+        if (guest_read_small(g, arg, owner_ex, sizeof(owner_ex)) < 0)
+            return -LINUX_EFAULT;
+        return 0;
+    }
+    case 9: /* F_GETOWN */
+        /* No owner tracked; report none. */
+        return 0;
+    case 16: { /* F_GETOWN_EX */
+        /* glibc implements fcntl(F_GETOWN) on top of F_GETOWN_EX, so this must
+         * answer coherently with the F_SETOWN no-op above rather than EINVAL
+         * (which would make F_GETOWN fail under glibc). Report "owned by no
+         * specific process": struct f_owner_ex { int type; int pid; } with
+         * type=F_OWNER_PID(1), pid=0. */
+        int32_t owner_ex[2] = {1 /* F_OWNER_PID */, 0 /* pid */};
+        if (guest_write_small(g, arg, owner_ex, sizeof(owner_ex)) < 0)
+            return -LINUX_EFAULT;
+        return 0;
+    }
     case 1024: /* F_GETPIPE_SZ */
         /* macOS does not support pipe size queries; return default 64KiB */
         return 65536;
