@@ -148,6 +148,42 @@ int main(void)
             FAIL("timerfd_create failed");
     }
 
+    /* CLOCK_BOOTTIME backs foot's keyboard repeat timer; on macOS it
+     * resolves to CLOCK_MONOTONIC since no boottime equivalent exists.
+     * Paired with TFD_NONBLOCK to mirror foot's actual call.
+     */
+    TEST("create accepts CLOCK_BOOTTIME with TFD_NONBLOCK");
+    {
+        int fd = timerfd_create(CLOCK_BOOTTIME, TFD_CLOEXEC | TFD_NONBLOCK);
+        EXPECT_TRUE(fd >= 0, "timerfd_create(CLOCK_BOOTTIME) failed");
+        if (fd >= 0)
+            close(fd);
+    }
+
+    /* NONBLOCK shadow: the kqueue host fd cannot carry O_NONBLOCK, so the
+     * flag lives in fd_table[gfd].linux_flags. Arm with a 1s deadline so
+     * the read is non-trivially blocked, then verify EAGAIN comes from the
+     * NONBLOCK path; an unarmed timer would also return EAGAIN, so the arm
+     * step is what makes this a real probe of the shadow.
+     */
+    TEST("NONBLOCK: armed-but-unfired returns EAGAIN");
+    {
+        int fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
+        if (fd >= 0) {
+            struct itimerspec its = {.it_value = {.tv_sec = 1, .tv_nsec = 0},
+                                     .it_interval = {0, 0}};
+            EXPECT_TRUE(timerfd_settime(fd, 0, &its, NULL) == 0,
+                        "settime failed");
+            uint64_t count = 0;
+            errno = 0;
+            ssize_t r = read(fd, &count, sizeof(count));
+            EXPECT_TRUE(r == -1 && errno == EAGAIN,
+                        "non-blocking read did not return EAGAIN");
+            close(fd);
+        } else
+            FAIL("timerfd_create");
+    }
+
     TEST("timerfd_create invalid clock");
     EXPECT_ERRNO(timerfd_create(9999, 0), EINVAL, "expected EINVAL");
 

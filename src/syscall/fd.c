@@ -89,6 +89,12 @@ typedef struct {
 #define LINUX_CLOCK_REALTIME 0
 #define LINUX_CLOCK_MONOTONIC 1
 
+/* Linux CLOCK_BOOTTIME counts time including suspend; macOS has no equivalent.
+ * timerfd_settime treats non-REALTIME slots as MONOTONIC for ABSTIME
+ * conversion, which matches translate_clockid() in time.c.
+ */
+#define LINUX_CLOCK_BOOTTIME 7
+
 static struct {
     int guest_fd;         /* Guest fd (-1 if unused) */
     int kq_fd;            /* kqueue fd for this timer */
@@ -167,7 +173,8 @@ static int64_t timerfd_remaining_ns_locked(int slot, int64_t now_ns)
 
 int64_t sys_timerfd_create(int clockid, int flags)
 {
-    if (clockid != LINUX_CLOCK_REALTIME && clockid != LINUX_CLOCK_MONOTONIC)
+    if (clockid != LINUX_CLOCK_REALTIME && clockid != LINUX_CLOCK_MONOTONIC &&
+        clockid != LINUX_CLOCK_BOOTTIME)
         return -LINUX_EINVAL;
     if (flags & ~(LINUX_TFD_CLOEXEC | LINUX_TFD_NONBLOCK))
         return -LINUX_EINVAL;
@@ -176,8 +183,12 @@ int64_t sys_timerfd_create(int clockid, int flags)
     if (kq < 0)
         return linux_errno();
 
-    if (((flags & LINUX_TFD_CLOEXEC) && fd_set_cloexec(kq) < 0) ||
-        ((flags & LINUX_TFD_NONBLOCK) && fd_set_nonblock(kq) < 0)) {
+    /* macOS kqueue fds reject fcntl(F_SETFL, O_NONBLOCK) with ENOTTY, so
+     * track the non-blocking mode in fd_table[gfd].linux_flags below and
+     * let timerfd_read consult that field directly. F_SETFD CLOEXEC still
+     * works on a kqueue fd.
+     */
+    if ((flags & LINUX_TFD_CLOEXEC) && fd_set_cloexec(kq) < 0) {
         close(kq);
         return linux_errno();
     }
@@ -204,7 +215,8 @@ int64_t sys_timerfd_create(int clockid, int flags)
     pthread_mutex_unlock(&sfd_lock);
 
     fd_table[gfd].linux_flags =
-        (flags & LINUX_TFD_CLOEXEC) ? LINUX_O_CLOEXEC : 0;
+        ((flags & LINUX_TFD_CLOEXEC) ? LINUX_O_CLOEXEC : 0) |
+        ((flags & LINUX_TFD_NONBLOCK) ? LINUX_O_NONBLOCK : 0);
     return gfd;
 }
 
@@ -396,6 +408,15 @@ int64_t timerfd_read(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t count)
     if (count < 8)
         return -LINUX_EINVAL;
 
+    /* Snapshot the NONBLOCK status under fd_lock before sfd_lock to match the
+     * documented lock order (fd_lock=3 < sfd_lock=5a). The kqueue host fd
+     * rejects fcntl(F_SETFL, O_NONBLOCK) on macOS, so the flag lives in
+     * fd_table[guest_fd].linux_flags rather than on the host fd.
+     */
+    pthread_mutex_lock(&fd_lock);
+    bool nonblock = fd_table[guest_fd].linux_flags & LINUX_O_NONBLOCK;
+    pthread_mutex_unlock(&fd_lock);
+
     pthread_mutex_lock(&sfd_lock);
     int slot = timerfd_find(guest_fd);
     if (slot < 0) {
@@ -409,9 +430,7 @@ int64_t timerfd_read(int guest_fd, guest_t *g, uint64_t buf_gva, uint64_t count)
     timerfd_drain_pending_locked(slot);
 
     if (timerfd_state[slot].expirations == 0) {
-        /* No events yet; check if non-blocking */
-        int fl = fcntl(kq, F_GETFL);
-        if (fl >= 0 && (fl & O_NONBLOCK)) {
+        if (nonblock) {
             pthread_mutex_unlock(&sfd_lock);
             return -LINUX_EAGAIN;
         }
