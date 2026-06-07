@@ -494,6 +494,14 @@ typedef struct {
     /* Semantic region tracking for munmap/mprotect/proc-self-maps */
     guest_region_t regions[GUEST_MAX_REGIONS];
     int nregions; /* Number of active regions */
+    /* Sticky flag set when guest_region_set_prot could not honor a request
+     * because the region table was full. After this point the tracker no
+     * longer faithfully reflects PTE state, so the mprotect fast path must
+     * fall back to unconditional PTE work. Propagated across fork IPC with
+     * the semantic region snapshot so children inherit the same fast-path
+     * guard as the parent.
+     */
+    bool regions_tracker_stale;
     guest_region_t preannounced[GUEST_MAX_PREANNOUNCED];
     int npreannounced; /* /proc/self/maps-only shadow regions */
 
@@ -1173,6 +1181,32 @@ const guest_region_t *guest_region_find(const guest_t *g, uint64_t addr);
  * Splits regions at boundaries as needed.
  */
 void guest_region_set_prot(guest_t *g, uint64_t start, uint64_t end, int prot);
+
+/* Index of the first region whose end is strictly above addr. Earlier
+ * regions sort entirely below addr (regions[] is start-sorted and
+ * non-overlapping, so ends are monotonic). Callers use this to skip the
+ * untouched prefix in O(log n) before a linear walk over the overlap.
+ */
+int guest_region_first_end_above(const guest_t *g, uint64_t addr);
+
+/* True if every tracked region overlapping [start, end) already has prot.
+ * Returns true vacuously when no region overlaps the range, since callers
+ * use this to decide whether page-table maintenance can be skipped and an
+ * untracked sub-range has no PTEs of its own to update.
+ */
+bool guest_region_range_prot_uniform(const guest_t *g,
+                                     uint64_t start,
+                                     uint64_t end,
+                                     int prot);
+
+/* True if any tracked region overlapping [start, end) is MAP_NORESERVE.
+ * Callers must run page-table maintenance for such ranges even when prot
+ * already matches, because lazy materialization may have produced PTEs
+ * that need re-permissioning.
+ */
+bool guest_region_range_has_noreserve(const guest_t *g,
+                                      uint64_t start,
+                                      uint64_t end);
 
 /* Try to materialize a lazy (MAP_NORESERVE) page at the given offset.
  * Called from the data/instruction abort handler when the faulting address

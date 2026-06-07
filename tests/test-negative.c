@@ -13,6 +13,8 @@
 #include <stdint.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <setjmp.h>
+#include <signal.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -34,6 +36,16 @@
 #endif
 
 int passes = 0, fails = 0;
+
+static sigjmp_buf segv_jmp;
+static volatile sig_atomic_t saw_segv;
+
+static void on_sigsegv(int sig)
+{
+    (void) sig;
+    saw_segv = 1;
+    siglongjmp(segv_jmp, 1);
+}
 
 /* Test 1: Invalid FD operations */
 
@@ -161,6 +173,40 @@ static void test_mmap_prot(void)
         int val = *(volatile int *) p;
         EXPECT_TRUE(val == 42, "data not readable after RO mprotect");
         munmap(p, 4096);
+    }
+
+    TEST("same-prot mprotect keeps RO mmap unwritable");
+    {
+        void *p =
+            mmap(NULL, 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (p == MAP_FAILED) {
+            FAIL("mmap failed");
+            return;
+        }
+        if (mprotect(p, 4096, PROT_READ) != 0) {
+            munmap(p, 4096);
+            FAIL("mprotect failed");
+            return;
+        }
+
+        struct sigaction old_sa;
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = on_sigsegv;
+        sigemptyset(&sa.sa_mask);
+        if (sigaction(SIGSEGV, &sa, &old_sa) != 0) {
+            munmap(p, 4096);
+            FAIL("sigaction failed");
+            return;
+        }
+
+        saw_segv = 0;
+        if (sigsetjmp(segv_jmp, 1) == 0)
+            *(volatile int *) p = 7;
+
+        sigaction(SIGSEGV, &old_sa, NULL);
+        munmap(p, 4096);
+        EXPECT_TRUE(saw_segv, "write to read-only mapping succeeded");
     }
 }
 

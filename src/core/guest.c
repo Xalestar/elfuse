@@ -1737,6 +1737,40 @@ static bool regions_mergeable(const guest_region_t *a, const guest_region_t *b)
     return a->offset + (a->end - a->start) == b->offset;
 }
 
+/* First region whose start is >= start. regions[] is sorted by start. */
+static int region_lower_bound_start(const guest_t *g, uint64_t start)
+{
+    int lo = 0;
+    int hi = g->nregions;
+
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / 2;
+        if (g->regions[mid].start < start)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return lo;
+}
+
+/* First region whose end is > addr. See guest.h for the contract; also used
+ * inside this file to skip the untouched prefix for remove and set_prot.
+ */
+int guest_region_first_end_above(const guest_t *g, uint64_t addr)
+{
+    int lo = 0;
+    int hi = g->nregions;
+
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / 2;
+        if (g->regions[mid].end <= addr)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return lo;
+}
+
 /* Merge region at index i with its right neighbor (i+1) when their layouts
  * agree. No-op if i is the last region or layouts differ.
  */
@@ -1857,12 +1891,10 @@ int guest_region_add_ex_owned_gpa(guest_t *g,
         return -1;
     }
 
-    /* Find insertion point (keep sorted by start address) */
-    int i = g->nregions;
-    while (i > 0 && g->regions[i - 1].start > start) {
-        g->regions[i] = g->regions[i - 1];
-        i--;
-    }
+    /* Find insertion point (keep sorted by start address). */
+    int i = region_lower_bound_start(g, start);
+    memmove(&g->regions[i + 1], &g->regions[i],
+            (g->nregions - i) * sizeof(guest_region_t));
 
     guest_region_t *r = &g->regions[i];
     r->start = start;
@@ -1926,104 +1958,117 @@ int guest_preannounce(guest_t *g,
 
 void guest_region_remove(guest_t *g, uint64_t start, uint64_t end)
 {
-    int i = 0;
-    while (i < g->nregions) {
-        guest_region_t *r = &g->regions[i];
+    if (end <= start)
+        return;
 
-        /* No overlap: region is entirely before the removal range */
-        if (r->end <= start) {
-            i++;
-            continue;
-        }
+    /* In-place compaction: 'out' is the next output slot, 'in' is the next
+     * input slot. Since the prefix [0, first) is untouched (it sorts strictly
+     * before [start, end) by guest_region_first_end_above), both cursors begin
+     * at 'first'. The non-overlap invariant guarantees out <= in throughout the
+     * loop, so writes at g->regions[out] never clobber slots not yet read.
+     */
+    int first = guest_region_first_end_above(g, start);
+    int out = first;
+    int in = first;
 
-        /* No overlap: region is entirely after the removal range */
+    while (in < g->nregions) {
+        guest_region_t *r = &g->regions[in];
         if (r->start >= end)
-            break; /* sorted, so done */
+            break;
 
-        /* Full containment: remove the entire region */
-        if (r->start >= start && r->end <= end) {
-            if (r->backing_fd >= 0)
-                close(r->backing_fd);
-            memmove(&g->regions[i], &g->regions[i + 1],
-                    (g->nregions - i - 1) * sizeof(guest_region_t));
-            g->nregions--;
-            continue; /* do not increment i */
-        }
+        bool keep_left = r->start < start;
+        bool keep_right = r->end > end;
 
-        /* Partial overlap: removal range cuts the beginning */
-        if (r->start >= start && r->end > end) {
-            uint64_t trimmed = end - r->start;
-            r->offset += trimmed;
-            r->gpa_base += trimmed;
-            r->start = end;
-            guest_region_clip_overlay(r);
-            i++;
-            continue;
-        }
-
-        /* Partial overlap: removal range cuts the end */
-        if (r->start < start && r->end > start && r->end <= end) {
-            r->end = start;
-            guest_region_clip_overlay(r);
-            i++;
-            continue;
-        }
-
-        /* Split: removal range is entirely inside the region */
-        if (r->start < start && r->end > end) {
-            /* Need to split into two regions: [r->start, start) and [end,
-             * r->end)
-             */
+        /* Interior split: removal range lies strictly inside *r, producing
+         * two output entries from one input slot. This is the only growth
+         * path; handle it explicitly so the untouched suffix is shifted out
+         * of the way before either half is written. After this branch no
+         * further input regions can overlap [start, end), so the loop is
+         * done.
+         */
+        if (keep_left && keep_right) {
             if (g->nregions >= GUEST_MAX_REGIONS) {
-                /* Region table is full; trim to [r->start, start) and drop
-                 * the tail. The tail [end, r->end) becomes untracked in
-                 * /proc/self/maps but remains mapped in page tables.
+                /* Table full: drop the tail [end, r->end) and fall through to
+                 * the simple "trim end" treatment of *r. The tail stays mapped
+                 * in page tables but is now untracked, so a later mprotect over
+                 * that range would otherwise see vacuously uniform prot in the
+                 * tracker and skip PTE work. Mark the tracker permanently stale
+                 * to disarm the mprotect fast path for the lifetime of the
+                 * process.
                  */
                 log_error(
                     "guest: region table full, "
                     "munmap split drops tail [0x%llx-0x%llx)",
                     (unsigned long long) end, (unsigned long long) r->end);
-                r->end = start;
-                i++;
-                continue;
+                g->regions_tracker_stale = true;
+                keep_right = false;
+            } else {
+                guest_region_t orig = *r;
+                int suffix_count = g->nregions - in - 1;
+                if (suffix_count > 0)
+                    memmove(&g->regions[out + 2], &g->regions[in + 1],
+                            suffix_count * sizeof(guest_region_t));
+
+                guest_region_t left = orig;
+                left.end = start;
+                guest_region_clip_overlay(&left);
+                g->regions[out] = left;
+
+                guest_region_t right = orig;
+                uint64_t trimmed = end - orig.start;
+                right.offset += trimmed;
+                right.gpa_base += trimmed;
+                right.start = end;
+                if (orig.backing_fd >= 0) {
+                    right.backing_fd = dup(orig.backing_fd);
+                    if (right.backing_fd < 0)
+                        log_error(
+                            "guest: dup() failed for region split "
+                            "backing fd %d: %s",
+                            orig.backing_fd, strerror(errno));
+                }
+                guest_region_clip_overlay(&right);
+                g->regions[out + 1] = right;
+
+                g->nregions = out + 2 + suffix_count;
+                return;
             }
-            /* Make room for the new region after i */
-            memmove(&g->regions[i + 2], &g->regions[i + 1],
-                    (g->nregions - i - 1) * sizeof(guest_region_t));
+        }
 
-            /* Right half: [end, old_end) */
-            guest_region_t *right = &g->regions[i + 1];
-            *right = *r; /* Copy attributes */
-            right->offset += (end - r->start);
-            right->gpa_base += (end - r->start);
-            right->start = end;
-            if (r->backing_fd >= 0) {
-                /* A dup failure leaves backing_fd=-1, silently converting this
-                 * half to anonymous semantics (msync and MADV_DONTNEED skip
-                 * regions with backing_fd<0). Propagating the error would
-                 * require making all region split callers (mprotect, munmap)
-                 * fallible.
-                 */
-                right->backing_fd = dup(r->backing_fd);
-                if (right->backing_fd < 0)
-                    log_error(
-                        "guest: dup() failed for region split "
-                        "backing fd %d: %s",
-                        r->backing_fd, strerror(errno));
-            }
-
-            /* Left half keeps the original entry and shortens its end. */
-            r->end = start;
-            guest_region_clip_overlay(r);
-            guest_region_clip_overlay(right);
-
-            g->nregions++;
-            i += 2; /* skip both halves */
+        if (!keep_left && !keep_right) {
+            if (r->backing_fd >= 0)
+                close(r->backing_fd);
+            in++;
             continue;
         }
 
-        i++;
+        /* Trim-only paths: either keep_left xor keep_right is true. Build the
+         * surviving half from the source slot, then publish it to g->regions
+         * [out]. The original backing_fd transfers to whichever half survives;
+         * no dup is needed because only one half remains.
+         */
+        guest_region_t survivor = *r;
+        if (keep_left) {
+            survivor.end = start;
+        } else {
+            uint64_t trimmed = end - r->start;
+            survivor.offset += trimmed;
+            survivor.gpa_base += trimmed;
+            survivor.start = end;
+        }
+        guest_region_clip_overlay(&survivor);
+        g->regions[out++] = survivor;
+        in++;
     }
+
+    /* Append the unread suffix (regions whose start >= end) after the
+     * compacted overlap area, shifting only if compaction left a hole.
+     */
+    int tail = g->nregions - in;
+    if (tail > 0 && out != in)
+        memmove(&g->regions[out], &g->regions[in],
+                tail * sizeof(guest_region_t));
+    g->nregions = out + tail;
 }
 
 const guest_region_t *guest_region_find(const guest_t *g, uint64_t addr)
@@ -2043,6 +2088,35 @@ const guest_region_t *guest_region_find(const guest_t *g, uint64_t addr)
     return NULL;
 }
 
+bool guest_region_range_prot_uniform(const guest_t *g,
+                                     uint64_t start,
+                                     uint64_t end,
+                                     int prot)
+{
+    for (int i = guest_region_first_end_above(g, start); i < g->nregions; i++) {
+        const guest_region_t *r = &g->regions[i];
+        if (r->start >= end)
+            break;
+        if (r->prot != prot)
+            return false;
+    }
+    return true;
+}
+
+bool guest_region_range_has_noreserve(const guest_t *g,
+                                      uint64_t start,
+                                      uint64_t end)
+{
+    for (int i = guest_region_first_end_above(g, start); i < g->nregions; i++) {
+        const guest_region_t *r = &g->regions[i];
+        if (r->start >= end)
+            break;
+        if (r->noreserve)
+            return true;
+    }
+    return false;
+}
+
 void guest_region_set_prot(guest_t *g, uint64_t start, uint64_t end, int prot)
 {
     /* Walk regions overlapping [start, end), split at boundaries, update prot.
@@ -2051,20 +2125,28 @@ void guest_region_set_prot(guest_t *g, uint64_t start, uint64_t end, int prot)
      */
     int first_modified = -1, last_modified = -1;
 
-    for (int i = 0; i < g->nregions; i++) {
+    /* The prefix skip ensures regions[i].end > start for i >= first; the
+     * non-overlap invariant carries it through all later iterations.
+     */
+    for (int i = guest_region_first_end_above(g, start); i < g->nregions; i++) {
         guest_region_t *r = &g->regions[i];
-        if (r->end <= start)
-            continue;
         if (r->start >= end)
             break;
 
         /* If region extends before start, split at start */
         if (r->start < start) {
             if (g->nregions >= GUEST_MAX_REGIONS) {
+                /* The region keeps its old prot in the tracker, but PTEs for
+                 * [start, r->end) have already been updated. Mark the tracker
+                 * permanently stale so the mprotect fast path falls back to
+                 * unconditional PTE work and cannot be fooled by a tracker
+                 * that lags actual PTE state.
+                 */
                 log_error(
                     "guest: region table full, "
                     "mprotect split skipped at 0x%llx",
                     (unsigned long long) start);
+                g->regions_tracker_stale = true;
                 continue;
             }
             memmove(&g->regions[i + 1], &g->regions[i],
@@ -2094,8 +2176,10 @@ void guest_region_set_prot(guest_t *g, uint64_t start, uint64_t end, int prot)
         /* If region extends past end, split at end */
         if (r->end > end) {
             if (g->nregions >= GUEST_MAX_REGIONS) {
-                /* Split failure applies prot to the whole region.
-                 * The tail [end, r->end) gets new prot too.
+                /* Over-apply prot to the whole region: the tail [end, r->end)
+                 * now claims new prot in the tracker even though PTE work
+                 * did not cover it. Mark the tracker stale so the mprotect
+                 * fast path stops trusting prot uniformity.
                  */
                 log_error(
                     "guest: region table full, "
@@ -2103,6 +2187,7 @@ void guest_region_set_prot(guest_t *g, uint64_t start, uint64_t end, int prot)
                     "(region [0x%llx-0x%llx) gets prot %d entirely)",
                     (unsigned long long) end, (unsigned long long) r->start,
                     (unsigned long long) r->end, prot);
+                g->regions_tracker_stale = true;
                 r->prot = prot;
                 if (first_modified < 0)
                     first_modified = i;

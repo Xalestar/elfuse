@@ -18,11 +18,14 @@
 /* Magic values for IPC frame delimiters */
 #define IPC_MAGIC_HEADER 0x454C464BU   /* "ELFK" */
 #define IPC_MAGIC_SENTINEL 0x454C4F4BU /* "ELOK" */
-/* Bumped to 10 when the rosetta placement / kbuf / ttbr1 tuple was added so
+/* Bumped to 11 when regions_tracker_stale was added to process state so
+ * forked children preserve mprotect fast-path correctness.
+ *
+ * Bumped to 10 when the rosetta placement / kbuf / ttbr1 tuple was added so
  * a rosetta-aware child rejects an older parent's header instead of trying
  * to interpret unknown trailing fields.
  */
-#define IPC_VERSION 10
+#define IPC_VERSION 11
 
 typedef struct {
     uint32_t magic;
@@ -99,6 +102,7 @@ int fork_ipc_recv_fd_table(int ipc_fd, guest_t *g);
 int fork_ipc_send_process_state(int ipc_sock,
                                 const guest_region_t *regions_snapshot,
                                 uint32_t num_guest_regions,
+                                bool regions_tracker_stale_snapshot,
                                 const guest_region_t *preannounced_snapshot,
                                 uint32_t num_preannounced);
 int fork_ipc_recv_process_state(int ipc_fd, guest_t *g, signal_state_t *sig);

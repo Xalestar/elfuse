@@ -1578,6 +1578,7 @@ int64_t sys_clone(hv_vcpu_t vcpu,
      * stack limits on worker threads (512KiB default).
      */
     int nregions_snapshot = g->nregions;
+    bool regions_tracker_stale_snapshot = g->regions_tracker_stale;
     size_t snap_sz = (size_t) nregions_snapshot * sizeof(guest_region_t);
     if (nregions_snapshot > 0) {
         regions_snapshot = malloc(snap_sz);
@@ -1599,9 +1600,10 @@ int64_t sys_clone(hv_vcpu_t vcpu,
 
     uint32_t num_guest_regions = (uint32_t) nregions_snapshot;
     uint32_t num_preannounced = (uint32_t) npreannounced_snapshot;
-    if (fork_ipc_send_process_state(ipc_sock, regions_snapshot,
-                                    num_guest_regions, preannounced_snapshot,
-                                    num_preannounced) < 0) {
+    if (fork_ipc_send_process_state(
+            ipc_sock, regions_snapshot, num_guest_regions,
+            regions_tracker_stale_snapshot, preannounced_snapshot,
+            num_preannounced) < 0) {
         log_error("clone: failed to send process state");
         goto fail_snapshot;
     }

@@ -482,6 +482,7 @@ static int fork_ipc_send_backing_fds(int ipc_sock,
 int fork_ipc_send_process_state(int ipc_sock,
                                 const guest_region_t *regions_snapshot,
                                 uint32_t num_guest_regions,
+                                bool regions_tracker_stale_snapshot,
                                 const guest_region_t *preannounced_snapshot,
                                 uint32_t num_preannounced)
 {
@@ -523,8 +524,12 @@ int fork_ipc_send_process_state(int ipc_sock,
         fork_ipc_write_all(ipc_sock, cmdline, cmdline_len_u32) < 0)
         return -1;
 
+    uint8_t regions_tracker_stale =
+        regions_tracker_stale_snapshot ? UINT8_C(1) : UINT8_C(0);
     if (fork_ipc_write_all(ipc_sock, &num_guest_regions,
-                           sizeof(num_guest_regions)) < 0)
+                           sizeof(num_guest_regions)) < 0 ||
+        fork_ipc_write_all(ipc_sock, &regions_tracker_stale,
+                           sizeof(regions_tracker_stale)) < 0)
         return -1;
     if (num_guest_regions > 0 &&
         fork_ipc_write_all(ipc_sock, regions_snapshot,
@@ -709,6 +714,12 @@ int fork_ipc_recv_process_state(int ipc_fd, guest_t *g, signal_state_t *sig)
         log_error("fork-child: failed to read region count");
         return -1;
     }
+    uint8_t regions_tracker_stale = 0;
+    if (fork_ipc_read_all(ipc_fd, &regions_tracker_stale,
+                          sizeof(regions_tracker_stale)) < 0) {
+        log_error("fork-child: failed to read region tracker state");
+        return -1;
+    }
     uint32_t recv_regions = num_guest_regions;
     if (recv_regions > GUEST_MAX_REGIONS)
         recv_regions = GUEST_MAX_REGIONS;
@@ -728,6 +739,8 @@ int fork_ipc_recv_process_state(int ipc_fd, guest_t *g, signal_state_t *sig)
                                          sizeof(guest_region_t)) < 0)
         return -1;
     g->nregions = (int) recv_regions;
+    g->regions_tracker_stale =
+        (regions_tracker_stale != 0) || (num_guest_regions > recv_regions);
 
     uint32_t num_preannounced = 0;
     if (fork_ipc_read_all(ipc_fd, &num_preannounced, sizeof(num_preannounced)) <

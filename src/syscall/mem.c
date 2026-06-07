@@ -263,26 +263,6 @@ static void split_regions_at_boundary(guest_t *g, uint64_t boundary)
     }
 }
 
-/* Find the smallest i such that g->regions[i].end > gap_start. All earlier
- * regions are entirely below gap_start and would be skipped by the loop body
- * with no other effect. Regions are kept sorted by start and non-overlapping
- * (sys_mmap MAP_FIXED removes overlaps before insertion), so ends are
- * monotonic across the array and binary-searchable.
- */
-static int first_region_end_above(const guest_t *g, uint64_t gap_start)
-{
-    int lo = 0;
-    int hi = g->nregions;
-    while (lo < hi) {
-        int mid = lo + (hi - lo) / 2;
-        if (g->regions[mid].end <= gap_start)
-            lo = mid + 1;
-        else
-            hi = mid;
-    }
-    return lo;
-}
-
 static uint64_t find_free_gap_inner(const guest_t *g,
                                     uint64_t length,
                                     uint64_t min_addr,
@@ -303,12 +283,20 @@ static uint64_t find_free_gap_inner(const guest_t *g,
      * region tail, so the linear walk would otherwise re-scan that whole
      * prefix on every mmap, addr-hint probe, or hint-miss full scan.
      */
-    for (int i = first_region_end_above(g, gap_start); i < g->nregions; i++) {
+    for (int i = guest_region_first_end_above(g, gap_start); i < g->nregions;
+         i++) {
         /* A region can still slip below gap_start after the ALIGN_UP advance
          * below skips past a smaller adjacent region; keep the cheap guard.
          */
         if (g->regions[i].end <= gap_start)
             continue;
+
+        /* The search is bounded to [min_addr, max_addr). Once the sorted
+         * region stream reaches max_addr, later regions cannot affect any
+         * candidate gap inside the window.
+         */
+        if (g->regions[i].start >= max_addr)
+            break;
 
         /* If this region starts far enough after gap_start, the allocator found
          * a gap. Must also verify the gap is within max_addr; regions[] may
@@ -3272,6 +3260,16 @@ int64_t sys_munmap(guest_t *g, uint64_t addr, uint64_t length)
 
 /* sys_mprotect. */
 
+static bool mprotect_same_prot_fast_path_safe(int prot)
+{
+    /* Non-fixed main-arena mmap initially installs RW PTEs for PROT_READ
+     * mappings, relying on mprotect to tighten them later. Do not trust the
+     * region tracker alone for read-only same-prot requests.
+     */
+    return prot == LINUX_PROT_NONE || (prot & LINUX_PROT_WRITE) ||
+           (prot & LINUX_PROT_EXEC);
+}
+
 int64_t sys_mprotect(guest_t *g, uint64_t addr, uint64_t length, int prot)
 {
     if (addr & 4095)
@@ -3291,7 +3289,26 @@ int64_t sys_mprotect(guest_t *g, uint64_t addr, uint64_t length, int prot)
                 (prot & LINUX_PROT_EXEC))
                 return -LINUX_EINVAL;
 
-            guest_region_set_prot(g, addr, mprot_end, prot);
+            /* Fast path: if the tracker already records this prot for every
+             * overlapping region and none are MAP_NORESERVE, page tables are
+             * already in sync and no PTE work is required. The tracker
+             * update is also a no-op, so skip it. Read-only same-prot
+             * requests still need PTE work because some mmap paths install
+             * RW PTEs while recording PROT_READ in the tracker. Disabled once
+             * regions_tracker_stale is set: prior set_prot calls hit
+             * GUEST_MAX_REGIONS and left the tracker out of sync with PTEs.
+             */
+            if (mprotect_same_prot_fast_path_safe(prot) &&
+                !g->regions_tracker_stale &&
+                guest_region_range_prot_uniform(g, addr, mprot_end, prot) &&
+                !guest_region_range_has_noreserve(g, addr, mprot_end))
+                return 0;
+
+            /* Do PTE work BEFORE updating the tracker. If page-table
+             * maintenance fails, regions[] still reflects the old prot, so
+             * a retry will see the mismatch and re-attempt the update
+             * instead of short-circuiting on stale tracker state.
+             */
             if (prot != LINUX_PROT_NONE) {
                 if (guest_update_perms(g, addr, mprot_end,
                                        prot_to_perms(prot)) < 0)
@@ -3300,6 +3317,7 @@ int64_t sys_mprotect(guest_t *g, uint64_t addr, uint64_t length, int prot)
                 if (guest_invalidate_ptes(g, addr, mprot_end) < 0)
                     return -LINUX_ENOMEM;
             }
+            guest_region_set_prot(g, addr, mprot_end, prot);
             return 0;
         }
         uint64_t mprot_off = addr - g->ipa_base;
@@ -3312,16 +3330,26 @@ int64_t sys_mprotect(guest_t *g, uint64_t addr, uint64_t length, int prot)
             if (guest_range_hits_infra(g, mprot_off, mprot_end))
                 return -LINUX_EINVAL;
 
-            guest_region_set_prot(g, mprot_off, mprot_end, prot);
+            /* Same fast path / ordering / staleness gate as above. */
+            if (mprotect_same_prot_fast_path_safe(prot) &&
+                !g->regions_tracker_stale &&
+                guest_region_range_prot_uniform(g, mprot_off, mprot_end,
+                                                prot) &&
+                !guest_region_range_has_noreserve(g, mprot_off, mprot_end))
+                return 0;
+
             if (prot != LINUX_PROT_NONE) {
                 int page_perms = prot_to_perms(prot);
                 if (guest_extend_page_tables(g, mprot_off, mprot_end,
                                              page_perms) < 0)
                     return -LINUX_ENOMEM;
-                guest_update_perms(g, mprot_off, mprot_end, page_perms);
+                if (guest_update_perms(g, mprot_off, mprot_end, page_perms) < 0)
+                    return -LINUX_ENOMEM;
             } else {
-                guest_invalidate_ptes(g, mprot_off, mprot_end);
+                if (guest_invalidate_ptes(g, mprot_off, mprot_end) < 0)
+                    return -LINUX_ENOMEM;
             }
+            guest_region_set_prot(g, mprot_off, mprot_end, prot);
         }
     }
     return 0;
