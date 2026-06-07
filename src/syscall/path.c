@@ -75,6 +75,13 @@ bool path_might_use_stat_intercept(const char *path)
         return true;
     if (!strcmp(path, "/dev/fuse"))
         return true;
+    /* glibc ptsname(3) stats /dev/pts/N after TIOCGPTN to confirm the slave
+     * exists and is a char device; without this the stat falls through to the
+     * host where /dev/pts is absent and ptsname returns ENOENT.
+     */
+    if (!strncmp(path, "/dev/pts/", 9) || !strcmp(path, "/dev/pts") ||
+        !strcmp(path, "/dev/pts/"))
+        return true;
     if (fuse_path_matches_mount(path))
         return true;
     if (path_prefix_match(path, SYSFS_CPU_PREFIX, sizeof(SYSFS_CPU_PREFIX) - 1))

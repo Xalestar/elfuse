@@ -21,6 +21,7 @@
 #include "utils.h"
 
 #include "core/shim-globals.h"
+#include "runtime/procemu.h"
 #include "syscall/abi.h"
 #include "syscall/internal.h"
 
@@ -476,6 +477,12 @@ void fd_cleanup_entry(int guest_fd, const fd_entry_t *snap)
     /* Type-specific teardown via vtable (replaces per-type switch) */
     if (snap->cleanup)
         snap->cleanup(guest_fd);
+
+    /* Drop any /dev/ptmx keepalive slave fd paired with this host fd. Must
+     * happen before close(snap->host_fd) because the side table is keyed by
+     * the still-live host master fd. No-op for non-pty fds.
+     */
+    proc_pty_close_keepalive(snap->host_fd);
 
     /* Keep stdin/stdout/stderr open on the host */
     if (snap->type != FD_STDIO)

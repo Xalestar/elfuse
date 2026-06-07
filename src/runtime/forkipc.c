@@ -261,6 +261,15 @@ int fork_child_main(int ipc_fd,
         return 1;
     }
 
+    /* Must follow fork_ipc_recv_fd_table: the keepalive recv resolves each
+     * payload guest_fd to its (now installed) child-side host master fd.
+     */
+    if (fork_ipc_recv_pty_keepalives(ipc_fd) < 0) {
+        log_error("fork-child: failed to receive pty keepalives");
+        guest_destroy(&g);
+        return 1;
+    }
+
     signal_state_t sig;
     if (fork_ipc_recv_process_state(ipc_fd, &g, &sig) < 0) {
         log_error("fork-child: failed to receive process state");
@@ -1595,6 +1604,15 @@ int64_t sys_clone(hv_vcpu_t vcpu,
 
     if (fork_ipc_send_fd_table(ipc_sock) < 0) {
         log_error("clone: failed to send fd table");
+        goto fail_snapshot;
+    }
+
+    /* Must follow fork_ipc_send_fd_table because the keepalive payload
+     * carries a guest_fd that the child resolves through its just-installed
+     * fd_table to recover the child-side master host fd.
+     */
+    if (fork_ipc_send_pty_keepalives(ipc_sock) < 0) {
+        log_error("clone: failed to send pty keepalives");
         goto fail_snapshot;
     }
 

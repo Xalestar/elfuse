@@ -68,6 +68,7 @@ test-epoll-aba
 test-timerfd
 test-large-io-boundary
 test-ioctl-cloexec
+test-pty
 
 [section] /proc and /dev emulation tests
 test-proc

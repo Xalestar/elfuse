@@ -342,6 +342,12 @@ int64_t sys_openat_path(guest_t *g,
             int type = intercepted_fd_type(tx.intercept_path, intercepted,
                                            linux_flags);
             if (type < 0) {
+                /* /dev/ptmx registers a keepalive slave under intercepted
+                 * before this point; without dropping it here the slave fd
+                 * leaks because nothing else has the master in fd_table.
+                 * proc_pty_close_keepalive is a no-op for other paths.
+                 */
+                proc_pty_close_keepalive(intercepted);
                 close_keep_errno(intercepted);
                 return linux_errno();
             }
@@ -351,6 +357,7 @@ int64_t sys_openat_path(guest_t *g,
                 fd_alloc_opened_host(intercepted, type, linux_flags,
                                      min_guest_fd, fd_cleanup_for_type(type));
             if (guest_fd < 0) {
+                proc_pty_close_keepalive(intercepted);
                 close_keep_errno(intercepted);
                 return linux_errno();
             }
@@ -430,6 +437,13 @@ int64_t sys_close(int fd)
 
     int host_fd = -1;
     if (fd_close_regular_relaxed(fd, &host_fd)) {
+        /* The fast path bypasses fd_cleanup_entry, so any side tables
+         * keyed by host_fd that the slow path drops must be drained here
+         * too. proc_pty_close_keepalive is a cheap no-op for non-pty fds
+         * and prevents the keepalive slave from leaking past a /dev/ptmx
+         * close when no per-type cleanup is registered.
+         */
+        proc_pty_close_keepalive(host_fd);
         if (close(host_fd) < 0)
             return linux_errno();
         return 0;
@@ -542,18 +556,27 @@ static int duplicate_guest_fd(int src_fd,
                               bool fixed_slot,
                               int linux_flags)
 {
-    /* Snapshot the source entry and dup its host fd in a single fd_lock
-     * critical section so the type, host fd, and metadata captured here
-     * cannot drift apart under a racing close + reopen.
+    /* Hold pty_keepalive_lock across the source snapshot, host dup, and
+     * keepalive mirror so a concurrent sys_close on src_fd cannot remove
+     * the source's keepalive entry between fd_snapshot_and_dup and
+     * proc_pty_dup_keepalive_locked. Without this bracket the alias would
+     * land in fd_table with no keepalive of its own.
+     *
+     * Lock order is pty_keepalive_lock -> fd_lock (fd_snapshot_and_dup
+     * takes fd_lock internally); proc_pty_master_adopt's joint-locked
+     * publish uses the same order so the two paths do not deadlock.
      */
+    proc_pty_lock_for_dup();
     fd_entry_t src_snap;
     int new_host_fd = fd_snapshot_and_dup(src_fd, &src_snap);
     if (new_host_fd < 0 && src_snap.type == FD_CLOSED) {
+        proc_pty_unlock_for_dup();
         errno = EBADF;
         return -1;
     }
     if (src_snap.type == FD_FUSE_DEV || src_snap.type == FD_FUSE_FILE ||
         src_snap.type == FD_FUSE_DIR) {
+        proc_pty_unlock_for_dup();
         if (new_host_fd >= 0)
             close_keep_errno(new_host_fd);
         return fuse_dup_fd(src_fd, min_guest_fd, fixed_guest_fd, fixed_slot,
@@ -566,13 +589,27 @@ static int duplicate_guest_fd(int src_fd,
      * bind there.
      */
     if (src_snap.type == FD_EVENTFD) {
+        proc_pty_unlock_for_dup();
         if (new_host_fd >= 0)
             close_keep_errno(new_host_fd);
         return eventfd_dup_fd(src_fd, src_snap.host_fd, min_guest_fd,
                               fixed_guest_fd, fixed_slot, linux_flags);
     }
-    if (new_host_fd < 0)
+    if (new_host_fd < 0) {
+        proc_pty_unlock_for_dup();
         return -1;
+    }
+
+    /* Mirror any /dev/ptmx keepalive BEFORE fd_alloc publishes guest_fd.
+     * Once the guest fd exists, a sibling thread can close it; that runs
+     * fd_cleanup_entry which calls proc_pty_close_keepalive(new_host_fd).
+     * For that cleanup to drop the freshly-duped keepalive, the keepalive
+     * entry must already be in the table; registering after fd_alloc would
+     * lose the race and leak the slave fd. No-op when the source has no
+     * keepalive.
+     */
+    proc_pty_dup_keepalive_locked(src_snap.host_fd, new_host_fd);
+    proc_pty_unlock_for_dup();
 
     int new_type = (src_snap.type == FD_STDIO) ? FD_REGULAR : src_snap.type;
     void (*cleanup)(int) = fd_cleanup_for_type(new_type);
@@ -583,6 +620,10 @@ static int duplicate_guest_fd(int src_fd,
     if (guest_fd < 0) {
         if (fixed_slot)
             errno = EBADF;
+        /* fd_cleanup_entry never ran on new_host_fd (no guest fd was
+         * registered), so the keepalive must be dropped explicitly here.
+         */
+        proc_pty_close_keepalive(new_host_fd);
         close_keep_errno(new_host_fd);
         return -1;
     }

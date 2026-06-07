@@ -351,6 +351,7 @@ typedef struct {
 #define LINUX_TIOCSPGRP 0x5410  /* -> macOS TIOCSPGRP (same semantics) */
 #define LINUX_TIOCSCTTY 0x540E  /* -> macOS TIOCSCTTY (same semantics) */
 #define LINUX_TIOCGWINSZ 0x5413 /* -> macOS TIOCGWINSZ (same struct) */
+#define LINUX_TIOCSWINSZ 0x5414 /* -> macOS TIOCSWINSZ (same struct) */
 #define LINUX_FIONREAD 0x541B   /* -> macOS FIONREAD (same semantics) */
 #define LINUX_FIONBIO 0x5421    /* set/clear O_NONBLOCK (arg: int *) */
 #define LINUX_FIONCLEX 0x5450   /* clear close-on-exec on fd */
@@ -362,6 +363,13 @@ typedef struct {
 #define LINUX_TCSETS2 0x402c542b  /* termios2 set (TCSANOW) */
 #define LINUX_TCSETSW2 0x402c542c /* termios2 set (TCSADRAIN) */
 #define LINUX_TCSETSF2 0x402c542d /* termios2 set (TCSAFLUSH) */
+/* Pseudoterminal multiplexer ioctls. The numeric encodings match Linux
+ * include/uapi/asm-generic/ioctls.h regardless of architecture. macOS exposes
+ * an equivalent /dev/ptmx and unlockpt(3); ptsname(3) returns /dev/ttysNNN.
+ */
+#define LINUX_TIOCGPTN 0x80045430   /* _IOR('T', 0x30, unsigned int) */
+#define LINUX_TIOCSPTLCK 0x40045431 /* _IOW('T', 0x31, int) */
+#define LINUX_TIOCGPTPEER 0x5441    /* _IO('T', 0x41); arg is open flags */
 
 /* Linux open flags. */
 #define LINUX_O_RDONLY 0x0000

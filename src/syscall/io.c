@@ -20,6 +20,7 @@
 #include <stdbool.h>
 #include <limits.h>
 #include <pthread.h>
+#include <ctype.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
 #include <sys/ioctl.h>
@@ -1551,6 +1552,7 @@ int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg)
     }
     case LINUX_TIOCGWINSZ: {
         /* Get terminal window size */
+        (void) proc_pty_master_adopt(fd);
         struct winsize ws;
         if (ioctl(host_fd, TIOCGWINSZ, &ws) < 0) {
             host_fd_ref_close(&host_ref);
@@ -1568,6 +1570,33 @@ int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg)
         }
         host_fd_ref_close(&host_ref);
         return 0;
+    }
+    case LINUX_TIOCSWINSZ: {
+        /* Set terminal window size. Same struct as TIOCGWINSZ; foot, sshd,
+         * tmux, and any libvte-derived emulator call this on the PTY master
+         * after spawning the slave child. Without it, terminal startup fails
+         * with -ENOTTY from the default arm below (issue #88).
+         *
+         * A master received through SCM_RIGHTS bypasses /dev/ptmx open
+         * interception, so lazily create its keepalive before the host ioctl.
+         * The helper is a no-op for non-pty fds; the real ioctl below still
+         * supplies the final errno.
+         */
+        linux_winsize_t lws;
+        if (guest_read_small(g, arg, &lws, sizeof(lws)) < 0) {
+            host_fd_ref_close(&host_ref);
+            return -LINUX_EFAULT;
+        }
+        struct winsize ws = {
+            .ws_row = lws.ws_row,
+            .ws_col = lws.ws_col,
+            .ws_xpixel = lws.ws_xpixel,
+            .ws_ypixel = lws.ws_ypixel,
+        };
+        (void) proc_pty_master_adopt(fd);
+        int rc = ioctl(host_fd, TIOCSWINSZ, &ws);
+        host_fd_ref_close(&host_ref);
+        return rc < 0 ? linux_errno() : 0;
     }
 
     case LINUX_TCGETS: {
@@ -1713,6 +1742,96 @@ int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg)
         }
         host_fd_ref_close(&host_ref);
         return 0;
+    }
+
+    case LINUX_TIOCGPTN: {
+        /* Get the slave pty number associated with a /dev/ptmx master fd.
+         * Pass the guest fd: proc_pty_master_adopt snapshots the canonical
+         * (host_fd, generation) under fd_lock, performs the slave open on a
+         * private dup, then re-validates the slot before publishing the
+         * keepalive. Passing the per-syscall host_fd_ref dup or a raw host
+         * fd would race with sibling close+reuse.
+         */
+        uint32_t val = proc_pty_master_adopt(fd);
+        if (val == UINT32_MAX) {
+            host_fd_ref_close(&host_ref);
+            return -LINUX_ENOTTY;
+        }
+        if (guest_write_small(g, arg, &val, sizeof(val)) < 0) {
+            host_fd_ref_close(&host_ref);
+            return -LINUX_EFAULT;
+        }
+        host_fd_ref_close(&host_ref);
+        return 0;
+    }
+    case LINUX_TIOCSPTLCK: {
+        /* Lock/unlock the slave side of a pty. glibc unlockpt() always passes
+         * 0 (unlock); util-linux's setlock(1) passes 1 to lock. macOS exposes
+         * unlockpt(3) but no re-lock primitive, so the lock branch is accepted
+         * as a best-effort no-op for real ptmx masters rather than surfacing
+         * as -EINVAL: an application probing the result would otherwise
+         * misread the failure as "this kernel has no devpts".
+         */
+        int32_t lock = 0;
+        if (guest_read_small(g, arg, &lock, sizeof(lock)) < 0) {
+            host_fd_ref_close(&host_ref);
+            return -LINUX_EFAULT;
+        }
+        int rc = 0;
+        if (lock == 0) {
+            rc = unlockpt(host_fd);
+        } else {
+            char slave[64];
+            if (ptsname_r(host_fd, slave, sizeof(slave)) != 0) {
+                host_fd_ref_close(&host_ref);
+                return -LINUX_ENOTTY;
+            }
+        }
+        host_fd_ref_close(&host_ref);
+        return rc < 0 ? linux_errno() : 0;
+    }
+    case LINUX_TIOCGPTPEER: {
+        /* Return a fresh fd referring to the slave side of a /dev/ptmx master.
+         * Linux added this in 4.13 so callers can avoid the ptsname(3) round
+         * trip and any /dev/pts visibility races. The arg holds open(2)-style
+         * flags. Restrict to the bits Linux's pty driver actually honors
+         * (accmode + O_NOCTTY + O_NONBLOCK + O_CLOEXEC); any other bit, in
+         * particular O_CREAT / O_TRUNC / O_EXCL / O_PATH, would be silently
+         * ignored on Linux and is rejected with EINVAL here so misuse does
+         * not leak nonsense flags into the guest fd table.
+         */
+        int linux_flags = (int) arg;
+        const int allowed = LINUX_O_ACCMODE | LINUX_O_NOCTTY |
+                            LINUX_O_NONBLOCK | LINUX_O_CLOEXEC;
+        if (linux_flags & ~allowed) {
+            host_fd_ref_close(&host_ref);
+            return -LINUX_EINVAL;
+        }
+        char slave[64];
+        if (ptsname_r(host_fd, slave, sizeof(slave)) != 0) {
+            host_fd_ref_close(&host_ref);
+            return -LINUX_ENOTTY;
+        }
+        int oflags = translate_open_flags(linux_flags);
+        int host_slave_fd = open(slave, oflags);
+        if (host_slave_fd < 0) {
+            int saved_errno = errno;
+            host_fd_ref_close(&host_ref);
+            errno = saved_errno;
+            return linux_errno();
+        }
+        host_fd_ref_close(&host_ref);
+        int guest_fd = fd_alloc(FD_REGULAR, host_slave_fd, NULL);
+        if (guest_fd < 0) {
+            close(host_slave_fd);
+            return -LINUX_EMFILE;
+        }
+        /* Track CLOEXEC + accmode in the guest table so exec honors them; the
+         * host fd's own FD_CLOEXEC is per-descriptor and would be lost on the
+         * dup that host_fd_ref hands multi-threaded callers.
+         */
+        fd_publish_linux_flags(guest_fd, linux_flags);
+        return guest_fd;
     }
 
     case LINUX_FIONBIO: {
