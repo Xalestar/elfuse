@@ -105,19 +105,33 @@ static const char *proc_stateful_file_path(const char *path)
     return NULL;
 }
 
-static void fd_note_proc_path(int guest_fd, const char *path)
+/* Resolve the proc_path the fd table should record for an intercepted path.
+ * Returns true and fills *out when a mapping exists; false otherwise so the
+ * caller can skip the install entirely. Pure string work; safe to call before
+ * any lock acquisition.
+ */
+static bool resolve_virtual_path(const char *path, char *out, size_t out_size)
 {
-    if (!path || strncmp(path, "/proc", 5) != 0)
-        return;
+    if (!path || out_size == 0)
+        return false;
+
+    if (!strcmp(path, "/dev/ptmx")) {
+        str_copy_trunc(out, path, out_size);
+        return true;
+    }
+
+    if (strncmp(path, "/proc", 5) != 0)
+        return false;
 
     char virt_buf[64];
     const char *virt = proc_virtual_dir_path(path, virt_buf, sizeof(virt_buf));
     if (!virt)
         virt = proc_stateful_file_path(path);
+    if (!virt)
+        return false;
 
-    if (virt)
-        str_copy_trunc(fd_table[guest_fd].proc_path, virt,
-                       sizeof(fd_table[guest_fd].proc_path));
+    str_copy_trunc(out, virt, out_size);
+    return true;
 }
 
 static const char *proc_virtual_dir_path(const char *path,
@@ -185,7 +199,8 @@ static int fd_alloc_opened_host(int host_fd,
                                 int type,
                                 int linux_flags,
                                 int min_guest_fd,
-                                void (*cleanup)(int))
+                                void (*cleanup)(int),
+                                const char *virtual_path)
 {
     DIR *dir = NULL;
 
@@ -213,16 +228,23 @@ static int fd_alloc_opened_host(int host_fd,
         return -1;
     }
 
-    /* Publish linux_flags, dir, and the urandom bitmap bit atomically
-     * with respect to the slot's identity. fd_alloc_*_relaxed drops
+    /* Resolve the virtual-path stamp before taking fd_lock; the helper is pure
+     * string work and must not run inside the critical section.
+     */
+    char proc_path_buf[FD_VIRTUAL_PATH_MAX];
+    bool have_proc_path = resolve_virtual_path(virtual_path, proc_path_buf,
+                                               sizeof(proc_path_buf));
+
+    /* Publish linux_flags, dir, proc_path, and the urandom bitmap bit
+     * atomically with respect to the slot's identity. fd_alloc_*_relaxed drops
      * fd_lock before returning, so a sibling vCPU's pathological
-     * close(guest_fd) + open() could reuse the slot between alloc and
-     * the metadata install below. Re-acquire fd_lock and verify the
-     * (type, host_fd) tuple still matches what just got allocated;
-     * if it does not, the slot belongs to a different file now and
-     * any install would clobber the sibling's entry. The sibling's
-     * close path already cleaned up our host_fd via fd_cleanup_entry,
-     * so this side only owns dir, which gets closed below.
+     * close(guest_fd) + open() could reuse the slot between alloc and the
+     * metadata install below. Re-acquire fd_lock and verify the
+     * (type, host_fd) tuple still matches what just got allocated; if it does
+     * not, the slot belongs to a different file now and any install would
+     * clobber the sibling's entry. The sibling's close path already cleaned up
+     * the host_fd of this side via fd_cleanup_entry, so this side only owns
+     * dir, which gets closed below.
      */
     bool installed = false;
     pthread_mutex_lock(&fd_lock);
@@ -231,6 +253,9 @@ static int fd_alloc_opened_host(int host_fd,
         fd_table[guest_fd].linux_flags = linux_flags;
         if (dir)
             fd_table[guest_fd].dir = dir;
+        if (have_proc_path)
+            memcpy(fd_table[guest_fd].proc_path, proc_path_buf,
+                   sizeof(proc_path_buf));
         bool readable_urandom =
             type == FD_URANDOM &&
             (linux_flags & LINUX_O_ACCMODE) != LINUX_O_WRONLY;
@@ -283,8 +308,8 @@ int64_t sys_openat_path(guest_t *g,
                 close_keep_errno(sidecar_fd);
                 return linux_errno();
             }
-            int guest_fd =
-                fd_alloc_opened_host(sidecar_fd, type, linux_flags, -1, NULL);
+            int guest_fd = fd_alloc_opened_host(sidecar_fd, type, linux_flags,
+                                                -1, NULL, NULL);
             if (guest_fd < 0) {
                 close_keep_errno(sidecar_fd);
                 return linux_errno();
@@ -314,7 +339,7 @@ int64_t sys_openat_path(guest_t *g,
             return linux_errno();
         }
         int guest_fd =
-            fd_alloc_opened_host(host_fd, type, linux_flags, -1, NULL);
+            fd_alloc_opened_host(host_fd, type, linux_flags, -1, NULL, NULL);
         if (guest_fd < 0) {
             close_keep_errno(host_fd);
             return linux_errno();
@@ -353,15 +378,14 @@ int64_t sys_openat_path(guest_t *g,
             }
             int min_guest_fd =
                 (!strncmp(tx.intercept_path, "/dev/", 5)) ? -1 : 128;
-            int guest_fd =
-                fd_alloc_opened_host(intercepted, type, linux_flags,
-                                     min_guest_fd, fd_cleanup_for_type(type));
+            int guest_fd = fd_alloc_opened_host(
+                intercepted, type, linux_flags, min_guest_fd,
+                fd_cleanup_for_type(type), tx.intercept_path);
             if (guest_fd < 0) {
                 proc_pty_close_keepalive(intercepted);
                 close_keep_errno(intercepted);
                 return linux_errno();
             }
-            fd_note_proc_path(guest_fd, tx.intercept_path);
             return guest_fd;
         }
         if (intercepted == -1) {
@@ -382,7 +406,7 @@ int64_t sys_openat_path(guest_t *g,
             return linux_errno();
         }
         int guest_fd =
-            fd_alloc_opened_host(host_fd, type, linux_flags, -1, NULL);
+            fd_alloc_opened_host(host_fd, type, linux_flags, -1, NULL, NULL);
         if (guest_fd < 0) {
             close_keep_errno(host_fd);
             return linux_errno();
@@ -404,7 +428,8 @@ int64_t sys_openat_path(guest_t *g,
         close_keep_errno(host_fd);
         return linux_errno();
     }
-    int guest_fd = fd_alloc_opened_host(host_fd, type, linux_flags, -1, NULL);
+    int guest_fd =
+        fd_alloc_opened_host(host_fd, type, linux_flags, -1, NULL, NULL);
     if (guest_fd < 0) {
         close_keep_errno(host_fd);
         return linux_errno();

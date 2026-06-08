@@ -2263,9 +2263,24 @@ int proc_intercept_open(const guest_t *g,
                         int linux_flags,
                         int mode)
 {
-    /* /dev/ptmx -> host /dev/ptmx + keepalive slave (see pty_open_master). */
-    if (!strcmp(path, "/dev/ptmx"))
+    /* /dev/ptmx -> host /dev/ptmx + keepalive slave (see pty_open_master).
+     * O_PATH is path-only on Linux: it must not run the device open hook or
+     * allocate a pty pair. Use a harmless backing fd; FD_PATH gates I/O and
+     * ioctl, while proc_intercept_stat supplies the visible device metadata.
+     */
+    if (!strcmp(path, "/dev/ptmx")) {
+        if (linux_flags & LINUX_O_PATH) {
+            if (linux_flags & LINUX_O_DIRECTORY) {
+                errno = ENOTDIR;
+                return -1;
+            }
+            int oflags = O_RDONLY;
+            if (linux_flags & LINUX_O_CLOEXEC)
+                oflags |= O_CLOEXEC;
+            return open("/dev/null", oflags);
+        }
         return pty_open_master(linux_flags);
+    }
 
     /* /dev/null, /dev/zero, /dev/(u)random, /dev/tty */
     const char *host_dev = NULL;
@@ -3293,6 +3308,23 @@ int proc_intercept_stat(const char *path, struct stat *st)
      */
     if (!strcmp(path, "/dev/fuse"))
         return fuse_proc_stat(st);
+
+    /* Linux /dev/ptmx is the Unix98 pty multiplexer character device (5:2).
+     * Keep this synthetic so O_PATH probes can fstat the path fd without
+     * forcing a real host /dev/ptmx open, which would allocate a pty.
+     */
+    if (!strcmp(path, "/dev/ptmx")) {
+        memset(st, 0, sizeof(*st));
+        st->st_mode = S_IFCHR | 0666;
+        st->st_nlink = 1;
+        st->st_dev = PROC_SYNTH_DEV;
+        st->st_ino = proc_synth_ino(path);
+        st->st_uid = proc_get_uid();
+        st->st_gid = proc_get_gid();
+        st->st_rdev = ((dev_t) 5u << 24) | (dev_t) 2u;
+        st->st_blksize = 1024;
+        return 0;
+    }
 
     /* /dev/shm is a directory */
     if (!strcmp(path, "/dev/shm") || !strcmp(path, "/dev/shm/")) {

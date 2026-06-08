@@ -30,6 +30,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
+#include <sys/syscall.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <termios.h>
@@ -49,8 +50,42 @@
 #ifndef TIOCGPTPEER
 #define TIOCGPTPEER 0x5441
 #endif
+#ifndef O_PATH
+#define O_PATH 010000000
+#endif
+#ifndef AT_EMPTY_PATH
+#define AT_EMPTY_PATH 0x1000
+#endif
+#ifndef SYS_statx
+#define SYS_statx 291
+#endif
 
 int passes = 0, fails = 0;
+
+static int count_pts_entries(void)
+{
+    DIR *dir = opendir("/dev/pts");
+    if (!dir)
+        return -1;
+
+    int count = 0;
+    struct dirent *ent;
+    while ((ent = readdir(dir))) {
+        if (!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, ".."))
+            continue;
+        int numeric = 1;
+        for (const char *p = ent->d_name; *p; p++) {
+            if (!isdigit((unsigned char) *p)) {
+                numeric = 0;
+                break;
+            }
+        }
+        if (numeric)
+            count++;
+    }
+    closedir(dir);
+    return count;
+}
 
 int main(void)
 {
@@ -67,6 +102,40 @@ int main(void)
      * not corrupt elfuse's own file table.
      */
     close(STDIN_FILENO);
+
+    TEST("open(/dev/ptmx, O_PATH) does not allocate a pty");
+    int before_path_pts = count_pts_entries();
+    int path_fd = open("/dev/ptmx", O_PATH | O_CLOEXEC);
+    int after_path_pts = count_pts_entries();
+    if (path_fd >= 0) {
+        struct stat ptmx_path_st;
+        int fstat_rc = fstat(path_fd, &ptmx_path_st);
+        struct stat ptmx_at_st;
+        int fstatat_rc = fstatat(path_fd, "", &ptmx_at_st, AT_EMPTY_PATH);
+        struct statx ptmx_sx;
+        memset(&ptmx_sx, 0, sizeof(ptmx_sx));
+        long statx_rc =
+            syscall(SYS_statx, path_fd, "", AT_EMPTY_PATH, 0x7ff, &ptmx_sx);
+        errno = 0;
+        int fchdir_rc = fchdir(path_fd);
+        int fchdir_errno = errno;
+        int ok = before_path_pts >= 0 && after_path_pts == before_path_pts &&
+                 fstat_rc == 0 && S_ISCHR(ptmx_path_st.st_mode) &&
+                 major(ptmx_path_st.st_rdev) == 5 &&
+                 minor(ptmx_path_st.st_rdev) == 2 && fstatat_rc == 0 &&
+                 S_ISCHR(ptmx_at_st.st_mode) &&
+                 major(ptmx_at_st.st_rdev) == 5 &&
+                 minor(ptmx_at_st.st_rdev) == 2 && statx_rc == 0 &&
+                 S_ISCHR(ptmx_sx.stx_mode) && ptmx_sx.stx_rdev_major == 5 &&
+                 ptmx_sx.stx_rdev_minor == 2 && fchdir_rc < 0 &&
+                 fchdir_errno == ENOTDIR;
+        close(path_fd);
+        EXPECT_TRUE(ok,
+                    "O_PATH open allocated a pty or exposed wrong path fd "
+                    "semantics");
+    } else {
+        FAIL("O_PATH /dev/ptmx open failed");
+    }
 
     int ptmx = open("/dev/ptmx", O_RDWR | O_NOCTTY);
     TEST("open(/dev/ptmx, O_RDWR | O_NOCTTY)");
