@@ -387,6 +387,7 @@ typedef struct {
 #define LINUX_O_TRUNC 0x0200
 #define LINUX_O_APPEND 0x0400
 #define LINUX_O_NONBLOCK 0x0800
+#define LINUX_O_DSYNC 0x1000
 #define LINUX_O_ASYNC 0x2000
 /* aarch64-linux open flag values (from asm-generic/fcntl.h).
  * These differ from x86_64-linux values.
@@ -397,7 +398,10 @@ typedef struct {
 #define LINUX_O_LARGEFILE 0x20000 /* 0400000 octal, ignored on LP64 */
 #define LINUX_O_NOATIME 0x40000   /* 01000000 octal */
 #define LINUX_O_CLOEXEC 0x80000   /* 02000000 octal */
+#define LINUX_O_SYNC 0x101000     /* __O_SYNC | O_DSYNC */
 #define LINUX_O_PATH 0x200000     /* 010000000 octal */
+#define LINUX___O_TMPFILE 0x400000
+#define LINUX_O_TMPFILE (LINUX___O_TMPFILE | LINUX_O_DIRECTORY)
 
 /* Linux fallocate(2) mode bits (linux/falloc.h). PUNCH_HOLE requires the
  * caller to also set KEEP_SIZE per the manpage; collapse/insert/zero/unshare

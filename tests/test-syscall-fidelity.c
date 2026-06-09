@@ -171,6 +171,53 @@ struct open_how {
 #define RESOLVE_BENEATH 0x08
 #define RESOLVE_IN_ROOT 0x10
 
+#ifndef O_TMPFILE
+#define O_TMPFILE (020000000 | O_DIRECTORY)
+#endif
+
+static void expect_openat2_errno(const char *name,
+                                 int dirfd,
+                                 const char *path,
+                                 unsigned long long flags,
+                                 unsigned long long mode,
+                                 unsigned long long resolve,
+                                 int expected_errno)
+{
+    TEST(name);
+    struct open_how how = {.flags = flags, .mode = mode, .resolve = resolve};
+    errno = 0;
+    long fd = syscall(SYS_openat2, dirfd, path, &how, sizeof(how));
+    if (fd >= 0) {
+        close((int) fd);
+        FAIL("openat2 unexpectedly succeeded");
+        return;
+    }
+    EXPECT_TRUE(errno == expected_errno, "wrong errno");
+}
+
+static void expect_fd_magiclink_rejected(const char *path_label,
+                                         int dirfd,
+                                         const char *path)
+{
+    static const struct {
+        const char *resolve_name;
+        unsigned long long resolve;
+        int expected_errno;
+    } cases[] = {
+        {"NO_MAGICLINKS", RESOLVE_NO_MAGICLINKS, ELOOP},
+        {"NO_SYMLINKS", RESOLVE_NO_SYMLINKS, ELOOP},
+        {"NO_XDEV", RESOLVE_NO_XDEV, EXDEV},
+    };
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char name[128];
+        snprintf(name, sizeof(name), "openat2 %s rejects %s",
+                 cases[i].resolve_name, path_label);
+        expect_openat2_errno(name, dirfd, path, O_RDONLY, 0, cases[i].resolve,
+                             cases[i].expected_errno);
+    }
+}
+
 static void test_openat2_basic(void)
 {
     TEST("openat2 basic open");
@@ -182,6 +229,86 @@ static void test_openat2_basic(void)
     }
     close(fd);
     PASS();
+}
+
+static void test_openat2_rejects_nonzero_how_extension(void)
+{
+    TEST("openat2 rejects nonzero open_how extension");
+    struct {
+        struct open_how how;
+        unsigned long long extra;
+    } ext = {
+        .how = {.flags = O_RDONLY, .mode = 0, .resolve = 0},
+        .extra = 1,
+    };
+    long fd = syscall(SYS_openat2, AT_FDCWD, "/dev/null", &ext, sizeof(ext));
+    if (fd >= 0) {
+        close((int) fd);
+        FAIL("accepted nonzero open_how extension");
+        return;
+    }
+    EXPECT_TRUE(errno == E2BIG, "wrong errno");
+}
+
+static void test_openat2_rejects_oversized_how(void)
+{
+    TEST("openat2 rejects oversized open_how");
+    struct open_how how = {.flags = O_RDONLY, .mode = 0, .resolve = 0};
+    long fd = syscall(SYS_openat2, AT_FDCWD, "/dev/null", &how, 4097);
+    if (fd >= 0) {
+        close((int) fd);
+        FAIL("accepted oversized open_how");
+        return;
+    }
+    EXPECT_TRUE(errno == E2BIG, "wrong errno");
+}
+
+static void test_openat2_rejects_unknown_flags(void)
+{
+    TEST("openat2 rejects unknown flags");
+    struct open_how how = {.flags = 1ULL << 63, .mode = 0, .resolve = 0};
+    long fd = syscall(SYS_openat2, AT_FDCWD, "/dev/null", &how, sizeof(how));
+    if (fd >= 0) {
+        close((int) fd);
+        FAIL("accepted unknown flags");
+        return;
+    }
+    EXPECT_TRUE(errno == EINVAL, "wrong errno");
+}
+
+static void test_openat2_rejects_mode_without_create(void)
+{
+    TEST("openat2 rejects mode without create");
+    struct open_how how = {.flags = O_RDONLY, .mode = 0600, .resolve = 0};
+    long fd = syscall(SYS_openat2, AT_FDCWD, "/dev/null", &how, sizeof(how));
+    if (fd >= 0) {
+        close((int) fd);
+        FAIL("accepted mode without create");
+        return;
+    }
+    EXPECT_TRUE(errno == EINVAL, "wrong errno");
+}
+
+static void test_openat2_rejects_beneath_in_root(void)
+{
+    expect_openat2_errno("openat2 rejects BENEATH|IN_ROOT", AT_FDCWD,
+                         "/dev/null", O_RDONLY, 0,
+                         RESOLVE_BENEATH | RESOLVE_IN_ROOT, EINVAL);
+}
+
+static void test_openat2_rejects_directory_create(void)
+{
+    const char *path = "/tmp/elfuse-openat2-directory-create-probe";
+    unlink(path);
+    expect_openat2_errno("openat2 rejects O_DIRECTORY|O_CREAT", AT_FDCWD, path,
+                         O_RDONLY | O_DIRECTORY | O_CREAT, 0600, 0, EINVAL);
+    unlink(path);
+}
+
+static void test_openat2_rejects_tmpfile_readonly(void)
+{
+    expect_openat2_errno("openat2 rejects O_TMPFILE|O_RDONLY", AT_FDCWD, "/tmp",
+                         O_TMPFILE | O_RDONLY, 0600, 0, EINVAL);
 }
 
 static void test_openat2_resolve_beneath(void)
@@ -816,6 +943,156 @@ static void test_openat2_resolve_no_xdev_rejects_proc_fd_magiclink(void)
     EXPECT_TRUE(errno == EXDEV, "wrong errno");
 }
 
+static void test_openat2_rejects_proc_pid_fd_magiclink(void)
+{
+    int helper = open("/tmp", O_RDONLY | O_DIRECTORY);
+    if (helper < 0) {
+        TEST("openat2 prepares /proc/<pid>/fd helper");
+        FAIL("open /tmp helper");
+        return;
+    }
+
+    char path[128];
+    if (snprintf(path, sizeof(path), "/proc/%ld/fd/%d", (long) getpid(),
+                 helper) >= (int) sizeof(path)) {
+        close(helper);
+        TEST("openat2 prepares /proc/<pid>/fd helper");
+        FAIL("path too long");
+        return;
+    }
+    expect_fd_magiclink_rejected("absolute /proc/<pid>/fd", AT_FDCWD, path);
+
+    int procfd = open("/proc", O_RDONLY | O_DIRECTORY);
+    if (procfd < 0) {
+        close(helper);
+        TEST("openat2 prepares /proc/<pid>/fd helper");
+        FAIL("open /proc");
+        return;
+    }
+    if (snprintf(path, sizeof(path), "%ld/fd/%d", (long) getpid(), helper) >=
+        (int) sizeof(path)) {
+        close(procfd);
+        close(helper);
+        TEST("openat2 prepares /proc/<pid>/fd helper");
+        FAIL("path too long");
+        return;
+    }
+    expect_fd_magiclink_rejected("dirfd /proc <pid>/fd", procfd, path);
+    close(procfd);
+    close(helper);
+}
+
+static void test_openat2_resolve_no_xdev_rejects_dev_fd_magiclink(void)
+{
+    TEST("openat2 RESOLVE_NO_XDEV rejects /dev/fd magic link");
+    int helper = open("/tmp", O_RDONLY | O_DIRECTORY);
+    if (helper < 0) {
+        FAIL("open /tmp helper");
+        return;
+    }
+    int dirfd = open("/dev", O_RDONLY | O_DIRECTORY);
+    if (dirfd < 0) {
+        close(helper);
+        FAIL("open /dev");
+        return;
+    }
+
+    char link_path[64];
+    snprintf(link_path, sizeof(link_path), "fd/%d", helper);
+    struct open_how how = {
+        .flags = O_RDONLY, .mode = 0, .resolve = RESOLVE_NO_XDEV};
+    long fd = syscall(SYS_openat2, dirfd, link_path, &how, sizeof(how));
+    close(dirfd);
+    close(helper);
+    if (fd >= 0) {
+        close((int) fd);
+        FAIL("expected EXDEV for /dev/fd magic-link traversal");
+        return;
+    }
+    EXPECT_TRUE(errno == EXDEV, "wrong errno");
+}
+
+static void test_openat2_rejects_dev_fd_magiclink_variants(void)
+{
+    int helper = open("/tmp", O_RDONLY | O_DIRECTORY);
+    if (helper < 0) {
+        TEST("openat2 prepares /dev/fd helper");
+        FAIL("open /tmp helper");
+        return;
+    }
+
+    char path[128];
+    if (snprintf(path, sizeof(path), "/dev/fd/%d", helper) >=
+        (int) sizeof(path)) {
+        close(helper);
+        TEST("openat2 prepares /dev/fd helper");
+        FAIL("path too long");
+        return;
+    }
+    expect_fd_magiclink_rejected("absolute /dev/fd", AT_FDCWD, path);
+
+    int rootfd = open("/", O_RDONLY | O_DIRECTORY);
+    if (rootfd < 0) {
+        close(helper);
+        TEST("openat2 prepares /dev/fd helper");
+        FAIL("open /");
+        return;
+    }
+    if (snprintf(path, sizeof(path), "dev/fd/%d", helper) >=
+        (int) sizeof(path)) {
+        close(rootfd);
+        close(helper);
+        TEST("openat2 prepares /dev/fd helper");
+        FAIL("path too long");
+        return;
+    }
+    expect_fd_magiclink_rejected("dirfd / dev/fd", rootfd, path);
+    close(rootfd);
+
+    int cwdfd = open(".", O_RDONLY | O_DIRECTORY);
+    if (cwdfd < 0) {
+        close(helper);
+        TEST("openat2 prepares /dev/fd helper");
+        FAIL("open cwd");
+        return;
+    }
+    if (chdir("/") < 0) {
+        close(cwdfd);
+        close(helper);
+        TEST("openat2 prepares /dev/fd helper");
+        FAIL("chdir /");
+        return;
+    }
+    expect_fd_magiclink_rejected("cwd / dev/fd", AT_FDCWD, path);
+    if (fchdir(cwdfd) < 0) {
+        close(cwdfd);
+        close(helper);
+        TEST("openat2 prepares /dev/fd helper");
+        FAIL("restore cwd");
+        return;
+    }
+    close(cwdfd);
+
+    int devfd = open("/dev", O_RDONLY | O_DIRECTORY);
+    if (devfd < 0) {
+        close(helper);
+        TEST("openat2 prepares /dev/fd helper");
+        FAIL("open /dev");
+        return;
+    }
+    if (snprintf(path, sizeof(path), "shm/../fd/%d", helper) >=
+        (int) sizeof(path)) {
+        close(devfd);
+        close(helper);
+        TEST("openat2 prepares /dev/fd helper");
+        FAIL("path too long");
+        return;
+    }
+    expect_fd_magiclink_rejected("dirfd /dev shm/../fd", devfd, path);
+    close(devfd);
+    close(helper);
+}
+
 static void test_openat2_resolve_no_xdev_rejects_normalized_proc_fd_magiclink(
     void)
 {
@@ -1024,6 +1301,13 @@ int main(void)
 
     /* openat2 RESOLVE_* */
     test_openat2_basic();
+    test_openat2_rejects_nonzero_how_extension();
+    test_openat2_rejects_oversized_how();
+    test_openat2_rejects_unknown_flags();
+    test_openat2_rejects_mode_without_create();
+    test_openat2_rejects_beneath_in_root();
+    test_openat2_rejects_directory_create();
+    test_openat2_rejects_tmpfile_readonly();
     test_openat2_resolve_beneath();
     test_openat2_resolve_beneath_allows_internal_dotdot();
     test_openat2_resolve_in_root_clamps_dotdot();
@@ -1045,6 +1329,9 @@ int main(void)
     test_openat2_resolve_no_xdev_rejects_symlink_to_proc();
     test_openat2_resolve_no_xdev_in_root_clamps_dotdot();
     test_openat2_resolve_no_xdev_rejects_proc_fd_magiclink();
+    test_openat2_rejects_proc_pid_fd_magiclink();
+    test_openat2_resolve_no_xdev_rejects_dev_fd_magiclink();
+    test_openat2_rejects_dev_fd_magiclink_variants();
     test_openat2_resolve_no_xdev_rejects_normalized_proc_fd_magiclink();
 
     /* O_PATH */

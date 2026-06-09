@@ -655,35 +655,6 @@ int path_openat2_normalize_in_root(const char *path, char *out, size_t outsz)
     return 0;
 }
 
-int path_openat2_is_proc_magiclink(guest_fd_t dirfd, const char *path)
-{
-    if (!path)
-        return 0;
-
-    char normalized[LINUX_PATH_MAX];
-    const char *candidate = path;
-
-    if (path[0] == '/') {
-        if (strncmp(path, "/proc", 5) || (path[5] != '\0' && path[5] != '/'))
-            return 0;
-
-        size_t marks[PROC_PATH_COMPONENTS_MAX];
-        size_t depth;
-        if (proc_seed_absolute_path(path, normalized, sizeof(normalized), marks,
-                                    ARRAY_SIZE(marks), &depth) < 0)
-            return 0;
-        candidate = normalized;
-    } else {
-        int rc =
-            resolve_proc_at_path(dirfd, path, normalized, sizeof(normalized));
-        if (rc <= 0)
-            return 0;
-        candidate = normalized;
-    }
-
-    return !strncmp(candidate, "/proc/self/fd/", 14);
-}
-
 static int path_openat2_dirfd_host_path(guest_fd_t dirfd,
                                         char *out,
                                         size_t outsz)
@@ -907,6 +878,51 @@ static int dirfd_guest_base_path(guest_fd_t dirfd, char *out, size_t outsz)
     out[0] = '/';
     out[1] = '\0';
     return 0;
+}
+
+static bool normalized_proc_self_fd_anchor(const char *path)
+{
+    if (!strncmp(path, "proc/self/fd/", 13))
+        return true;
+    if (strncmp(path, "proc/", 5))
+        return false;
+
+    char *endp;
+    const char *pid_start = path + sizeof("proc/") - 1;
+    errno = 0;
+    long long pid = strtoll(pid_start, &endp, 10);
+    if (endp == pid_start || errno == ERANGE ||
+        pid != (long long) proc_get_pid())
+        return false;
+    return strncmp(endp, "/fd/", 4) == 0;
+}
+
+bool path_openat2_is_fd_magiclink_anchor(guest_fd_t dirfd, const char *path)
+{
+    if (!path)
+        return false;
+
+    char normalized[LINUX_PATH_MAX];
+
+    if (path[0] == '/') {
+        if (path_openat2_normalize_in_root(path, normalized,
+                                           sizeof(normalized)) < 0)
+            return false;
+    } else {
+        char base[LINUX_PATH_MAX];
+        char joined[LINUX_PATH_MAX];
+        if (dirfd_guest_base_path(dirfd, base, sizeof(base)) < 0)
+            return false;
+        if (snprintf(joined, sizeof(joined), "%s/%s", base, path) >=
+            (int) sizeof(joined))
+            return false;
+        if (path_openat2_normalize_in_root(joined, normalized,
+                                           sizeof(normalized)) < 0)
+            return false;
+    }
+
+    return strncmp(normalized, "dev/fd/", 7) == 0 ||
+           normalized_proc_self_fd_anchor(normalized);
 }
 
 /* Pop one trailing component from an absolute path, refusing to drop

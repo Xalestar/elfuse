@@ -1362,6 +1362,69 @@ static int64_t sc_memfd_create(guest_t *g,
     (RESOLVE_NO_XDEV | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS | \
      RESOLVE_BENEATH | RESOLVE_IN_ROOT | RESOLVE_CACHED)
 
+/* Linux openat2() treats the user-supplied open_how size as an ABI
+ * version. The first published layout has three u64 fields
+ * (flags, mode, resolve), so v0 is 24 bytes. Bytes beyond that are
+ * future extension fields: all-zero tails are ignored, nonzero tails
+ * return E2BIG. Keep the same page-sized upper bound Linux applies
+ * before checking the tail.
+ */
+#define OPEN_HOW_SIZE_VER0 24
+#define OPEN_HOW_MAX_SIZE 4096
+
+static int64_t openat2_check_zero_tail(guest_t *g,
+                                       uint64_t how_gva,
+                                       uint64_t size)
+{
+    if (size == OPEN_HOW_SIZE_VER0)
+        return 0;
+
+    uint64_t off = OPEN_HOW_SIZE_VER0;
+    while (off < size) {
+        uint8_t tail[64];
+        size_t chunk = (size_t) (size - off);
+        if (chunk > sizeof(tail))
+            chunk = sizeof(tail);
+        if (how_gva > UINT64_MAX - off ||
+            guest_read_small(g, how_gva + off, tail, chunk) < 0)
+            return -LINUX_EFAULT;
+        for (size_t i = 0; i < chunk; i++) {
+            if (tail[i] != 0)
+                return -LINUX_E2BIG;
+        }
+        off += chunk;
+    }
+    return 0;
+}
+
+static bool openat2_flags_valid(uint64_t flags, uint64_t mode)
+{
+    const uint64_t known_flags =
+        LINUX_O_ACCMODE | LINUX_O_CREAT | LINUX_O_EXCL | LINUX_O_NOCTTY |
+        LINUX_O_TRUNC | LINUX_O_APPEND | LINUX_O_NONBLOCK | LINUX_O_DSYNC |
+        LINUX_O_ASYNC | LINUX_O_DIRECTORY | LINUX_O_NOFOLLOW | LINUX_O_DIRECT |
+        LINUX_O_LARGEFILE | LINUX_O_NOATIME | LINUX_O_CLOEXEC | LINUX_O_SYNC |
+        LINUX_O_PATH | LINUX___O_TMPFILE;
+
+    if (flags & ~known_flags)
+        return false;
+    if ((flags & LINUX_O_PATH) &&
+        (flags & ~(LINUX_O_PATH | LINUX_O_CLOEXEC | LINUX_O_DIRECTORY |
+                   LINUX_O_NOFOLLOW)))
+        return false;
+    if (flags & LINUX___O_TMPFILE)
+        return false;
+    if ((flags & (LINUX_O_DIRECTORY | LINUX_O_CREAT)) ==
+        (LINUX_O_DIRECTORY | LINUX_O_CREAT))
+        return false;
+    if (mode & ~07777ULL)
+        return false;
+    if (mode != 0 && !(flags & LINUX_O_CREAT))
+        return false;
+
+    return true;
+}
+
 static int64_t sc_openat2(guest_t *g,
                           uint64_t x0,
                           uint64_t x1,
@@ -1374,16 +1437,25 @@ static int64_t sc_openat2(guest_t *g,
     (void) x4;
     (void) x5;
     (void) verbose;
-    if (x3 < 24)
+    if (x3 < OPEN_HOW_SIZE_VER0)
         return -LINUX_EINVAL;
+    if (x3 > OPEN_HOW_MAX_SIZE)
+        return -LINUX_E2BIG;
     uint64_t how[3];
     if (guest_read_small(g, x2, how, sizeof(how)) < 0)
         return -LINUX_EFAULT;
+    int64_t tail_rc = openat2_check_zero_tail(g, x2, x3);
+    if (tail_rc < 0)
+        return tail_rc;
 
     uint64_t oflags = how[0], mode = how[1];
     uint64_t resolve = how[2];
 
+    if (!openat2_flags_valid(oflags, mode))
+        return -LINUX_EINVAL;
     if (resolve & ~(uint64_t) RESOLVE_ALL)
+        return -LINUX_EINVAL;
+    if ((resolve & RESOLVE_BENEATH) && (resolve & RESOLVE_IN_ROOT))
         return -LINUX_EINVAL;
 
     /* RESOLVE_CACHED asks the kernel to satisfy lookup from cache only.
@@ -1402,6 +1474,10 @@ static int64_t sc_openat2(guest_t *g,
         char path[LINUX_PATH_MAX];
         if (guest_read_str(g, x1, path, sizeof(path)) < 0)
             return -LINUX_EFAULT;
+
+        if ((resolve & (RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS)) &&
+            path_openat2_is_fd_magiclink_anchor((int) x0, path))
+            return -LINUX_ELOOP;
 
         if (resolve & RESOLVE_NO_SYMLINKS) {
             if (sys_path_has_symlink((int) x0, path) < 0) {
@@ -1425,32 +1501,15 @@ static int64_t sc_openat2(guest_t *g,
             !path_openat2_stays_beneath(path, true))
             return -LINUX_EXDEV;
 
-        if ((resolve & RESOLVE_NO_MAGICLINKS) &&
-            path_openat2_is_proc_magiclink((int) x0, path))
-            return -LINUX_ELOOP;
-
         int no_xdev_start_class = -1;
         if (resolve & RESOLVE_NO_XDEV) {
-            /* A /proc/self/fd/N traversal follows a magic link out of procfs
-             * into whatever mount holds the target fd, which is a mount
-             * crossing under Linux NO_XDEV. The post-open class check cannot
-             * detect this because procemu stamps the resulting fd's proc_path
-             * with the symbolic /proc/self/fd/N path, hiding the real landing
-             * mount. Reject the traversal up front.
-             * path_openat2_is_proc_magiclink normalizes both absolute and
-             * dirfd/cwd-relative forms against /proc, so /proc/self/fd/N,
-             * "self/fd/N" / "fd/N" from a /proc or /proc/self anchor, and
-             * traversals like "task/../fd/N" all collapse onto the same
-             * /proc/self/fd/N candidate.
-             *
-             * Not yet detected: /dev/fd/N (procemu intercepts this as an
-             * alias for /proc/self/fd/N and dup()s the underlying fd) and
-             * /proc/<pid>/fd/N with an explicit pid. A NO_XDEV resolution
-             * landing on either is still a real cross, but the precheck has
-             * no normalization path for /dev or for explicit-pid procfs
-             * anchors yet, so the bypass remains.
+            /* /proc/self/fd/N, /proc/<self_pid>/fd/N, and /dev/fd/N all
+             * traverse fd magic links into whatever mount holds the target fd.
+             * Reject the normalized anchor up front because procemu can stamp
+             * the resulting fd with the symbolic proc/dev path, hiding the real
+             * landing mount from the post-open class check.
              */
-            if (path_openat2_is_proc_magiclink((int) x0, path))
+            if (path_openat2_is_fd_magiclink_anchor((int) x0, path))
                 return -LINUX_EXDEV;
             int crossed = path_openat2_crosses_mount(
                 (int) x0, path, (resolve & RESOLVE_IN_ROOT) != 0,

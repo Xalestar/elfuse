@@ -65,7 +65,7 @@ const char *path_resolve_sysroot_create_path(const char *path,
 
 int path_openat2_stays_beneath(const char *path, bool clamp_at_root);
 int path_openat2_normalize_in_root(const char *path, char *out, size_t outsz);
-int path_openat2_is_proc_magiclink(guest_fd_t dirfd, const char *path);
+bool path_openat2_is_fd_magiclink_anchor(guest_fd_t dirfd, const char *path);
 int path_openat2_resolved_within_root(guest_fd_t dirfd,
                                       const char *path,
                                       uint64_t oflags,
