@@ -108,6 +108,9 @@ test-cloexec
 [section] O_PATH semantics tests
 test-opath
 
+[section] xattr semantics tests
+test-xattr
+
 [section] Guard page / mmap edge cases
 test-guard-page
 test-mmap-hint

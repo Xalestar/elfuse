@@ -333,6 +333,7 @@ typedef struct {
 #define LINUX_EMULTIHOP 72  /* Multihop attempted */
 #define LINUX_EILSEQ 84     /* Illegal byte sequence */
 #define LINUX_EHOSTDOWN 112 /* Host is down */
+#define LINUX_ENODATA 61    /* No data available (xattr missing, stream) */
 
 /* Linux FD flags. */
 #define LINUX_FD_CLOEXEC 1
