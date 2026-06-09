@@ -12,9 +12,12 @@
  *   2. FUTEX_LOCK_PI + FUTEX_UNLOCK_PI round-trip: acquire and
  *      release a PI lock from the same thread.
  *
- *   3. futex_wait EINTR injection (commit 18bdd0f): futex_wait with
- *      no timeout returns -EINTR within ~1-2 seconds when no waker
- *      exists (simulated periodic signal delivery).
+ *   3. futex_wait blocks indefinitely without a signal: an earlier
+ *      revision returned synthetic -EINTR after ~1 s of unconditional
+ *      blocking, which violated POSIX sem_wait callers that do not
+ *      retry on EINTR (e.g. foot's render_worker_thread). The wait
+ *      must only return when a real wake arrives or a signal is
+ *      genuinely queued for the thread.
  *
  * Syscalls exercised: futex(98), clone(220), gettid(178), exit(93)
  */
@@ -198,92 +201,77 @@ static void test_pi_dead_owner(void)
     PASS();
 }
 
-/* Test 3: EINTR injection after ~1s */
+/* Test 3: futex_wait without a signal blocks until woken */
 
-/* Sibling that keeps the guest in a multi-threaded state for the duration of
- * the EINTR probe. The synthetic EINTR injection in futex_wait only fires
- * while thread_is_single_active() is false; a single-threaded guest must be
- * allowed to park in FUTEX_WAIT indefinitely so it does not break glibc
- * startup paths. The probe therefore has to run with at least one other guest
- * thread alive.
- *
- * The sibling sleeps on a timed futex_wait against keepalive_word with a
- * 5-second timeout. The timeout dodges the EINTR injection ('!has_timeout' is
- * what gates the sim), and 5 s is long enough to outlast the worst-case parent
- * EINTR window (1 s with up to 100 ms poll jitter, plus a safety margin). After
- * the parent's probe returns, the parent flips keepalive_word and wakes the
- * sibling.
+/* Sibling that waits ~1.2 s, flips the futex word, and issues FUTEX_WAKE on
+ * the parent's address. Used to drive the parent out of an indefinite
+ * futex_wait via a real wake (not synthetic EINTR).
  */
-static volatile int sibling_keepalive __attribute__((aligned(4))) = 1;
-static char sibling_stack_buf[8192] __attribute__((aligned(16)));
+static volatile int waker_word __attribute__((aligned(4))) = 0;
+static char waker_stack_buf[8192] __attribute__((aligned(16)));
 
-static void sibling_alive_thread(void)
+static void waker_thread(void)
 {
-    struct timespec ts = {5, 0};
-    while (__atomic_load_n(&sibling_keepalive, __ATOMIC_SEQ_CST) == 1) {
-        raw_syscall6(__NR_futex, (long) &sibling_keepalive,
-                     FUTEX_WAIT | FUTEX_PRIVATE, 1, (long) &ts, 0, 0);
-    }
+    struct timespec ts = {1, 200 * 1000 * 1000};
+    raw_syscall6(__NR_nanosleep, (long) &ts, 0, 0, 0, 0, 0);
+
+    __atomic_store_n(&waker_word, 1, __ATOMIC_SEQ_CST);
+    raw_futex_wake((int *) &waker_word, 1);
     raw_exit(0);
 }
 
 static void test_futex_eintr(void)
 {
-    TEST("futex_wait EINTR after ~1s");
+    TEST("futex_wait blocks until real wake, no synthetic EINTR");
 
-    /* Spawn the sibling so thread_is_single_active() is false during the wait.
-     * CLONE flags match test_pi_dead_owner.
-     */
-    sibling_keepalive = 1;
-    void *sibling_top = sibling_stack_buf + sizeof(sibling_stack_buf);
-    int sibling_tid_val = 0;
-    long sret = raw_clone(0x7d0f00, sibling_top, &sibling_tid_val, 0,
-                          (int *) &sibling_tid_val);
+    waker_word = 0;
+    void *waker_top = waker_stack_buf + sizeof(waker_stack_buf);
+    int waker_tid_val = 0;
+    long sret = raw_clone(0x7d0f00, waker_top, &waker_tid_val, 0,
+                          (int *) &waker_tid_val);
     if (sret < 0) {
-        FAIL("sibling clone failed");
+        FAIL("waker clone failed");
         return;
     }
     if (sret == 0) {
-        sibling_alive_thread();
+        waker_thread();
         raw_exit(1); /* unreachable */
     }
-
-    /* Create a futex word that no one will wake.
-     * futex_wait with no timeout should return -EINTR after ~1 second
-     * (elfuse's simulated periodic signal delivery).
-     */
-    volatile int unwoken = 42;
 
     struct timeval t0, t1;
     gettimeofday(&t0, NULL);
 
-    long r = raw_futex_wait((int *) &unwoken, 42);
+    /* No timeout. With no signal queued, the wait must NOT return until the
+     * waker thread issues FUTEX_WAKE; earlier revisions returned synthetic
+     * -EINTR after ~1 s, which broke glibc sem_wait callers.
+     */
+    long r = raw_futex_wait((int *) &waker_word, 0);
 
     gettimeofday(&t1, NULL);
     long elapsed_ms =
         (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_usec - t0.tv_usec) / 1000;
 
-    /* Tear down the sibling now that the EINTR check is done. */
-    __atomic_store_n(&sibling_keepalive, 0, __ATOMIC_SEQ_CST);
-    raw_futex_wake((int *) &sibling_keepalive, 1);
+    /* Reap the waker. */
     for (int i = 0; i < 100; i++) {
-        if (__atomic_load_n(&sibling_tid_val, __ATOMIC_SEQ_CST) == 0)
+        if (__atomic_load_n(&waker_tid_val, __ATOMIC_SEQ_CST) == 0)
             break;
         usleep(10000);
     }
 
-    /* Expect -EINTR (Linux errno 4) after 800ms-3000ms.
-     * The 1s timeout has jitter from 100ms polling intervals.
+    /* The waker sleeps ~1200 ms before waking the parent. Accept either rc==0
+     * (woken by FUTEX_WAKE after the wait observed waker_word change) or
+     * -EAGAIN (woken between the waker_word store and the FUTEX_WAKE; the
+     * value-mismatch path is the documented race for FUTEX_WAIT). Either
+     * outcome proves the parent did not bail out on synthetic EINTR.
      */
-    if (r == -4 /* -EINTR */ && elapsed_ms >= 800 && elapsed_ms <= 3000) {
+    if ((r == 0 || r == -11 /* -EAGAIN */) && elapsed_ms >= 1000 &&
+        elapsed_ms <= 4000) {
         PASS();
-    } else if (r == -4) {
-        /* Got EINTR but timing seems off; still passing, but note it */
-        printf("OK (EINTR after %ldms)\n", elapsed_ms);
-        passes++;
     } else {
-        printf("FAIL: expected -EINTR(-4) got %ld, elapsed %ldms\n", r,
-               elapsed_ms);
+        printf(
+            "FAIL: expected rc=0 or -EAGAIN after ~1200ms, got %ld at "
+            "%ldms\n",
+            r, elapsed_ms);
         fails++;
     }
 }

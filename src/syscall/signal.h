@@ -244,6 +244,17 @@ void signal_set_fault_info(int si_code, uint64_t addr, uint64_t esr);
 int signal_pending(void);
 bool signal_pending_interruption(bool *restart_out);
 
+/* Lock-free variant: consults the atomic pending hint and this thread's
+ * blocked mask. Never blocks, never acquires sig_lock. May report a
+ * stale true (the hint races with rt_sigprocmask), but never a stale
+ * false: signal_queue updates the hint with SEQ_CST before unlock, and
+ * the per-thread blocked field is published with RELEASE in
+ * rt_sigprocmask. Suitable for hot paths that need a yes/no answer
+ * without risking lock-order inversions (futex bucket lock outranks
+ * sig_lock).
+ */
+bool signal_pending_lockfree(void);
+
 /* True if anything that would normally be drained by signal_check_timer is
  * currently live: an unblocked pending signal, OR any of the three guest
  * itimers is armed. The shim's identity fast path consults this (indirectly

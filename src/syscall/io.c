@@ -1878,8 +1878,83 @@ int64_t sys_fallocate(int fd, int mode, int64_t offset, int64_t len)
         return -LINUX_EINVAL;
     }
 
-    /* mode 0 = basic allocation -> ftruncate fallback.
-     * Other modes (FALLOC_FL_PUNCH_HOLE etc.) not supported.
+    /* FALLOC_FL_PUNCH_HOLE always requires FALLOC_FL_KEEP_SIZE on Linux;
+     * map both to macOS F_PUNCHHOLE on the host fd, with a pwrite-zeros
+     * fallback for misalignment.
+     *
+     * The Linux semantic is "reads in [offset, offset+len) return zero;
+     * file size unchanged". macOS F_PUNCHHOLE enforces filesystem block
+     * alignment on both ends and rejects sub-block requests with EINVAL --
+     * that one-byte probe (offset=0 len=1) foot's wl_shm pool issues
+     * surfaces as "fallocate(FALLOC_FL_PUNCH_HOLE) not supported (Invalid
+     * argument)" otherwise, and foot disables punch-hole for the whole
+     * session.
+     *
+     * Writing zeros over the region produces the same observable result:
+     * reads return zero, file size unchanged. The disk-space deallocation
+     * optimisation is lost on the pwrite path, but the probe succeeds, so
+     * foot keeps punch-hole enabled and the later, properly aligned calls
+     * (page-sized buffers) still take the F_PUNCHHOLE fast path.
+     */
+    const int kPunchHole =
+        LINUX_FALLOC_FL_PUNCH_HOLE | LINUX_FALLOC_FL_KEEP_SIZE;
+    if (mode == kPunchHole) {
+        struct fpunchhole hole = {
+            .fp_flags = 0,
+            .reserved = 0,
+            .fp_offset = (off_t) offset,
+            .fp_length = (off_t) len,
+        };
+        if (fcntl(host_ref.fd, F_PUNCHHOLE, &hole) == 0) {
+            host_fd_ref_close(&host_ref);
+            return 0;
+        }
+        /* EINVAL: misaligned, sub-block, or non-regular file. pwrite zeros
+         * only through the current EOF so KEEP_SIZE remains guest-visible.
+         * Any other host errno propagates verbatim.
+         */
+        if (errno != EINVAL) {
+            host_fd_ref_close(&host_ref);
+            return linux_errno();
+        }
+        struct stat st;
+        if (fstat(host_ref.fd, &st) < 0) {
+            host_fd_ref_close(&host_ref);
+            return linux_errno();
+        }
+        if (offset >= st.st_size) {
+            host_fd_ref_close(&host_ref);
+            return 0;
+        }
+        int64_t remaining = st.st_size - offset;
+        if (remaining > len)
+            remaining = len;
+
+        static const char zeros[4096];
+        off_t cur = (off_t) offset;
+        while (remaining > 0) {
+            size_t chunk = remaining > (int64_t) sizeof(zeros)
+                               ? sizeof(zeros)
+                               : (size_t) remaining;
+            ssize_t nw = pwrite(host_ref.fd, zeros, chunk, cur);
+            if (nw < 0) {
+                if (errno == EINTR)
+                    continue;
+                host_fd_ref_close(&host_ref);
+                return linux_errno();
+            }
+            if (nw == 0)
+                break; /* defensive; pwrite on a regular file should not 0 */
+            cur += nw;
+            remaining -= nw;
+        }
+        host_fd_ref_close(&host_ref);
+        return 0;
+    }
+
+    /* mode 0 = basic allocation -> ftruncate fallback. Anything else
+     * (collapse range, zero range, insert range, unshare range) stays
+     * unsupported and surfaces as -EOPNOTSUPP for the guest to handle.
      */
     if (mode != 0) {
         host_fd_ref_close(&host_ref);

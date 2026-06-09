@@ -42,7 +42,10 @@
 #include "core/startup-trace.h"
 #include "debug/log.h"
 #include "utils.h"
+#include "runtime/futex.h"  /* futex_interrupt_request */
 #include "runtime/thread.h" /* thread_destroy_all_vcpus */
+#include "syscall/poll.h"   /* wakeup_pipe_signal */
+#include "syscall/proc.h"   /* proc_request_exit_group */
 
 /* Per-vCPU pending TLBI request. Zero-initialized in every host pthread
  * by virtue of TLS default-zeroing, which maps to TLBI_NONE.
@@ -575,9 +578,34 @@ static void release_extra_mappings(guest_t *g)
 
 void guest_destroy(guest_t *g)
 {
-    /* Destroy all worker vCPUs (thread table) before tearing down the VM.
-     * This prevents hv_vm_destroy from racing with active vCPUs that may still
-     * be running if thread join timed out during exit_group.
+    /* Quiesce worker vCPUs before unmapping stage-2. thread_destroy_all_vcpus
+     * only releases vCPU handles; it does not wait for the owning pthread to
+     * leave hv_vcpu_run. A worker still inside the guest at unmap time takes
+     * a stage-2 translation fault on its next instruction fetch and surfaces
+     * as "unexpected exception EC=0x20" in the crash report. PR #89's foot
+     * reproduction tripped exactly that race. The exit_group syscall handler
+     * already runs request, interrupt, and join before its own teardown; the
+     * destroy path needs the same prefix because forkipc.c:vcpu_run_loop
+     * returns straight into guest_destroy without going through the guest
+     * exit_group handler. The request is guarded on the prior state so a
+     * process that already chose its exit code keeps it intact.
+     *
+     * The wake signals cover workers blocked outside hv_vcpu_run: futex
+     * waiters poll futex_interrupt_requested, and any thread parked in
+     * epoll or poll wakes off the shared pipe. Without them, host-blocked
+     * workers miss the hv_vcpus_exit kick (which only affects threads
+     * inside hv_vcpu_run) and the 100ms join cap in thread_join_workers
+     * detaches them, leaving live pthreads to crash on the imminent munmap.
+     */
+    if (!proc_exit_group_requested())
+        proc_request_exit_group(0);
+    futex_interrupt_request();
+    wakeup_pipe_signal();
+    thread_interrupt_all();
+    thread_join_workers();
+    /* Destroy all remaining worker vCPUs (thread table) before tearing down
+     * the VM. This prevents hv_vm_destroy from racing with active vCPUs that
+     * may still be running if thread join timed out during exit_group.
      */
     thread_destroy_all_vcpus();
     if (g->vcpu) {

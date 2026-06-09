@@ -474,6 +474,16 @@ int signal_pending(void)
     return result;
 }
 
+bool signal_pending_lockfree(void)
+{
+    uint64_t hint =
+        atomic_load_explicit(&sig_pending_hint, memory_order_acquire);
+    if (hint == 0)
+        return false;
+    uint64_t blocked = __atomic_load_n(thread_blocked_ptr(), __ATOMIC_ACQUIRE);
+    return (hint & ~blocked) != 0;
+}
+
 bool signal_attention_needed(void)
 {
     /* Cheap atomic load on the sig-pending hint first; if a signal is

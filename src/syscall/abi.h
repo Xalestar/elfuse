@@ -398,6 +398,13 @@ typedef struct {
 #define LINUX_O_CLOEXEC 0x80000   /* 02000000 octal */
 #define LINUX_O_PATH 0x200000     /* 010000000 octal */
 
+/* Linux fallocate(2) mode bits (linux/falloc.h). PUNCH_HOLE requires the
+ * caller to also set KEEP_SIZE per the manpage; collapse/insert/zero/unshare
+ * range modes are recognised numerically but elsewhere unsupported.
+ */
+#define LINUX_FALLOC_FL_KEEP_SIZE 0x01
+#define LINUX_FALLOC_FL_PUNCH_HOLE 0x02
+
 /* Linux AT_* constants. */
 #define LINUX_AT_FDCWD (-100)
 #define LINUX_AT_SYMLINK_NOFOLLOW 0x100

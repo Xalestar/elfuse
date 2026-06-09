@@ -210,7 +210,7 @@ int64_t sys_ppoll(guest_t *g,
                    poll_timeout_ms < 0 ? 200 : poll_timeout_ms);
 
         /* Check for exit_group / futex_interrupt after waking */
-        if (proc_exit_group_requested() || futex_interrupt_pending()) {
+        if (proc_exit_group_requested() || futex_interrupt_consume()) {
             ret = -1;
             errno = EINTR;
             break;
@@ -549,7 +549,7 @@ int64_t sys_pselect6(guest_t *g,
                           has_timeout ? &ts : &poll_ts, NULL);
         }
 
-        if (proc_exit_group_requested() || futex_interrupt_pending()) {
+        if (proc_exit_group_requested() || futex_interrupt_consume()) {
             ret = -1;
             errno = EINTR;
             break;
@@ -1030,7 +1030,7 @@ int64_t sys_epoll_pwait(guest_t *g,
         nready = kevent(epoll_ref.fd, NULL, 0, kevents, cap,
                         has_timeout ? &ts : &poll_ts);
 
-        if (proc_exit_group_requested() || futex_interrupt_pending()) {
+        if (proc_exit_group_requested() || futex_interrupt_consume()) {
             nready = -1;
             errno = EINTR;
             break;
