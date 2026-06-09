@@ -212,29 +212,45 @@ static int64_t stat_at_path(guest_t *g,
         return 0;
     }
 
-    host_fd_ref_t dir_ref;
-    if (host_dirfd_ref_open(dirfd, &dir_ref) < 0)
-        return -LINUX_EBADF;
-
     int64_t rc = 0;
+    host_fd_ref_t dir_ref = {.fd = -1, .owned = false};
     if ((flags & LINUX_AT_EMPTY_PATH) && pathp[0] == '\0') {
         /* Linux: AT_EMPTY_PATH with dirfd == AT_FDCWD operates on the
          * current working directory.
          */
-        if (dir_ref.fd == AT_FDCWD) {
+        if (dirfd == LINUX_AT_FDCWD) {
+            dir_ref.fd = AT_FDCWD;
             int mac_flags = translate_at_flags(flags);
             if (fstatat(AT_FDCWD, ".", mac_st, mac_flags) < 0) {
                 rc = linux_errno();
                 goto done;
             }
-        } else if (dir_ref.fd < 0) {
-            rc = -LINUX_EBADF;
-            goto done;
-        } else if (fstat(dir_ref.fd, mac_st) < 0) {
-            rc = linux_errno();
-            goto done;
+        } else {
+            fd_entry_t snap;
+            dir_ref.fd = fd_snapshot_and_dup(dirfd, &snap);
+            dir_ref.owned = true;
+            if (dir_ref.fd < 0) {
+                rc = -LINUX_EBADF;
+                goto done;
+            }
+            if (snap.type == FD_PATH && snap.proc_path[0] != '\0') {
+                int intercepted = proc_intercept_stat(snap.proc_path, mac_st);
+                if (intercepted == 0)
+                    goto done;
+                if (intercepted == -1) {
+                    rc = linux_errno();
+                    goto done;
+                }
+            }
+            if (fstat(dir_ref.fd, mac_st) < 0) {
+                rc = linux_errno();
+                goto done;
+            }
         }
     } else {
+        if (host_dirfd_ref_open(dirfd, &dir_ref) < 0)
+            return -LINUX_EBADF;
+
         int intercepted = PROC_NOT_INTERCEPTED;
         if (path_might_use_stat_intercept(tx.intercept_path)) {
             intercepted = proc_intercept_stat(tx.intercept_path, mac_st);
@@ -274,6 +290,19 @@ int64_t sys_fstat(guest_t *g, int fd, uint64_t stat_gva)
     }
     if (frc != -LINUX_EBADF)
         return frc;
+
+    fd_entry_t snap;
+    if (fd_snapshot(fd, &snap) && snap.type == FD_PATH &&
+        snap.proc_path[0] != '\0') {
+        int intercepted = proc_intercept_stat(snap.proc_path, &mac_st);
+        if (intercepted == 0) {
+            if (write_linux_stat(g, stat_gva, &mac_st) < 0)
+                return -LINUX_EFAULT;
+            return 0;
+        }
+        if (intercepted == -1)
+            return linux_errno();
+    }
 
     host_fd_ref_t host_ref;
     if (host_fd_ref_open(fd, &host_ref) < 0) {

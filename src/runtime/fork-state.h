@@ -99,6 +99,17 @@ int fork_ipc_recv_memory_regions(int ipc_fd, guest_t *g);
 int fork_ipc_send_fd_table(int ipc_sock);
 int fork_ipc_recv_fd_table(int ipc_fd, guest_t *g);
 
+/* Carry the /dev/ptmx keepalive slave fds across the fork boundary. The fd
+ * table batch sends master fds without their hidden keepalive companions, so
+ * a child that inherits a master would otherwise hit the macOS ENOTTY /
+ * winsize-reset cliff that proc_pty_close_keepalive papers over in the
+ * parent. send/recv must run AFTER fork_ipc_send_fd_table / _recv_fd_table
+ * so the child can look up its new master host fd from the just-installed
+ * fd_table entry.
+ */
+int fork_ipc_send_pty_keepalives(int ipc_sock);
+int fork_ipc_recv_pty_keepalives(int ipc_fd);
+
 int fork_ipc_send_process_state(int ipc_sock,
                                 const guest_region_t *regions_snapshot,
                                 uint32_t num_guest_regions,

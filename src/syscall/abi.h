@@ -333,6 +333,7 @@ typedef struct {
 #define LINUX_EMULTIHOP 72  /* Multihop attempted */
 #define LINUX_EILSEQ 84     /* Illegal byte sequence */
 #define LINUX_EHOSTDOWN 112 /* Host is down */
+#define LINUX_ENODATA 61    /* No data available (xattr missing, stream) */
 
 /* Linux FD flags. */
 #define LINUX_FD_CLOEXEC 1
@@ -351,6 +352,7 @@ typedef struct {
 #define LINUX_TIOCSPGRP 0x5410  /* -> macOS TIOCSPGRP (same semantics) */
 #define LINUX_TIOCSCTTY 0x540E  /* -> macOS TIOCSCTTY (same semantics) */
 #define LINUX_TIOCGWINSZ 0x5413 /* -> macOS TIOCGWINSZ (same struct) */
+#define LINUX_TIOCSWINSZ 0x5414 /* -> macOS TIOCSWINSZ (same struct) */
 #define LINUX_FIONREAD 0x541B   /* -> macOS FIONREAD (same semantics) */
 #define LINUX_FIONBIO 0x5421    /* set/clear O_NONBLOCK (arg: int *) */
 #define LINUX_FIONCLEX 0x5450   /* clear close-on-exec on fd */
@@ -362,6 +364,13 @@ typedef struct {
 #define LINUX_TCSETS2 0x402c542b  /* termios2 set (TCSANOW) */
 #define LINUX_TCSETSW2 0x402c542c /* termios2 set (TCSADRAIN) */
 #define LINUX_TCSETSF2 0x402c542d /* termios2 set (TCSAFLUSH) */
+/* Pseudoterminal multiplexer ioctls. The numeric encodings match Linux
+ * include/uapi/asm-generic/ioctls.h regardless of architecture. macOS exposes
+ * an equivalent /dev/ptmx and unlockpt(3); ptsname(3) returns /dev/ttysNNN.
+ */
+#define LINUX_TIOCGPTN 0x80045430   /* _IOR('T', 0x30, unsigned int) */
+#define LINUX_TIOCSPTLCK 0x40045431 /* _IOW('T', 0x31, int) */
+#define LINUX_TIOCGPTPEER 0x5441    /* _IO('T', 0x41); arg is open flags */
 
 /* Linux open flags. */
 #define LINUX_O_RDONLY 0x0000
@@ -389,6 +398,13 @@ typedef struct {
 #define LINUX_O_NOATIME 0x40000   /* 01000000 octal */
 #define LINUX_O_CLOEXEC 0x80000   /* 02000000 octal */
 #define LINUX_O_PATH 0x200000     /* 010000000 octal */
+
+/* Linux fallocate(2) mode bits (linux/falloc.h). PUNCH_HOLE requires the
+ * caller to also set KEEP_SIZE per the manpage; collapse/insert/zero/unshare
+ * range modes are recognised numerically but elsewhere unsupported.
+ */
+#define LINUX_FALLOC_FL_KEEP_SIZE 0x01
+#define LINUX_FALLOC_FL_PUNCH_HOLE 0x02
 
 /* Linux AT_* constants. */
 #define LINUX_AT_FDCWD (-100)

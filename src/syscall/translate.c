@@ -94,6 +94,22 @@ int64_t linux_errno(void)
     case ENOTSUP:
         return -LINUX_EOPNOTSUPP;
 #endif
+        /* macOS xattr "attribute not found" lives at 93 (ENOATTR) on modern
+         * SDKs; on some versions ENOATTR is a synonym for ENODATA(96). Map
+         * both to Linux ENODATA(61) so getxattr/lgetxattr/fgetxattr report
+         * missing attrs correctly. Guarded by #if to avoid duplicate cases
+         * when the headers alias the two macros.
+         */
+#ifdef ENOATTR
+#if !defined(ENODATA) || ENOATTR != ENODATA
+    case ENOATTR:
+        return -LINUX_ENODATA;
+#endif
+#endif
+#ifdef ENODATA
+    case ENODATA:
+        return -LINUX_ENODATA;
+#endif
 #ifdef ENOTRECOVERABLE
     case ENOTRECOVERABLE:
         return -LINUX_ENOTRECOVERABLE;

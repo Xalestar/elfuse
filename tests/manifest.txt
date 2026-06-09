@@ -68,6 +68,7 @@ test-epoll-aba
 test-timerfd
 test-large-io-boundary
 test-ioctl-cloexec
+test-pty
 
 [section] /proc and /dev emulation tests
 test-proc
@@ -106,6 +107,9 @@ test-cloexec
 
 [section] O_PATH semantics tests
 test-opath
+
+[section] xattr semantics tests
+test-xattr
 
 [section] Guard page / mmap edge cases
 test-guard-page

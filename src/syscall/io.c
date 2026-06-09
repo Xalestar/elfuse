@@ -20,6 +20,7 @@
 #include <stdbool.h>
 #include <limits.h>
 #include <pthread.h>
+#include <ctype.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
 #include <sys/ioctl.h>
@@ -1551,6 +1552,7 @@ int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg)
     }
     case LINUX_TIOCGWINSZ: {
         /* Get terminal window size */
+        (void) proc_pty_master_adopt(fd);
         struct winsize ws;
         if (ioctl(host_fd, TIOCGWINSZ, &ws) < 0) {
             host_fd_ref_close(&host_ref);
@@ -1568,6 +1570,33 @@ int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg)
         }
         host_fd_ref_close(&host_ref);
         return 0;
+    }
+    case LINUX_TIOCSWINSZ: {
+        /* Set terminal window size. Same struct as TIOCGWINSZ; foot, sshd,
+         * tmux, and any libvte-derived emulator call this on the PTY master
+         * after spawning the slave child. Without it, terminal startup fails
+         * with -ENOTTY from the default arm below.
+         *
+         * A master received through SCM_RIGHTS bypasses /dev/ptmx open
+         * interception, so lazily create its keepalive before the host ioctl.
+         * The helper is a no-op for non-pty fds; the real ioctl below still
+         * supplies the final errno.
+         */
+        linux_winsize_t lws;
+        if (guest_read_small(g, arg, &lws, sizeof(lws)) < 0) {
+            host_fd_ref_close(&host_ref);
+            return -LINUX_EFAULT;
+        }
+        struct winsize ws = {
+            .ws_row = lws.ws_row,
+            .ws_col = lws.ws_col,
+            .ws_xpixel = lws.ws_xpixel,
+            .ws_ypixel = lws.ws_ypixel,
+        };
+        (void) proc_pty_master_adopt(fd);
+        int rc = ioctl(host_fd, TIOCSWINSZ, &ws);
+        host_fd_ref_close(&host_ref);
+        return rc < 0 ? linux_errno() : 0;
     }
 
     case LINUX_TCGETS: {
@@ -1715,6 +1744,96 @@ int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg)
         return 0;
     }
 
+    case LINUX_TIOCGPTN: {
+        /* Get the slave pty number associated with a /dev/ptmx master fd.
+         * Pass the guest fd: proc_pty_master_adopt snapshots the canonical
+         * (host_fd, generation) under fd_lock, performs the slave open on a
+         * private dup, then re-validates the slot before publishing the
+         * keepalive. Passing the per-syscall host_fd_ref dup or a raw host
+         * fd would race with sibling close+reuse.
+         */
+        uint32_t val = proc_pty_master_adopt(fd);
+        if (val == UINT32_MAX) {
+            host_fd_ref_close(&host_ref);
+            return -LINUX_ENOTTY;
+        }
+        if (guest_write_small(g, arg, &val, sizeof(val)) < 0) {
+            host_fd_ref_close(&host_ref);
+            return -LINUX_EFAULT;
+        }
+        host_fd_ref_close(&host_ref);
+        return 0;
+    }
+    case LINUX_TIOCSPTLCK: {
+        /* Lock/unlock the slave side of a pty. glibc unlockpt() always passes
+         * 0 (unlock); util-linux's setlock(1) passes 1 to lock. macOS exposes
+         * unlockpt(3) but no re-lock primitive, so the lock branch is accepted
+         * as a best-effort no-op for real ptmx masters rather than surfacing
+         * as -EINVAL: an application probing the result would otherwise
+         * misread the failure as "this kernel has no devpts".
+         */
+        int32_t lock = 0;
+        if (guest_read_small(g, arg, &lock, sizeof(lock)) < 0) {
+            host_fd_ref_close(&host_ref);
+            return -LINUX_EFAULT;
+        }
+        int rc = 0;
+        if (lock == 0) {
+            rc = unlockpt(host_fd);
+        } else {
+            char slave[64];
+            if (ptsname_r(host_fd, slave, sizeof(slave)) != 0) {
+                host_fd_ref_close(&host_ref);
+                return -LINUX_ENOTTY;
+            }
+        }
+        host_fd_ref_close(&host_ref);
+        return rc < 0 ? linux_errno() : 0;
+    }
+    case LINUX_TIOCGPTPEER: {
+        /* Return a fresh fd referring to the slave side of a /dev/ptmx master.
+         * Linux added this in 4.13 so callers can avoid the ptsname(3) round
+         * trip and any /dev/pts visibility races. The arg holds open(2)-style
+         * flags. Restrict to the bits Linux's pty driver actually honors
+         * (accmode + O_NOCTTY + O_NONBLOCK + O_CLOEXEC); any other bit, in
+         * particular O_CREAT / O_TRUNC / O_EXCL / O_PATH, would be silently
+         * ignored on Linux and is rejected with EINVAL here so misuse does
+         * not leak nonsense flags into the guest fd table.
+         */
+        int linux_flags = (int) arg;
+        const int allowed = LINUX_O_ACCMODE | LINUX_O_NOCTTY |
+                            LINUX_O_NONBLOCK | LINUX_O_CLOEXEC;
+        if (linux_flags & ~allowed) {
+            host_fd_ref_close(&host_ref);
+            return -LINUX_EINVAL;
+        }
+        char slave[64];
+        if (ptsname_r(host_fd, slave, sizeof(slave)) != 0) {
+            host_fd_ref_close(&host_ref);
+            return -LINUX_ENOTTY;
+        }
+        int oflags = translate_open_flags(linux_flags);
+        int host_slave_fd = open(slave, oflags);
+        if (host_slave_fd < 0) {
+            int saved_errno = errno;
+            host_fd_ref_close(&host_ref);
+            errno = saved_errno;
+            return linux_errno();
+        }
+        host_fd_ref_close(&host_ref);
+        int guest_fd = fd_alloc(FD_REGULAR, host_slave_fd, NULL);
+        if (guest_fd < 0) {
+            close(host_slave_fd);
+            return -LINUX_EMFILE;
+        }
+        /* Track CLOEXEC + accmode in the guest table so exec honors them; the
+         * host fd's own FD_CLOEXEC is per-descriptor and would be lost on the
+         * dup that host_fd_ref hands multi-threaded callers.
+         */
+        fd_publish_linux_flags(guest_fd, linux_flags);
+        return guest_fd;
+    }
+
     case LINUX_FIONBIO: {
         /* Set/clear O_NONBLOCK on the fd. Linux FIONBIO takes an int* arg:
          * nonzero enables non-blocking, zero disables it. libuv's
@@ -1759,8 +1878,83 @@ int64_t sys_fallocate(int fd, int mode, int64_t offset, int64_t len)
         return -LINUX_EINVAL;
     }
 
-    /* mode 0 = basic allocation -> ftruncate fallback.
-     * Other modes (FALLOC_FL_PUNCH_HOLE etc.) not supported.
+    /* FALLOC_FL_PUNCH_HOLE always requires FALLOC_FL_KEEP_SIZE on Linux;
+     * map both to macOS F_PUNCHHOLE on the host fd, with a pwrite-zeros
+     * fallback for misalignment.
+     *
+     * The Linux semantic is "reads in [offset, offset+len) return zero;
+     * file size unchanged". macOS F_PUNCHHOLE enforces filesystem block
+     * alignment on both ends and rejects sub-block requests with EINVAL --
+     * that one-byte probe (offset=0 len=1) foot's wl_shm pool issues
+     * surfaces as "fallocate(FALLOC_FL_PUNCH_HOLE) not supported (Invalid
+     * argument)" otherwise, and foot disables punch-hole for the whole
+     * session.
+     *
+     * Writing zeros over the region produces the same observable result:
+     * reads return zero, file size unchanged. The disk-space deallocation
+     * optimisation is lost on the pwrite path, but the probe succeeds, so
+     * foot keeps punch-hole enabled and the later, properly aligned calls
+     * (page-sized buffers) still take the F_PUNCHHOLE fast path.
+     */
+    const int kPunchHole =
+        LINUX_FALLOC_FL_PUNCH_HOLE | LINUX_FALLOC_FL_KEEP_SIZE;
+    if (mode == kPunchHole) {
+        struct fpunchhole hole = {
+            .fp_flags = 0,
+            .reserved = 0,
+            .fp_offset = (off_t) offset,
+            .fp_length = (off_t) len,
+        };
+        if (fcntl(host_ref.fd, F_PUNCHHOLE, &hole) == 0) {
+            host_fd_ref_close(&host_ref);
+            return 0;
+        }
+        /* EINVAL: misaligned, sub-block, or non-regular file. pwrite zeros
+         * only through the current EOF so KEEP_SIZE remains guest-visible.
+         * Any other host errno propagates verbatim.
+         */
+        if (errno != EINVAL) {
+            host_fd_ref_close(&host_ref);
+            return linux_errno();
+        }
+        struct stat st;
+        if (fstat(host_ref.fd, &st) < 0) {
+            host_fd_ref_close(&host_ref);
+            return linux_errno();
+        }
+        if (offset >= st.st_size) {
+            host_fd_ref_close(&host_ref);
+            return 0;
+        }
+        int64_t remaining = st.st_size - offset;
+        if (remaining > len)
+            remaining = len;
+
+        static const char zeros[4096];
+        off_t cur = (off_t) offset;
+        while (remaining > 0) {
+            size_t chunk = remaining > (int64_t) sizeof(zeros)
+                               ? sizeof(zeros)
+                               : (size_t) remaining;
+            ssize_t nw = pwrite(host_ref.fd, zeros, chunk, cur);
+            if (nw < 0) {
+                if (errno == EINTR)
+                    continue;
+                host_fd_ref_close(&host_ref);
+                return linux_errno();
+            }
+            if (nw == 0)
+                break; /* defensive; pwrite on a regular file should not 0 */
+            cur += nw;
+            remaining -= nw;
+        }
+        host_fd_ref_close(&host_ref);
+        return 0;
+    }
+
+    /* mode 0 = basic allocation -> ftruncate fallback. Anything else
+     * (collapse range, zero range, insert range, unshare range) stays
+     * unsupported and surfaces as -EOPNOTSUPP for the guest to handle.
      */
     if (mode != 0) {
         host_fd_ref_close(&host_ref);

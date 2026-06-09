@@ -34,6 +34,7 @@
 
 #include "syscall/abi.h"
 #include "syscall/proc.h"
+#include "syscall/signal.h"
 
 #include "debug/log.h"
 
@@ -103,10 +104,14 @@ static _Atomic int futex_interrupt_requested = 0;
  *
  * The wait quantum is capped at 100 ms so proc_exit_group_requested() and
  * futex_interrupt_pending() get noticed promptly without a process-wide
- * broadcast channel. The 1-second EINTR simulation that the bucket path uses
- * for shutdown-stalled multi-threaded runtimes is preserved here, but only
- * once more than one guest thread is active. Single-threaded guests should not
- * see synthetic EINTR churn on indefinite waits.
+ * broadcast channel. EINTR is only returned when an actual deliverable
+ * signal is queued for this thread (confirmed under sig_lock via
+ * signal_pending(), not the atomic hint, so that rt_sigprocmask masking the
+ * queued signal cannot leave a stale-true edge behind), or when a guest
+ * itimer expires under the poll loop's signal_check_timer poke. Earlier
+ * revisions returned -EINTR after one unconditional second of waiting to
+ * unblock shutdown-stalled multi-threaded runtimes, but that broke POSIX
+ * sem_wait callers that do not retry on EINTR (e.g. foot's render worker).
  */
 #if ELFUSE_HAVE_OS_SYNC_WAIT_ON_ADDRESS
 static bool os_sync_available;
@@ -114,12 +119,6 @@ static bool os_sync_wait_enabled;
 #endif
 
 #define FUTEX_OS_SYNC_POLL_CAP_NS (100ULL * 1000 * 1000)
-#define FUTEX_OS_SYNC_EINTR_SIM_MS 1000
-
-static inline bool futex_should_simulate_periodic_eintr(void)
-{
-    return !thread_is_single_active();
-}
 
 /* Hash table */
 
@@ -220,6 +219,22 @@ void futex_interrupt_clear(void)
 int futex_interrupt_pending(void)
 {
     return atomic_load(&futex_interrupt_requested);
+}
+
+/* Test-and-clear: returns 1 if the interrupt request was pending and atomically
+ * clears it, 0 otherwise. The interrupt is a one-shot edge: forkipc.c sets it
+ * when the last clone-thread exits so the main thread observes EINTR in its
+ * next blocking wait, mirroring how real Linux delivers SIGCHLD. Without the
+ * clear, the flag stays set and every subsequent epoll_pwait, ppoll, futex
+ * wait, etc. spins on EINTR until execve clears it -- in foot's case it never
+ * does, and the spinning main thread eventually faults in a code path the
+ * guest never expects to reach.
+ */
+int futex_interrupt_consume(void)
+{
+    int expected = 1;
+    return atomic_compare_exchange_strong(&futex_interrupt_requested, &expected,
+                                          0);
 }
 
 /* Cap on guest-supplied tv_sec. The cap exists purely so the int64_t / time_t
@@ -392,19 +407,13 @@ static int64_t futex_os_sync_wait(guest_t *g,
     if (current != expected)
         return -LINUX_EAGAIN;
 
-    struct timeval wait_start;
-    bool simulate_periodic_eintr =
-        !has_timeout && futex_should_simulate_periodic_eintr();
-    if (simulate_periodic_eintr)
-        gettimeofday(&wait_start, NULL);
-
     /* Bound consecutive EFAULT retries. Apple documents EFAULT as transient
      * (kernel copyin failure under memory pressure), so a few retries are fine;
      * but a genuinely bad page would otherwise cause the loop to spin with no
      * real sleep -- timeout_ns is supplied to syscall that returns immediately
-     * -- until either the user deadline or the 1-second EINTR simulation
-     *  finally bails out. Surface EFAULT to the guest after this many
-     *  back-to-back failures so the host CPU does not burn for ~1 s.
+     * -- until the user deadline finally bails out. Surface EFAULT to the
+     * guest after this many back-to-back failures so the host CPU does not
+     * burn for ~1 s.
      */
     int efault_retries = 0;
 
@@ -436,17 +445,24 @@ static int64_t futex_os_sync_wait(guest_t *g,
             efault_retries = 0;
         }
 
-        if (proc_exit_group_requested() || futex_interrupt_pending())
+        if (proc_exit_group_requested() || futex_interrupt_consume())
             return -LINUX_EINTR;
 
-        if (simulate_periodic_eintr) {
-            struct timeval now;
-            gettimeofday(&now, NULL);
-            long elapsed_ms = (now.tv_sec - wait_start.tv_sec) * 1000 +
-                              (now.tv_usec - wait_start.tv_usec) / 1000;
-            if (elapsed_ms >= FUTEX_OS_SYNC_EINTR_SIM_MS)
-                return -LINUX_EINTR;
-        }
+        /* Drain any expired guest itimer so its SIGALRM / SIGVTALRM / SIGPROF
+         * queues into sig_state.pending; without this poke, a guest with all
+         * threads parked in futex_wait would never advance the timers.
+         */
+        signal_check_timer();
+
+        /* Return EINTR only when a real deliverable signal is queued for
+         * this thread. POSIX callers (e.g. glibc sem_wait, foot's render
+         * worker) often do not retry on EINTR, so synthetic spurious
+         * wakeups cannot be issued here. signal_pending() confirms under
+         * sig_lock so the atomic hint cannot produce a stale-true edge
+         * after rt_sigprocmask masked the queued signal.
+         */
+        if (signal_pending())
+            return -LINUX_EINTR;
         /* For has_timeout: futex_remaining_ns returns 0 next iteration once
          * the user deadline elapses, so the loop exits with -ETIMEDOUT.
          */
@@ -528,22 +544,6 @@ static int64_t futex_wait(guest_t *g,
     /* Wait until woken or timeout */
     int ret = 0;
 
-    /* Record start time for the no-timeout path. On real Linux, any pending
-     * signal interrupts futex_wait with -EINTR. Without a timer signal
-     * (SIGVTALRM from timer_create/setitimer), some multi-threaded runtimes
-     * can deadlock when a thread blocks in futex_wait and no wakeup arrives
-     * (e.g., a shutdown signal delivered to the wrong I/O manager).
-     * FUTEX_WAIT returns -EINTR after 1 second of blocking to simulate
-     * periodic signal delivery. All real futex callers (musl, glibc, and
-     * other managed runtimes) handle -EINTR correctly by re-checking their
-     * condition and retrying.
-     */
-    struct timeval wait_start;
-    bool simulate_periodic_eintr =
-        !has_timeout && futex_should_simulate_periodic_eintr();
-    if (simulate_periodic_eintr)
-        gettimeofday(&wait_start, NULL);
-
     while (!__atomic_load_n(&waiter.woken, __ATOMIC_ACQUIRE)) {
         if (has_timeout) {
             int rc = pthread_cond_timedwait(&waiter.cond, &b->lock, &deadline);
@@ -552,35 +552,45 @@ static int64_t futex_wait(guest_t *g,
                 ret = -LINUX_ETIMEDOUT;
                 break;
             }
-        } else {
-            /* No timeout specified: poll every 100ms to check for exit_group,
-             * futex_interrupt (simulated SIGCHLD), or excessive wait time
-             * (simulated signal interruption).
-             */
-            struct timespec poll_ts;
-            timespec_deadline_in_ms(&poll_ts, 100);
-            pthread_cond_timedwait(&waiter.cond, &b->lock, &poll_ts);
+            continue;
+        }
 
-            if (proc_exit_group_requested() || futex_interrupt_pending()) {
-                ret = -LINUX_EINTR;
-                break;
-            }
+        /* No timeout specified: poll every 100 ms to check for exit_group,
+         * futex_interrupt, expired guest itimers, and queued signals.
+         */
+        struct timespec poll_ts;
+        timespec_deadline_in_ms(&poll_ts, 100);
+        pthread_cond_timedwait(&waiter.cond, &b->lock, &poll_ts);
 
-            /* Simulate periodic signal delivery only for multi-threaded
-             * guests. Single-threaded glibc startup paths can legitimately
-             * park in FUTEX_WAIT forever until a real wake arrives, and
-             * synthetic EINTR here breaks that contract.
-             */
-            if (simulate_periodic_eintr) {
-                struct timeval now;
-                gettimeofday(&now, NULL);
-                long elapsed_ms = (now.tv_sec - wait_start.tv_sec) * 1000 +
-                                  (now.tv_usec - wait_start.tv_usec) / 1000;
-                if (elapsed_ms >= FUTEX_OS_SYNC_EINTR_SIM_MS) {
-                    ret = -LINUX_EINTR;
-                    break;
-                }
-            }
+        if (proc_exit_group_requested() || futex_interrupt_consume()) {
+            ret = -LINUX_EINTR;
+            break;
+        }
+
+        /* Lock-order: bucket lock(7) outranks sig_lock(4), so signal_pending()
+         * and signal_check_timer() may only be called once the bucket lock has
+         * been released. Drop it, poke the itimers, observe queued signals
+         * under sig_lock (the slow-path confirm avoids the stale-true edge
+         * that the atomic hint can carry after rt_sigprocmask masks the
+         * queued signal), then re-acquire and re-check waiter.woken in case
+         * a wake landed in the window.
+         */
+        pthread_mutex_unlock(&b->lock);
+        signal_check_timer();
+        bool sig_ready = signal_pending() != 0;
+        pthread_mutex_lock(&b->lock);
+
+        if (__atomic_load_n(&waiter.woken, __ATOMIC_ACQUIRE))
+            break;
+
+        /* Return EINTR only when a real deliverable signal is queued for
+         * this thread. POSIX callers (e.g. glibc sem_wait, foot's render
+         * worker) often do not retry on EINTR, so synthetic spurious
+         * wakeups cannot be issued here.
+         */
+        if (sig_ready) {
+            ret = -LINUX_EINTR;
+            break;
         }
     }
 

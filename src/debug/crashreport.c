@@ -19,6 +19,19 @@
 
 #include "syscall/proc.h"
 
+/* Page-table descriptor bit definitions used by the diagnostic walker below.
+ * The full set lives in src/core/guest.c next to the helpers that build
+ * descriptors; the crash walker needs only the fields it prints, so keep the
+ * duplication minimal rather than promoting a private header.
+ */
+#define CR_PT_VALID 1ULL
+#define CR_PT_TABLE 2ULL
+#define CR_PT_ADDR_MASK 0xFFFFFFFFF000ULL
+#define CR_L2_BLOCK_ADDR_MASK 0xFFFFFFE00000ULL
+#define CR_BLOCK_1GIB (1024ULL * 1024 * 1024)
+#define CR_BLOCK_2MIB (2ULL * 1024 * 1024)
+#define CR_PAGE_SIZE 4096ULL
+
 /* Read a sysctl string into buf (NUL-terminated). Returns 0 on success. */
 static int sysctl_str(const char *name, char *buf, size_t bufsz)
 {
@@ -109,6 +122,201 @@ static const char *esr_ec_name(uint64_t esr)
     default:
         return "unhandled EC";
     }
+}
+
+static bool esr_is_data_abort(uint64_t esr)
+{
+    unsigned ec = (unsigned) ((esr >> 26) & 0x3f);
+    return ec == 0x24 || ec == 0x25;
+}
+
+/* Walk the guest stage-1 page tables for `va` and print L0/L1/L2/L3 entries
+ * in raw form so the crash report localises an "unmapped" claim either to the
+ * guest PT (entry is 0 or PT_VALID clear) or to a downstream stage-2 hole.
+ * The walker mirrors gva_translate_perm in src/core/guest.c but accepts any
+ * PT_VALID descriptor instead of enforcing requested permissions, so a
+ * non-executable or EL1-only page still prints with its actual contents.
+ * Silently skips when g, host_base, or ttbr0 are missing -- the data needed
+ * for the dump is gone before the walker can stage anything useful.
+ */
+static bool dump_pt_walk_for_va(const guest_t *g,
+                                uint64_t va,
+                                uint64_t *ipa_out)
+{
+    if (!g || !g->host_base || !g->ttbr0)
+        return false;
+
+    uint64_t base = g->ipa_base;
+    if (g->ttbr0 < base || g->ttbr0 - base >= g->guest_size) {
+        fprintf(stderr, "  PT walk: TTBR0 0x%llx out of slab range\n",
+                (unsigned long long) g->ttbr0);
+        return false;
+    }
+    uint64_t l0_off = g->ttbr0 - base;
+    const uint64_t *l0 =
+        (const uint64_t *) ((const uint8_t *) g->host_base + l0_off);
+    unsigned l0_idx = (unsigned) (va / (512ULL * CR_BLOCK_1GIB));
+    if (l0_idx >= 512) {
+        fprintf(stderr, "  PT walk: L0 index %u out of range\n", l0_idx);
+        return false;
+    }
+    uint64_t l0_entry = l0[l0_idx];
+    fprintf(stderr, "  L0[%u]=0x%llx", l0_idx, (unsigned long long) l0_entry);
+    if (!(l0_entry & CR_PT_VALID)) {
+        fprintf(stderr, " INVALID\n");
+        return false;
+    }
+
+    uint64_t l1_ipa = l0_entry & CR_PT_ADDR_MASK;
+    if (l1_ipa < base || l1_ipa - base >= g->guest_size) {
+        fprintf(stderr, " L1@0x%llx out-of-slab\n",
+                (unsigned long long) l1_ipa);
+        return false;
+    }
+    const uint64_t *l1 =
+        (const uint64_t *) ((const uint8_t *) g->host_base + (l1_ipa - base));
+    unsigned l1_idx = (unsigned) ((va / CR_BLOCK_1GIB) % 512);
+    uint64_t l1_entry = l1[l1_idx];
+    fprintf(stderr, " L1[%u]=0x%llx", l1_idx, (unsigned long long) l1_entry);
+    if (!(l1_entry & CR_PT_VALID)) {
+        fprintf(stderr, " INVALID\n");
+        return false;
+    }
+
+    uint64_t l2_ipa = l1_entry & CR_PT_ADDR_MASK;
+    if (l2_ipa < base || l2_ipa - base >= g->guest_size) {
+        fprintf(stderr, " L2@0x%llx out-of-slab\n",
+                (unsigned long long) l2_ipa);
+        return false;
+    }
+    const uint64_t *l2 =
+        (const uint64_t *) ((const uint8_t *) g->host_base + (l2_ipa - base));
+    unsigned l2_idx = (unsigned) ((va / CR_BLOCK_2MIB) % 512);
+    uint64_t l2_entry = l2[l2_idx];
+    fprintf(stderr, " L2[%u]=0x%llx", l2_idx, (unsigned long long) l2_entry);
+    if (!(l2_entry & CR_PT_VALID)) {
+        fprintf(stderr, " INVALID\n");
+        return false;
+    }
+
+    /* A valid L2 entry is either a 2MiB block (bit1=0) or a table descriptor
+     * pointing at a 4KiB L3 page. Only the table case requires another walk.
+     */
+    if (!(l2_entry & CR_PT_TABLE)) {
+        uint64_t block_ipa = l2_entry & CR_L2_BLOCK_ADDR_MASK;
+        uint64_t translated_ipa = block_ipa + (va & (CR_BLOCK_2MIB - 1));
+        fprintf(stderr, " (2MiB block -> IPA 0x%llx)\n",
+                (unsigned long long) translated_ipa);
+        if (ipa_out)
+            *ipa_out = translated_ipa;
+        return true;
+    }
+
+    uint64_t l3_ipa = l2_entry & CR_PT_ADDR_MASK;
+    if (l3_ipa < base || l3_ipa - base >= g->guest_size) {
+        fprintf(stderr, " L3@0x%llx out-of-slab\n",
+                (unsigned long long) l3_ipa);
+        return false;
+    }
+    const uint64_t *l3 =
+        (const uint64_t *) ((const uint8_t *) g->host_base + (l3_ipa - base));
+    unsigned l3_idx = (unsigned) ((va / CR_PAGE_SIZE) % 512);
+    uint64_t l3_entry = l3[l3_idx];
+    if (!(l3_entry & CR_PT_VALID)) {
+        fprintf(stderr, " L3[%u]=0x%llx INVALID\n", l3_idx,
+                (unsigned long long) l3_entry);
+        return false;
+    }
+
+    uint64_t page_ipa = l3_entry & CR_PT_ADDR_MASK;
+    uint64_t translated_ipa = page_ipa + (va & (CR_PAGE_SIZE - 1));
+    fprintf(stderr, " L3[%u]=0x%llx -> IPA 0x%llx\n", l3_idx,
+            (unsigned long long) l3_entry, (unsigned long long) translated_ipa);
+    if (ipa_out)
+        *ipa_out = translated_ipa;
+    return true;
+}
+
+/* Print the HVF stage-2 backing range covering `ipa` plus the region-tracker
+ * entry whose VA range includes the same address. A missing stage-2 backing is
+ * the downstream analogue of an INVALID L3 entry above; a missing region
+ * tracker is normal for non-tracked ranges (vDSO, shim) but useful for "is
+ * this VA in a known ELF segment" reasoning.
+ */
+static void dump_segment_and_region_for(const guest_t *g,
+                                        uint64_t va,
+                                        bool have_ipa,
+                                        uint64_t ipa)
+{
+    if (!g)
+        return;
+
+    if (have_ipa) {
+        bool found_seg = false;
+        for (int i = 0; i < g->n_segments; i++) {
+            const hvf_segment_t *s = &g->segments[i];
+            if (ipa >= s->ipa && ipa < s->ipa + s->len) {
+                fprintf(stderr,
+                        "  HVF segment[%d]: ipa=0x%llx len=0x%llx "
+                        "(covers translated IPA 0x%llx)\n",
+                        i, (unsigned long long) s->ipa,
+                        (unsigned long long) s->len, (unsigned long long) ipa);
+                found_seg = true;
+                break;
+            }
+        }
+        if (!found_seg) {
+            const guest_mapping_t *m = guest_find_mapping(g, ipa);
+            if (m) {
+                fprintf(stderr,
+                        "  HVF mapping: gpa=0x%llx size=0x%zx "
+                        "(covers translated IPA 0x%llx)\n",
+                        (unsigned long long) m->gpa, m->size,
+                        (unsigned long long) ipa);
+                found_seg = true;
+            }
+        }
+        if (!found_seg) {
+            const guest_overflow_t *o = guest_find_overflow(g, ipa);
+            if (o) {
+                fprintf(stderr,
+                        "  HVF overflow: ipa=0x%llx size=0x%llx "
+                        "(covers translated IPA 0x%llx)\n",
+                        (unsigned long long) o->ipa_start,
+                        (unsigned long long) o->size, (unsigned long long) ipa);
+                found_seg = true;
+            }
+        }
+        if (!found_seg)
+            fprintf(stderr,
+                    "  HVF backing: NONE (stage-2 hole for IPA 0x%llx)\n",
+                    (unsigned long long) ipa);
+    } else {
+        fprintf(stderr,
+                "  HVF backing: not checked (no valid stage-1 translation)\n");
+    }
+
+    const guest_region_t *r = guest_region_find(g, va);
+    if (r) {
+        fprintf(stderr, "  region: [0x%llx, 0x%llx) prot=%c%c%c name=\"%s\"\n",
+                (unsigned long long) r->start, (unsigned long long) r->end,
+                (r->prot & 1) ? 'r' : '-', (r->prot & 2) ? 'w' : '-',
+                (r->prot & 4) ? 'x' : '-', r->name[0] ? r->name : "(unnamed)");
+    } else {
+        fprintf(stderr, "  region: NONE\n");
+    }
+}
+
+static void dump_translation_diagnostics_for(const guest_t *g,
+                                             const char *label,
+                                             uint64_t va)
+{
+    fprintf(stderr, "## Translation diagnostics (%s=0x%llx)\n", label,
+            (unsigned long long) va);
+    uint64_t ipa = 0;
+    bool have_ipa = dump_pt_walk_for_va(g, va, &ipa);
+    dump_segment_and_region_for(g, va, have_ipa, ipa);
+    fprintf(stderr, "\n");
 }
 
 void crash_report(hv_vcpu_t vcpu,
@@ -247,7 +455,28 @@ void crash_report(hv_vcpu_t vcpu,
         fprintf(stderr, "interp_base = 0x%llx  mmap_limit = 0x%llx\n",
                 (unsigned long long) g->interp_base,
                 (unsigned long long) g->mmap_limit);
-        fprintf(stderr, "nregions    = %d\n\n", g->nregions);
+        fprintf(stderr, "nregions    = %d  hvf_segments = %d\n", g->nregions,
+                g->n_segments);
+        fprintf(stderr, "ttbr0       = 0x%llx\n\n",
+                (unsigned long long) g->ttbr0);
+
+        /* Translation diagnostics for the faulting PC. Helps decide whether
+         * an inst-abort or data-abort came from a stage-1 PT entry that went
+         * away (L3 INVALID after an unrelated mprotect / munmap) or from a
+         * stage-2 backing hole (for example, an hvf_segment_split that left no
+         * covering entry). Data aborts also dump FAR when it differs from PC
+         * because FAR is the actual load/store fault address.
+         */
+        if (vcpu) {
+            uint64_t pc = 0, esr = 0, far_reg = 0;
+            hv_vcpu_get_reg(vcpu, HV_REG_PC, &pc);
+            hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_ESR_EL1, &esr);
+            hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_FAR_EL1, &far_reg);
+            if (pc)
+                dump_translation_diagnostics_for(g, "PC", pc);
+            if (esr_is_data_abort(esr) && far_reg && far_reg != pc)
+                dump_translation_diagnostics_for(g, "FAR", far_reg);
+        }
     }
 
     fprintf(stderr,

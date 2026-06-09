@@ -19,6 +19,8 @@
  */
 #define MAPS_NAME_COLUMN 73
 
+#include <ctype.h>
+#include <stdbool.h>
 #include <stdarg.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -40,6 +42,8 @@
 #include <netinet/in.h>
 #include <libproc.h>
 #include <mach/mach.h>
+#include <sys/ioctl.h>
+#include <termios.h>
 
 #include "utils.h"
 
@@ -1479,11 +1483,805 @@ static void proc_task_collect_cb(thread_entry_t *t, void *arg)
         c->tids[c->ntids++] = t->guest_tid;
 }
 
+/* Pseudoterminal master side-table.
+ *
+ * Bridges two host vs guest mismatches in one place:
+ *
+ * 1. The macOS /dev/ptmx master is not itself a tty. TIOCSWINSZ / TIOCGWINSZ
+ *    on the bare master return ENOTTY until something has opened the
+ *    corresponding slave once, and the stored winsize gets cleared whenever
+ *    the slave refcount drops to zero (verified empirically on macOS 15).
+ *    Linux ptmx masters are tty fds in their own right, so guests assume those
+ *    ioctls work without an open slave. To bridge the gap, every /dev/ptmx
+ *    open eagerly opens one slave host fd that elfuse holds for the lifetime
+ *    of the master and never exposes to the guest.
+ *
+ * 2. macOS slaves live at /dev/ttysNNN; Linux glibc looks for /dev/pts/N where
+ *    N comes from TIOCGPTN. Guest opens of /dev/pts/N route back to the
+ *    macOS path captured from ptsname(3) at /dev/ptmx open time, not a
+ *    re-formatted guess, so format changes in macOS (or unusual minor
+ *    encodings) cannot strand the guest with the wrong slave.
+ *
+ * Entries are keyed by the host master fd because that is what fd_cleanup_entry
+ * has when the guest closes a master. Capacity matches the macOS default UNIX98
+ * slave count; overflow leaves the entry empty and the guest gets the pre-fix
+ * degraded behavior for that one pair instead of an open failure.
+ *
+ * Fork-restored entries may outlive their master for one /dev/pts/N open. A
+ * foot / sshd / posix-compliant child closes the master fd after fork before
+ * opening the slave (the child has no use for the master); without retaining
+ * the path mapping past close, the subsequent /dev/pts/N open in the child
+ * loses its translation and fails with ENOENT even though the parent still
+ * holds the master and the macOS slave node is openable. Those stale entries
+ * keep the received slave fd until the first translated open attempt, then
+ * expire before the minor can be reused for an unrelated host tty. Ordinary
+ * local master closes clear the mapping immediately.
+ */
+#define PTY_KEEPALIVE_MAX 256
+#define PTY_KEEPALIVE_FREE (-1)
+/* PTY_SLAVE_PATH_MAX lives in procemu.h so this table and the fork-IPC
+ * payload (proc_pty_ipc_entry_t) cannot drift apart.
+ */
+static struct {
+    int master_host_fd;
+    int slave_host_fd;
+    uint32_t linux_pts_num;
+    bool stale_open_once;
+    char slave_path[PTY_SLAVE_PATH_MAX];
+} pty_keepalive_table[PTY_KEEPALIVE_MAX];
+static pthread_mutex_t pty_keepalive_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_once_t pty_keepalive_once = PTHREAD_ONCE_INIT;
+
+/* Sentinel-init. Other fields stay BSS-zero; without sentinels a host fd 0
+ * close would match slot 0 and close the wrong fd inside elfuse.
+ */
+static void pty_keepalive_init(void)
+{
+    for (int i = 0; i < PTY_KEEPALIVE_MAX; i++) {
+        pty_keepalive_table[i].master_host_fd = PTY_KEEPALIVE_FREE;
+        pty_keepalive_table[i].slave_host_fd = PTY_KEEPALIVE_FREE;
+    }
+}
+
+static void pty_keepalive_lock_acquire(void)
+{
+    pthread_once(&pty_keepalive_once, pty_keepalive_init);
+    pthread_mutex_lock(&pty_keepalive_lock);
+}
+
+/* Find a slot by master_host_fd; -1 if none. Caller holds the lock. */
+static int pty_keepalive_find_master_locked(int master_host_fd)
+{
+    for (int i = 0; i < PTY_KEEPALIVE_MAX; i++)
+        if (pty_keepalive_table[i].master_host_fd == master_host_fd)
+            return i;
+    return -1;
+}
+
+static int pty_keepalive_clear_slot_locked(int slot)
+{
+    int slave = pty_keepalive_table[slot].slave_host_fd;
+    pty_keepalive_table[slot].master_host_fd = PTY_KEEPALIVE_FREE;
+    pty_keepalive_table[slot].slave_host_fd = PTY_KEEPALIVE_FREE;
+    pty_keepalive_table[slot].linux_pts_num = 0;
+    pty_keepalive_table[slot].stale_open_once = false;
+    pty_keepalive_table[slot].slave_path[0] = '\0';
+    return slave;
+}
+
+static uint32_t pty_extract_pts_num(const char *slave_path)
+{
+    /* macOS canonical slave paths are /dev/ttysNNN with a decimal tail. Read
+     * the longest decimal suffix and return it as the Linux pts number used
+     * by guest /dev/pts/N. Returns UINT32_MAX on parse failure so callers
+     * can reject ambiguous names rather than silently aliasing.
+     */
+    if (!slave_path)
+        return UINT32_MAX;
+    const char *p = slave_path + strlen(slave_path);
+    while (p > slave_path && isdigit((unsigned char) p[-1]))
+        p--;
+    if (!*p || !isdigit((unsigned char) *p))
+        return UINT32_MAX;
+    char *endp;
+    unsigned long n = strtoul(p, &endp, 10);
+    if (endp == p || *endp != '\0' || n > UINT32_MAX)
+        return UINT32_MAX;
+    return (uint32_t) n;
+}
+
+/* Result codes for the locked register helper. */
+#define PTY_REG_INSERTED 0 /* new entry installed */
+#define PTY_REG_EXISTS 1   /* a matching entry already existed */
+#define PTY_REG_FULL (-1)  /* table out of free slots */
+
+/* Caller-holds-lock variant. Returns one of PTY_REG_* and, on PTY_REG_EXISTS,
+ * writes the existing entry's pts number to *existing_pts_num. The lock-held
+ * variant exists so proc_pty_master_adopt can atomically pair fd-table slot
+ * validation with keepalive insertion under fd_lock + pty_keepalive_lock,
+ * eliminating the race window where a sibling close+recycle between validate
+ * and register would attach the keepalive to the wrong file.
+ */
+static int pty_keepalive_register_locked(int master_host_fd,
+                                         int slave_host_fd,
+                                         uint32_t linux_pts_num,
+                                         const char *slave_path,
+                                         bool stale_open_once,
+                                         uint32_t *existing_pts_num)
+{
+    int empty_slot = -1;
+    int stale_path_slot = -1;
+    for (int i = 0; i < PTY_KEEPALIVE_MAX; i++) {
+        if (pty_keepalive_table[i].master_host_fd == master_host_fd) {
+            if (existing_pts_num)
+                *existing_pts_num = pty_keepalive_table[i].linux_pts_num;
+            return PTY_REG_EXISTS;
+        }
+        if (pty_keepalive_table[i].master_host_fd != PTY_KEEPALIVE_FREE)
+            continue;
+        /* Prefer a stale-path slot with the same pts number: the macOS minor
+         * deterministically maps to the same slave_path string, so reusing
+         * keeps lookups path-correct and bounds the table at one slot per
+         * live minor instead of accumulating a new entry on every reopen.
+         */
+        if (pty_keepalive_table[i].slave_path[0] != '\0' &&
+            pty_keepalive_table[i].linux_pts_num == linux_pts_num) {
+            stale_path_slot = i;
+        } else if (empty_slot < 0 &&
+                   pty_keepalive_table[i].slave_path[0] == '\0') {
+            empty_slot = i;
+        }
+    }
+    int slot = (stale_path_slot >= 0) ? stale_path_slot : empty_slot;
+    if (slot < 0) {
+        /* Out of empty slots and no stale-path match: evict the lowest-index
+         * stale-path entry so the live registration cannot starve. Live entries
+         * are never evicted. The eviction policy is approximately LRU: empty
+         * slots fill from low indices, so the lowest-index stale slot tends to
+         * be the oldest closed. A theoretical race exists with the
+         * close-before-open child pattern (a child stales slot K under
+         * pty_keepalive_lock and races into open("/dev/pts/N") just as another
+         * thread evicts slot K to register a different minor) but needs the
+         * keepalive table to be full -- live and stale entries both count --
+         * with the staling thread's slot being the lowest-index stale. Well
+         * outside the foot / sshd workload that motivated this code.
+         */
+        for (int i = 0; i < PTY_KEEPALIVE_MAX; i++) {
+            if (pty_keepalive_table[i].master_host_fd == PTY_KEEPALIVE_FREE &&
+                pty_keepalive_table[i].slave_path[0] != '\0') {
+                slot = i;
+                break;
+            }
+        }
+        if (slot < 0)
+            return PTY_REG_FULL;
+    }
+    pty_keepalive_table[slot].master_host_fd = master_host_fd;
+    if (pty_keepalive_table[slot].slave_host_fd >= 0 &&
+        pty_keepalive_table[slot].slave_host_fd != slave_host_fd)
+        close(pty_keepalive_table[slot].slave_host_fd);
+    pty_keepalive_table[slot].slave_host_fd = slave_host_fd;
+    pty_keepalive_table[slot].linux_pts_num = linux_pts_num;
+    pty_keepalive_table[slot].stale_open_once = stale_open_once;
+    if (slave_path)
+        str_copy_trunc(pty_keepalive_table[slot].slave_path, slave_path,
+                       PTY_SLAVE_PATH_MAX);
+    else
+        pty_keepalive_table[slot].slave_path[0] = '\0';
+    return PTY_REG_INSERTED;
+}
+
+/* Lock-acquiring convenience wrapper used by the open-time and fork-restore
+ * paths where atomicity with fd_table is not required. Returns 0 on success
+ * (including PTY_REG_EXISTS, in which case the caller should close its own
+ * redundant slave_host_fd), -1 with errno set on table-full (ENOSPC).
+ */
+static int pty_keepalive_register(int master_host_fd,
+                                  int slave_host_fd,
+                                  uint32_t linux_pts_num,
+                                  const char *slave_path,
+                                  bool stale_open_once)
+{
+    pty_keepalive_lock_acquire();
+    int rc = pty_keepalive_register_locked(master_host_fd, slave_host_fd,
+                                           linux_pts_num, slave_path,
+                                           stale_open_once, NULL);
+    pthread_mutex_unlock(&pty_keepalive_lock);
+    if (rc == PTY_REG_FULL) {
+        errno = ENOSPC;
+        return -1;
+    }
+    if (rc == PTY_REG_EXISTS)
+        errno = EEXIST;
+    return 0;
+}
+
+uint32_t proc_pty_master_pts_num(int master_host_fd)
+{
+    if (master_host_fd < 0)
+        return UINT32_MAX;
+    pty_keepalive_lock_acquire();
+    int slot = pty_keepalive_find_master_locked(master_host_fd);
+    uint32_t pts_num =
+        (slot < 0) ? UINT32_MAX : pty_keepalive_table[slot].linux_pts_num;
+    pthread_mutex_unlock(&pty_keepalive_lock);
+    return pts_num;
+}
+
+/* Re-validate that fd_table[guest_fd] still refers to (host_fd, generation).
+ * Returns true when both match the snapshot, false otherwise (slot closed or
+ * recycled). Used by proc_pty_master_adopt to bracket every host-fd-number
+ * access against the closing-and-reuse race.
+ */
+static bool pty_fd_still_canonical(int guest_fd,
+                                   int canonical_host_fd,
+                                   uint64_t canonical_gen)
+{
+    fd_entry_t snap;
+    if (!fd_snapshot(guest_fd, &snap))
+        return false;
+    return snap.host_fd == canonical_host_fd &&
+           snap.generation == canonical_gen;
+}
+
+uint32_t proc_pty_master_adopt(int guest_fd)
+{
+    /* Step 1: atomically snapshot (host_fd, generation) and dup the
+     * canonical fd in a single fd_lock window. fd_snapshot_and_dup pins
+     * the file object behind the canonical host fd, so even if a sibling
+     * closes the guest fd and the host fd number is recycled by an
+     * unrelated open, host syscalls against the probe still operate on
+     * the right tty. The generation captured here is the witness for the
+     * subsequent table lookup and register validations.
+     */
+    fd_entry_t snap;
+    int probe = fd_snapshot_and_dup(guest_fd, &snap);
+    if (probe < 0)
+        return UINT32_MAX;
+    int canonical_host_fd = snap.host_fd;
+    uint64_t canonical_gen = snap.generation;
+
+    /* Fast path: a keepalive was already registered for this canonical fd
+     * (typical case for /dev/ptmx opens that went through pty_open_master).
+     * The keepalive table is keyed by host fd number, so re-validate the
+     * slot identity before trusting the returned pts_num. If the fd has
+     * been recycled to a different file (generation mismatch), the
+     * existing entry belongs to that file, not ours, and the slow path
+     * below must register a fresh entry for our pinned probe.
+     */
+    uint32_t existing = proc_pty_master_pts_num(canonical_host_fd);
+    if (existing != UINT32_MAX &&
+        pty_fd_still_canonical(guest_fd, canonical_host_fd, canonical_gen)) {
+        close(probe);
+        return existing;
+    }
+
+    /* Step 2: confirm the file really is a /dev/ptmx master. ptsname(3)
+     * returns NULL/ENOTTY on non-pty descriptors, so a stray TIOCGPTN
+     * against a regular file is rejected without any side effect.
+     */
+    char slave_path[PTY_SLAVE_PATH_MAX];
+    uint32_t pts_num = UINT32_MAX;
+    int slave = -1;
+    if (ptsname_r(probe, slave_path, sizeof(slave_path)) != 0)
+        goto out;
+    pts_num = pty_extract_pts_num(slave_path);
+    if (pts_num == UINT32_MAX)
+        goto out;
+
+    /* unlockpt(3) is harmless if the sender already unlocked. EINVAL means
+     * already unlocked; anything else means the slave will not open and
+     * we give up cleanly.
+     */
+    if (unlockpt(probe) < 0 && errno != EINVAL) {
+        pts_num = UINT32_MAX;
+        goto out;
+    }
+    slave = open(slave_path, O_RDWR | O_NOCTTY | O_CLOEXEC);
+    if (slave < 0) {
+        pts_num = UINT32_MAX;
+        goto out;
+    }
+
+    /* Step 3: re-validate AND publish under the joint pty_keepalive_lock +
+     * fd_lock window. Lock order is pty_keepalive_lock first;
+     * duplicate_guest_fd uses the same order when bracketing
+     * fd_snapshot_and_dup + proc_pty_dup_keepalive_locked, so the two paths
+     * cannot deadlock. With both held, no sibling can flip the fd_table slot
+     * between the validation read and the keepalive insert, so the keepalive
+     * cannot attach to a recycled canonical host fd.
+     */
+    pty_keepalive_lock_acquire();
+    pthread_mutex_lock(&fd_lock);
+    if (fd_table[guest_fd].type == FD_CLOSED ||
+        fd_table[guest_fd].host_fd != canonical_host_fd ||
+        fd_table[guest_fd].generation != canonical_gen) {
+        pthread_mutex_unlock(&fd_lock);
+        pthread_mutex_unlock(&pty_keepalive_lock);
+        close(slave);
+        pts_num = UINT32_MAX;
+        goto out;
+    }
+    uint32_t existing_pts = UINT32_MAX;
+    int rc = pty_keepalive_register_locked(canonical_host_fd, slave, pts_num,
+                                           slave_path, false, &existing_pts);
+    pthread_mutex_unlock(&fd_lock);
+    pthread_mutex_unlock(&pty_keepalive_lock);
+    if (rc == PTY_REG_FULL) {
+        close(slave);
+        pts_num = UINT32_MAX;
+    } else if (rc == PTY_REG_EXISTS) {
+        /* Another adopter registered first; their slave keeps the tty alive.
+         * The pts_num came from the locked scan above, so it is the value the
+         * winning entry holds and is not subject to a lookup-after-recycle
+         * race.
+         */
+        close(slave);
+        pts_num = existing_pts;
+    }
+
+out:
+    close(probe);
+    return pts_num;
+}
+
+/* Look up the captured macOS slave path for a Linux pts number. Returns 0 and
+ * writes the path on hit, -1 with errno=ENOENT on miss. Used by the /dev/pts/N
+ * open and stat intercepts so they hit the exact path returned by ptsname(3)
+ * rather than a guessed /dev/ttys%03lu reformat that breaks if macOS changes
+ * its naming scheme or uses an unexpected minor encoding.
+ */
+static int pty_lookup_slave_path(uint32_t linux_pts_num,
+                                 char *out,
+                                 size_t out_sz)
+{
+    if (!out || out_sz == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    int hit = -1;
+    pty_keepalive_lock_acquire();
+    /* Prefer a live entry (master still open in this process) over a stale
+     * path entry. Both encode the same slave_path for a given minor on macOS,
+     * so the preference only matters if a future change ever lets the two
+     * diverge - live wins by breaking out of the scan on first match.
+     */
+    for (int i = 0; i < PTY_KEEPALIVE_MAX; i++) {
+        if (pty_keepalive_table[i].linux_pts_num != linux_pts_num)
+            continue;
+        if (pty_keepalive_table[i].slave_path[0] == '\0')
+            continue;
+        if (pty_keepalive_table[i].master_host_fd != PTY_KEEPALIVE_FREE) {
+            hit = i;
+            break;
+        }
+        if (!pty_keepalive_table[i].stale_open_once ||
+            pty_keepalive_table[i].slave_host_fd < 0)
+            continue;
+        if (hit < 0)
+            hit = i;
+    }
+    if (hit < 0) {
+        pthread_mutex_unlock(&pty_keepalive_lock);
+        errno = ENOENT;
+        return -1;
+    }
+    size_t len = strlen(pty_keepalive_table[hit].slave_path);
+    if (len >= out_sz) {
+        pthread_mutex_unlock(&pty_keepalive_lock);
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    memcpy(out, pty_keepalive_table[hit].slave_path, len + 1);
+    pthread_mutex_unlock(&pty_keepalive_lock);
+    return 0;
+}
+
+static int pty_open_slave(uint32_t linux_pts_num, int linux_flags)
+{
+    int oflags = translate_open_flags(linux_flags) &
+                 (O_ACCMODE | O_NONBLOCK | O_CLOEXEC | O_NOCTTY);
+    char host_path[PTY_SLAVE_PATH_MAX];
+    int stale_hit = -1;
+    int retained_slaves[PTY_KEEPALIVE_MAX];
+    int nretained = 0;
+    int fd = -1;
+
+    pty_keepalive_lock_acquire();
+    for (int i = 0; i < PTY_KEEPALIVE_MAX; i++) {
+        if (pty_keepalive_table[i].linux_pts_num != linux_pts_num)
+            continue;
+        if (pty_keepalive_table[i].slave_path[0] == '\0')
+            continue;
+        if (pty_keepalive_table[i].master_host_fd != PTY_KEEPALIVE_FREE) {
+            size_t len = strlen(pty_keepalive_table[i].slave_path);
+            if (len >= sizeof(host_path)) {
+                pthread_mutex_unlock(&pty_keepalive_lock);
+                errno = ENAMETOOLONG;
+                return -1;
+            }
+            memcpy(host_path, pty_keepalive_table[i].slave_path, len + 1);
+            pthread_mutex_unlock(&pty_keepalive_lock);
+            return open(host_path, oflags);
+        }
+        if (stale_hit < 0 && pty_keepalive_table[i].stale_open_once &&
+            pty_keepalive_table[i].slave_host_fd >= 0)
+            stale_hit = i;
+    }
+
+    if (stale_hit < 0) {
+        pthread_mutex_unlock(&pty_keepalive_lock);
+        errno = ENOENT;
+        return -1;
+    }
+
+    /* Stale fork-child entries are one-shot. The retained slave fd pins the
+     * macOS tty while we translate the close-before-open sequence, preventing
+     * the cached path from resolving to a reused unrelated minor. Regardless
+     * of open success, consume the stale mapping before returning.
+     */
+    size_t len = strlen(pty_keepalive_table[stale_hit].slave_path);
+    if (len >= sizeof(host_path)) {
+        int retained_slave = pty_keepalive_clear_slot_locked(stale_hit);
+        pthread_mutex_unlock(&pty_keepalive_lock);
+        if (retained_slave >= 0)
+            close(retained_slave);
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    memcpy(host_path, pty_keepalive_table[stale_hit].slave_path, len + 1);
+    fd = open(host_path, oflags);
+    int saved = errno;
+    for (int i = 0; i < PTY_KEEPALIVE_MAX; i++) {
+        if (pty_keepalive_table[i].master_host_fd != PTY_KEEPALIVE_FREE)
+            continue;
+        if (!pty_keepalive_table[i].stale_open_once)
+            continue;
+        if (strncmp(pty_keepalive_table[i].slave_path, host_path,
+                    PTY_SLAVE_PATH_MAX) != 0)
+            continue;
+        int retained_slave = pty_keepalive_clear_slot_locked(i);
+        if (retained_slave >= 0 && nretained < PTY_KEEPALIVE_MAX)
+            retained_slaves[nretained++] = retained_slave;
+    }
+    pthread_mutex_unlock(&pty_keepalive_lock);
+    for (int i = 0; i < nretained; i++)
+        close(retained_slaves[i]);
+    errno = saved;
+    return fd;
+}
+
+static int pty_open_pts_dir(int linux_flags)
+{
+    char dir[80];
+    uint32_t pts_nums[PTY_KEEPALIVE_MAX];
+    int pts_count = 0;
+    int n = snprintf(dir, sizeof(dir), "/tmp/elfuse-pts-XXXXXX");
+    if (n < 0 || (size_t) n >= sizeof(dir)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    if (!mkdtemp(dir))
+        return -1;
+
+    pty_keepalive_lock_acquire();
+    /* Enumerate live masters and fork-child one-shot stale entries. The stale
+     * entries retain a slave fd until the first open attempt consumes them, so
+     * they cannot name a reused unrelated tty while they appear in readdir.
+     */
+    for (int i = 0; i < PTY_KEEPALIVE_MAX; i++) {
+        if (pty_keepalive_table[i].slave_path[0] == '\0')
+            continue;
+        if (pty_keepalive_table[i].master_host_fd == PTY_KEEPALIVE_FREE &&
+            (!pty_keepalive_table[i].stale_open_once ||
+             pty_keepalive_table[i].slave_host_fd < 0))
+            continue;
+        /* The recycle/reuse-by-pts_num invariant in
+         * pty_keepalive_register_locked keeps at most one entry per minor, so
+         * no de-duplication pass is needed here.
+         */
+        pts_nums[pts_count++] = pty_keepalive_table[i].linux_pts_num;
+    }
+    pthread_mutex_unlock(&pty_keepalive_lock);
+
+    for (int i = 0; i < pts_count; i++) {
+        char entry[160];
+        int en = snprintf(entry, sizeof(entry), "%s/%u", dir, pts_nums[i]);
+        if (en <= 0 || (size_t) en >= sizeof(entry))
+            continue;
+        int tfd = open(entry, O_CREAT | O_WRONLY, 0444);
+        if (tfd >= 0)
+            close(tfd);
+    }
+
+    pthread_once(&proc_scratch_atexit_once, proc_scratch_register_atexit);
+
+    pthread_mutex_lock(&proc_scratch_lock);
+    if (proc_scratch_dirs_count < PROC_SCRATCH_DIRS_MAX) {
+        str_copy_trunc(proc_scratch_dirs[proc_scratch_dirs_count++], dir,
+                       sizeof(proc_scratch_dirs[0]));
+    }
+    pthread_mutex_unlock(&proc_scratch_lock);
+
+    int fd = proc_open_dir_fd(dir, linux_flags);
+    if (fd < 0) {
+        int saved = errno;
+        proc_scratch_remove_one(dir);
+        errno = saved;
+    }
+    return fd;
+}
+
+void proc_pty_lock_for_dup(void)
+{
+    pty_keepalive_lock_acquire();
+}
+
+void proc_pty_unlock_for_dup(void)
+{
+    pthread_mutex_unlock(&pty_keepalive_lock);
+}
+
+void proc_pty_dup_keepalive_locked(int src_master_host_fd,
+                                   int dst_master_host_fd)
+{
+    /* Caller-holds-lock variant; see header for the dup race this guards. */
+    if (src_master_host_fd < 0 || dst_master_host_fd < 0)
+        return;
+
+    int slot = pty_keepalive_find_master_locked(src_master_host_fd);
+    if (slot < 0)
+        return;
+    int dst_slave = dup(pty_keepalive_table[slot].slave_host_fd);
+    if (dst_slave < 0)
+        return;
+    uint32_t src_pts_num = pty_keepalive_table[slot].linux_pts_num;
+    char src_slave_path[PTY_SLAVE_PATH_MAX];
+    memcpy(src_slave_path, pty_keepalive_table[slot].slave_path,
+           PTY_SLAVE_PATH_MAX);
+
+    /* dup(2) clears FD_CLOEXEC; the keepalive must not survive exec into
+     * a guest child that has no map back to it.
+     */
+    int fdflags = fcntl(dst_slave, F_GETFD);
+    if (fdflags < 0 || fcntl(dst_slave, F_SETFD, fdflags | FD_CLOEXEC) < 0) {
+        close(dst_slave);
+        return;
+    }
+    int rc =
+        pty_keepalive_register_locked(dst_master_host_fd, dst_slave,
+                                      src_pts_num, src_slave_path, false, NULL);
+    if (rc != PTY_REG_INSERTED) {
+        /* Table full or duplicate entry for dst_master_host_fd; drop the
+         * redundant slave. Duplicate is unexpected: dst is a freshly-duped
+         * host fd that should not already be in the table unless a prior
+         * close skipped proc_pty_close_keepalive.
+         */
+        close(dst_slave);
+    }
+}
+
+void proc_pty_close_keepalive(int master_host_fd)
+{
+    /* fd_cleanup_entry calls this for every guest fd close, not just pty
+     * masters; pty_keepalive_lock_acquire guarantees sentinel-init first.
+     */
+    if (master_host_fd < 0)
+        return;
+
+    int slave = -1;
+    pty_keepalive_lock_acquire();
+    int slot = pty_keepalive_find_master_locked(master_host_fd);
+    if (slot >= 0) {
+        if (pty_keepalive_table[slot].stale_open_once) {
+            /* Fork-restored child entry: retain the slave fd and path for one
+             * /dev/pts/N open after close(master). pty_open_slave consumes and
+             * closes it on the first translated open attempt.
+             */
+            pty_keepalive_table[slot].master_host_fd = PTY_KEEPALIVE_FREE;
+        } else {
+            slave = pty_keepalive_clear_slot_locked(slot);
+        }
+    }
+    pthread_mutex_unlock(&pty_keepalive_lock);
+    if (slave >= 0)
+        close(slave);
+}
+
+static void proc_pty_expire_stale_by_path(const char *slave_path)
+{
+    if (!slave_path || slave_path[0] == '\0')
+        return;
+
+    int stale_slaves[PTY_KEEPALIVE_MAX];
+    int nslaves = 0;
+    pty_keepalive_lock_acquire();
+    for (int i = 0; i < PTY_KEEPALIVE_MAX; i++) {
+        if (pty_keepalive_table[i].master_host_fd != PTY_KEEPALIVE_FREE)
+            continue;
+        if (!pty_keepalive_table[i].stale_open_once)
+            continue;
+        if (strncmp(pty_keepalive_table[i].slave_path, slave_path,
+                    PTY_SLAVE_PATH_MAX) != 0)
+            continue;
+        int slave = pty_keepalive_clear_slot_locked(i);
+        if (slave >= 0 && nslaves < PTY_KEEPALIVE_MAX)
+            stale_slaves[nslaves++] = slave;
+    }
+    pthread_mutex_unlock(&pty_keepalive_lock);
+    for (int i = 0; i < nslaves; i++)
+        close(stale_slaves[i]);
+}
+
+static int pty_keepalive_register_recycled(int master_host_fd,
+                                           int slave_host_fd,
+                                           uint32_t linux_pts_num,
+                                           const char *slave_path,
+                                           bool stale_open_once)
+{
+    proc_pty_expire_stale_by_path(slave_path);
+    return pty_keepalive_register(master_host_fd, slave_host_fd, linux_pts_num,
+                                  slave_path, stale_open_once);
+}
+
+int proc_pty_snapshot_keepalive(proc_pty_ipc_entry_t *out_entries,
+                                int *out_slave_fds,
+                                int max_entries)
+{
+    if (!out_entries || !out_slave_fds || max_entries <= 0)
+        return 0;
+
+    int n = 0;
+    pty_keepalive_lock_acquire();
+    for (int i = 0; i < PTY_KEEPALIVE_MAX && n < max_entries; i++) {
+        if (pty_keepalive_table[i].master_host_fd == PTY_KEEPALIVE_FREE)
+            continue;
+
+        /* dup under the lock so the slave fd cannot be closed and the host fd
+         * number recycled before SCM_RIGHTS reads it. The caller closes the dup
+         * after the send completes.
+         */
+        int duped = dup(pty_keepalive_table[i].slave_host_fd);
+        if (duped < 0)
+            continue;
+
+        out_entries[n].master_host_fd = pty_keepalive_table[i].master_host_fd;
+        out_entries[n].linux_pts_num = pty_keepalive_table[i].linux_pts_num;
+        _Static_assert(sizeof(out_entries[n].slave_path) == PTY_SLAVE_PATH_MAX,
+                       "ipc slave_path size must match keepalive table");
+        memcpy(out_entries[n].slave_path, pty_keepalive_table[i].slave_path,
+               PTY_SLAVE_PATH_MAX);
+        out_slave_fds[n] = duped;
+        n++;
+    }
+    pthread_mutex_unlock(&pty_keepalive_lock);
+    return n;
+}
+
+void proc_pty_restore_keepalive(int master_host_fd,
+                                int slave_host_fd,
+                                uint32_t linux_pts_num,
+                                const char *slave_path)
+{
+    /* fork-IPC hand-off. SCM_RIGHTS drops FD_CLOEXEC; set it here so the
+     * keepalive does not survive exec. Any failure drops the slave fd.
+     */
+    if (master_host_fd < 0)
+        goto drop;
+
+    if (slave_host_fd >= 0) {
+        int fdflags = fcntl(slave_host_fd, F_GETFD);
+        if (fdflags < 0 ||
+            fcntl(slave_host_fd, F_SETFD, fdflags | FD_CLOEXEC) < 0)
+            goto drop;
+    }
+
+    /* Trust the parent's linux_pts_num verbatim instead of re-parsing
+     * slave_path. The wire-format string is bounded to PTY_SLAVE_PATH_MAX - 1
+     * bytes; if a future macOS canonical form ever exceeded that, the parent
+     * would have truncated and reparsing here would yield the wrong number. On
+     * EEXIST the child's fd_table-restore path replayed master_host_fd over a
+     * prior recv-keepalive entry; drop the redundant slave so it does not leak.
+     */
+    errno = 0;
+    if (pty_keepalive_register_recycled(master_host_fd, slave_host_fd,
+                                        linux_pts_num, slave_path, true) < 0 ||
+        errno == EEXIST)
+        goto drop;
+    return;
+
+drop:
+    if (slave_host_fd >= 0)
+        close(slave_host_fd);
+}
+
+/* Open /dev/ptmx, unlock the slave, and instantiate a keepalive slave fd so the
+ * master's tty ioctls work before the guest opens the slave itself.
+ * Returns the master host fd on success, -1 with errno set on failure.
+ */
+static int pty_open_master(int linux_flags)
+{
+    /* /dev/ptmx is a character device; O_CREAT / O_TRUNC / O_EXCL make no sense
+     * here. Strip them and only honor accmode + descriptor flags so the host
+     * open(2) never sees a variadic-mode-required combination without a mode
+     * arg.
+     */
+    int oflags = translate_open_flags(linux_flags) &
+                 (O_ACCMODE | O_NONBLOCK | O_CLOEXEC | O_NOCTTY);
+    int master = open("/dev/ptmx", oflags);
+    if (master < 0)
+        return -1;
+
+    /* grantpt(3) is a no-op on a unix98 pty mount, but call it for clarity
+     * and to match what posix_openpt(3)'s callers expect to have happened.
+     */
+    char slave_path[PTY_SLAVE_PATH_MAX];
+    if (grantpt(master) < 0 || unlockpt(master) < 0 ||
+        ptsname_r(master, slave_path, sizeof(slave_path)) != 0) {
+        close_keep_errno(master);
+        return -1;
+    }
+
+    /* Establish the (linux_pts_num, slave_path) mapping that /dev/pts/N opens
+     * and stats resolve through. If table or slave-fd registration fails after
+     * the master is open, report EMFILE rather than silently returning a master
+     * fd whose pts number cannot be opened back through /dev/pts/N. The caller
+     * can close other pty pairs and retry instead of dealing with a half-broken
+     * descriptor.
+     */
+    uint32_t linux_pts_num = pty_extract_pts_num(slave_path);
+    if (linux_pts_num == UINT32_MAX) {
+        close(master);
+        errno = ENOTTY;
+        return -1;
+    }
+    int slave = open(slave_path, O_RDWR | O_NOCTTY | O_CLOEXEC);
+    if (slave < 0) {
+        close_keep_errno(master);
+        return -1;
+    }
+    errno = 0;
+    if (pty_keepalive_register_recycled(master, slave, linux_pts_num,
+                                        slave_path, false) < 0) {
+        close(slave);
+        close(master);
+        errno = EMFILE;
+        return -1;
+    }
+    /* Defense-in-depth: the freshly-opened master fd should not already have
+     * a keepalive (would indicate a stale entry from a prior close that did
+     * not run proc_pty_close_keepalive). Drop the redundant slave so it does
+     * not leak.
+     */
+    if (errno == EEXIST)
+        close(slave);
+    return master;
+}
+
 int proc_intercept_open(const guest_t *g,
                         const char *path,
                         int linux_flags,
                         int mode)
 {
+    /* /dev/ptmx -> host /dev/ptmx + keepalive slave (see pty_open_master).
+     * O_PATH is path-only on Linux: it must not run the device open hook or
+     * allocate a pty pair. Use a harmless backing fd; FD_PATH gates I/O and
+     * ioctl, while proc_intercept_stat supplies the visible device metadata.
+     */
+    if (!strcmp(path, "/dev/ptmx")) {
+        if (linux_flags & LINUX_O_PATH) {
+            if (linux_flags & LINUX_O_DIRECTORY) {
+                errno = ENOTDIR;
+                return -1;
+            }
+            int oflags = O_RDONLY;
+            if (linux_flags & LINUX_O_CLOEXEC)
+                oflags |= O_CLOEXEC;
+            return open("/dev/null", oflags);
+        }
+        return pty_open_master(linux_flags);
+    }
+
     /* /dev/null, /dev/zero, /dev/(u)random, /dev/tty */
     const char *host_dev = NULL;
     int host_accmode = translate_open_flags(linux_flags) & O_ACCMODE;
@@ -1525,6 +2323,7 @@ int proc_intercept_open(const guest_t *g,
         const char *shm = shm_dir_path();
         return shm ? proc_open_dir_fd(shm, linux_flags) : -1;
     }
+
     if (!strncmp(path, "/dev/shm/", 9)) {
         char host_path[512];
         if (dev_shm_resolve_path(path + 9, host_path, sizeof(host_path)) < 0)
@@ -1547,6 +2346,40 @@ int proc_intercept_open(const guest_t *g,
     /* /dev/fd/N -> dup(N) */
     if (!strncmp(path, "/dev/fd/", 8))
         return dev_fd_dup(path, 8);
+
+    /* /dev/pts -> synthetic devpts directory. stat/access advertise this
+     * directory even on macOS hosts without /dev/pts, so open must be
+     * intercepted too or callers that probe then enumerate see inconsistent
+     * Linux-visible behavior.
+     */
+    if (!strcmp(path, "/dev/pts") || !strcmp(path, "/dev/pts/"))
+        return pty_open_pts_dir(linux_flags);
+
+    /* /dev/pts/N -> the macOS slave path captured at /dev/ptmx open time.
+     * Looking up the exact ptsname(3) string (rather than reformatting
+     * /dev/ttys%03lu) keeps the guest correct against any future macOS format
+     * change and against tty minor encodings that do not round-trip through
+     * plain zero-padding. ENOENT until the owning master is opened matches
+     * Linux devpts behavior for an unallocated slave number.
+     */
+    if (!strncmp(path, "/dev/pts/", 9)) {
+        const char *digits = path + 9;
+        if (!*digits) {
+            errno = ENOENT;
+            return -1;
+        }
+        char *endp;
+        unsigned long n = strtoul(digits, &endp, 10);
+        if (endp == digits || *endp != '\0' || n > UINT32_MAX) {
+            errno = ENOENT;
+            return -1;
+        }
+        /* /dev/pts/N is a character device; strip O_CREAT and friends so
+         * the two-argument open(2) never sees a creation-mode-required
+         * combination without a mode arg.
+         */
+        return pty_open_slave((uint32_t) n, linux_flags);
+    }
 
     /* /proc -> synthetic directory with PID entries for busybox ps, top, etc.
      * Creates a temp dir once (cached for the process lifetime) with entries
@@ -1573,9 +2406,8 @@ int proc_intercept_open(const guest_t *g,
      * Each open gets its own scratch dir so concurrent enumerations cannot
      * mutate one another (see proc_open_fd_scratch).
      */
-    if (!strcmp(path, "/proc/self/fd") || !strcmp(path, "/proc/self/fd/")) {
+    if (!strcmp(path, "/proc/self/fd") || !strcmp(path, "/proc/self/fd/"))
         return proc_open_fd_scratch("elfuse-fd", linux_flags);
-    }
 
     if (!strcmp(path, "/proc/net") || !strcmp(path, "/proc/net/")) {
         const char *dir = ensure_proc_tmpdir(g);
@@ -1590,9 +2422,9 @@ int proc_intercept_open(const guest_t *g,
         return proc_open_dir_fd(netdir, linux_flags);
     }
 
-    /* /proc/<our_pid>[/...] -> /proc/self[...]. Returns -1 on
-     * ENAMETOOLONG so the guest sees the same error a real Linux kernel
-     * would produce instead of falling through to a host syscall.
+    /* /proc/<our_pid>[/...] -> /proc/self[...].
+     * Returns -1 on ENAMETOOLONG so the guest sees the same error a real Linux
+     * kernel would produce instead of falling through to a host syscall.
      */
     {
         char alias[LINUX_PATH_MAX];
@@ -1621,9 +2453,9 @@ int proc_intercept_open(const guest_t *g,
      * return an actual file descriptor to the binary.
      * Under rosetta, the binfmt_misc convention treats rosetta as the
      * interpreter visible to the guest: rosetta opens /proc/self/fd/X
-     * via /proc/self/exe to identify itself and then issues the VZ
-     * ioctls on that descriptor. Return ROSETTA_PATH so the VZ ioctl
-     * gate (rosetta_ioctl_target_fd) recognises the fd.
+     * via /proc/self/exe to identify itself and then issues the VZ ioctls on
+     * that descriptor. Return ROSETTA_PATH so the VZ ioctl gate
+     * (rosetta_ioctl_target_fd) recognises the fd.
      */
     if (!strcmp(path, "/proc/self/exe")) {
         if (g && g->is_rosetta)
@@ -1637,8 +2469,8 @@ int proc_intercept_open(const guest_t *g,
     }
 
     /* /proc/cpuinfo -> synthetic file with CPU count.
-     * Buffer sized dynamically from ncpu (~200 bytes/entry) to avoid
-     * silent truncation on hosts with >16 CPUs.
+     * Buffer sized dynamically from ncpu (~200 bytes/entry) to avoid silent
+     * truncation on hosts with >16 CPUs.
      */
     if (!strcmp(path, "/proc/cpuinfo")) {
         int ncpu = (int) sysconf(_SC_NPROCESSORS_ONLN);
@@ -1746,8 +2578,8 @@ int proc_intercept_open(const guest_t *g,
     }
 
     /* /proc/self/task -> directory with per-thread TID entries.
-     * Debuggers and runtimes (GDB, LLDB, JVM, Go runtime) probe this at
-     * startup to discover thread count and per-thread state.
+     * Debuggers and runtimes (GDB, LLDB, JVM, Go runtime) probe this at startup
+     * to discover thread count and per-thread state.
      *
      * Rebuilds a temp directory on each open (thread set is dynamic).
      * Cannot rmdir before returning the fd because macOS getdents on unlinked
@@ -1815,8 +2647,8 @@ int proc_intercept_open(const guest_t *g,
         }
 
         /* /proc/self/task/<tid> directory itself: synthesize a dir with
-         * stat/status placeholder entries. Persistent so getdents sees
-         * the entries on macOS (which cannot enumerate unlinked dirs).
+         * stat/status placeholder entries. Persistent so getdents sees the
+         * entries on macOS (which cannot enumerate unlinked dirs).
          */
         if (*endp == '\0' || !strcmp(endp, "/")) {
             static proc_persistent_dir_t tiddir =
@@ -1881,9 +2713,9 @@ int proc_intercept_open(const guest_t *g,
 
         /* Add preannounced entries only while they still have an uncovered
          * tail. Once the union of live regions covers the full advertised
-         * interval, suppress the shadow entry so /proc/self/maps shows only
-         * the realized split VMAs. A partial union must stay visible because
-         * some reserved-but-not-realized span remains to advertise.
+         * interval, suppress the shadow entry so /proc/self/maps shows only the
+         * realized split VMAs. A partial union must stay visible because some
+         * reserved-but-not-realized span remains to advertise.
          */
         for (int i = 0; i < g->npreannounced && nentries < MAPS_ENTRY_MAX;
              i++) {
@@ -2185,8 +3017,9 @@ int proc_intercept_open(const guest_t *g,
             uint64_t mask;
             /* fs/signalfd.c uses a tab after the colon (matching the
              * pos:/flags:/mnt_id: convention in fs/proc/fd.c, not the
-             * single-space style of eventfd/timerfd). Verified against a
-             * real Linux 6.x /proc/self/fdinfo dump. */
+             * single-space style of eventfd/timerfd). Verified against a real
+             * Linux 6.x /proc/self/fdinfo dump.
+             */
             if (signalfd_fdinfo_snapshot(n, &mask))
                 snprintf(extra, sizeof(extra), "sigmask:\t%016llx\n",
                          (unsigned long long) mask);
@@ -2196,11 +3029,12 @@ int proc_intercept_open(const guest_t *g,
             int64_t value_ns, interval_ns;
             if (timerfd_fdinfo_snapshot(n, &clockid, &ticks, &value_ns,
                                         &interval_ns)) {
-                /* Linux fs/timerfd.c emits these fields with single
-                 * spaces after the colon, not tabs (unlike pos:/flags:/
-                 * mnt_id: in fs/proc/fd.c, which do use tabs). Match the
-                 * upstream format so guest readers parsing fdinfo via a
-                 * "it_value: (" prefix find the field. */
+                /* Linux fs/timerfd.c emits these fields with single spaces
+                 * after the colon, not tabs (unlike pos:/flags:/mnt_id: in
+                 * fs/proc/fd.c, which do use tabs). Match the upstream format
+                 * so guest readers parsing fdinfo via a "it_value: (" prefix
+                 * find the field.
+                 */
                 snprintf(extra, sizeof(extra),
                          "clockid: %d\n"
                          "ticks: %llu\n"
@@ -2227,9 +3061,9 @@ int proc_intercept_open(const guest_t *g,
     }
 
     /* /proc/self/fdinfo -> directory listing. Each open gets its own scratch
-     * dir so concurrent getdents on independent dirfds cannot interfere
-     * (the previous shared-dir design unlinked entries under a sibling
-     * enumerator). The dirs are tracked for atexit cleanup.
+     * dir so concurrent getdents on independent dirfds cannot interfere (the
+     * previous shared-dir design unlinked entries under a sibling enumerator).
+     * The dirs are tracked for atexit cleanup.
      */
     if (!strcmp(path, "/proc/self/fdinfo") ||
         !strcmp(path, "/proc/self/fdinfo/")) {
@@ -2276,6 +3110,7 @@ int proc_intercept_open(const guest_t *g,
             buffers_kb = total_kb / 20;
             cached_kb = total_kb / 4;
         }
+
         return proc_emit_fmt(
             "MemTotal:       %llu kB\n"
             "MemFree:        %llu kB\n"
@@ -2313,9 +3148,9 @@ int proc_intercept_open(const guest_t *g,
     }
 
     /* /proc/self/io -> synthetic I/O counters.
-     * Some node-style observability runtimes read this for resource
-     * monitoring metrics. procfs emulation returns zeroed counters because
-     * it does not track per-guest I/O.
+     * Some node-style observability runtimes read this for resource monitoring
+     * metrics. procfs emulation returns zeroed counters because it does not
+     * track per-guest I/O.
      */
     if (!strcmp(path, "/proc/self/io")) {
         return proc_emit_literal(
@@ -2474,6 +3309,23 @@ int proc_intercept_stat(const char *path, struct stat *st)
     if (!strcmp(path, "/dev/fuse"))
         return fuse_proc_stat(st);
 
+    /* Linux /dev/ptmx is the Unix98 pty multiplexer character device (5:2).
+     * Keep this synthetic so O_PATH probes can fstat the path fd without
+     * forcing a real host /dev/ptmx open, which would allocate a pty.
+     */
+    if (!strcmp(path, "/dev/ptmx")) {
+        memset(st, 0, sizeof(*st));
+        st->st_mode = S_IFCHR | 0666;
+        st->st_nlink = 1;
+        st->st_dev = PROC_SYNTH_DEV;
+        st->st_ino = proc_synth_ino(path);
+        st->st_uid = proc_get_uid();
+        st->st_gid = proc_get_gid();
+        st->st_rdev = ((dev_t) 5u << 24) | (dev_t) 2u;
+        st->st_blksize = 1024;
+        return 0;
+    }
+
     /* /dev/shm is a directory */
     if (!strcmp(path, "/dev/shm") || !strcmp(path, "/dev/shm/")) {
         stat_fill_proc_dir(st, 01777, 2,
@@ -2486,6 +3338,63 @@ int proc_intercept_stat(const char *path, struct stat *st)
         if (dev_shm_resolve_path(path + 9, host_path, sizeof(host_path)) < 0)
             return -1;
         return stat(host_path, st);
+    }
+
+    /* /dev/pts directory and /dev/pts/N slave entries. glibc ptsname(3)
+     * stats /dev/pts/N after TIOCGPTN and rejects with ENOENT if absent.
+     * Synthesize a minimal char-device stat whose st_rdev decodes to Linux's
+     * standard pts major (136) so glibc's major(rdev) == UNIX98_PTY_SLAVE_MAJOR
+     * check passes. The numeric tail must round-trip with /dev/ttysN via the
+     * open intercept (see proc_intercept_open).
+     */
+    if (!strcmp(path, "/dev/pts") || !strcmp(path, "/dev/pts/")) {
+        stat_fill_proc_dir(st, 0755, 2, path);
+        return 0;
+    }
+    if (!strncmp(path, "/dev/pts/", 9)) {
+        const char *digits = path + 9;
+        if (!*digits) {
+            errno = ENOENT;
+            return -1;
+        }
+        char *endp;
+        unsigned long n = strtoul(digits, &endp, 10);
+        if (endp == digits || *endp != '\0' || n > UINT32_MAX) {
+            errno = ENOENT;
+            return -1;
+        }
+        /* Resolve through the captured-path table: ENOENT unless the
+         * corresponding master is currently open. This avoids the host
+         * stat false-positive where /dev/ttysNNN happens to exist for an
+         * unrelated tty allocated outside elfuse.
+         */
+        char host_path[PTY_SLAVE_PATH_MAX];
+        if (pty_lookup_slave_path((uint32_t) n, host_path, sizeof(host_path)) <
+            0)
+            return -1;
+        struct stat host_st;
+        if (stat(host_path, &host_st) < 0) {
+            errno = ENOENT;
+            return -1;
+        }
+        memset(st, 0, sizeof(*st));
+        st->st_mode = S_IFCHR | 0620;
+        st->st_nlink = 1;
+        st->st_uid = host_st.st_uid;
+        st->st_gid = host_st.st_gid;
+        /* macOS dev_t = (major << 24) | minor; the fs-stat translation layer
+         * (mac_to_linux_dev) re-encodes that into Linux's split major/minor
+         * layout, so storing 136 in the macOS-major slot makes glibc's
+         * major(rdev) yield UNIX98_PTY_SLAVE_MAJOR.
+         */
+        st->st_rdev = ((dev_t) 136u << 24) | (dev_t) (n & 0xFFFFFFu);
+        st->st_size = 0;
+        st->st_blksize = 1024;
+        st->st_blocks = 0;
+        st->st_atime = host_st.st_atime;
+        st->st_mtime = host_st.st_mtime;
+        st->st_ctime = host_st.st_ctime;
+        return 0;
     }
 
     /* /proc and /proc/<our_pid> are directories */
@@ -2645,10 +3554,11 @@ int proc_intercept_stat(const char *path, struct stat *st)
             struct stat host_st;
             if (lstat(host_path, &host_st) < 0)
                 return -1;
+
             /* Replace host inode/dev with the synthetic-procfs convention so
-             * the guest sees a stable identity that does not collide with
-             * real host files (and so st_size reads as 0 for cpumask files,
-             * matching real sysfs).
+             * the guest sees a stable identity that does not collide with real
+             * host files (and so st_size reads as 0 for cpumask files, matching
+             * real sysfs).
              */
             if (S_ISDIR(host_st.st_mode))
                 stat_fill_proc_dir(st, 0555, 2, path);
@@ -2699,9 +3609,9 @@ int proc_intercept_readlink(const char *path, char *buf, size_t bufsiz)
         char sysroot_snap[LINUX_PATH_MAX];
         if (proc_sysroot_snapshot(sysroot_snap, sizeof(sysroot_snap))) {
             /* proc_set_sysroot stores a realpath()-canonicalized form, so
-             * canonicalize exe before the prefix check or the strip fails
-             * when /var -> /private/var (and similar macOS symlinks) make
-             * the two strings diverge.
+             * canonicalize exe before the prefix check or the strip fails when
+             * /var -> /private/var (and similar macOS symlinks) make the two
+             * strings diverge.
              */
             const char *exe_cmp = exe;
             if (realpath(exe, exe_real))
@@ -2843,10 +3753,11 @@ int proc_intercept_write(int guest_fd,
         return 0;
     int kind = proc_oom_path_kind(snap.proc_path);
     if (kind == OOM_PATH_SCORE) {
-        /* Linux: oom_score has no write handler. proc_reg_write returns
-         * -EIO when the underlying proc_dir_entry exposes no write op,
-         * not -EINVAL. Match that so guests probing the error code see
-         * the same value as on a real kernel. */
+        /* Linux: oom_score has no write handler. proc_reg_write returns -EIO
+         * when the underlying proc_dir_entry exposes no write op, not -EINVAL.
+         * Match that so guests probing the error code see the same value as on
+         * a real kernel.
+         */
         errno = EIO;
         return -1;
     }
@@ -2854,8 +3765,8 @@ int proc_intercept_write(int guest_fd,
         return 0;
 
     /* Linux: zero-byte writes to proc nodes succeed without side effects.
-     * Without this short-circuit, sys_writev would funnel a zero-length
-     * vector through proc_parse_int_write and get -EINVAL.
+     * Without this short-circuit, sys_writev would funnel a zero-length vector
+     * through proc_parse_int_write and get -EINVAL.
      */
     if (count == 0) {
         *written_out = 0;
@@ -2902,6 +3813,7 @@ int proc_intercept_write(int guest_fd,
         goto unlock;
     if (!use_pwrite && lseek(host_fd, offset + (int64_t) count, SEEK_SET) < 0)
         goto unlock;
+
     atomic_store(&oom_score_adj_value, score_adj);
     proc_oom_refresh_live_fds_locked();
     *written_out = (ssize_t) count;

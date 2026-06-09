@@ -17,6 +17,7 @@
 #include "utils.h"
 
 #include "runtime/fork-state.h"
+#include "runtime/procemu.h"
 
 #include "debug/log.h"
 #include "syscall/abi.h"
@@ -447,6 +448,156 @@ int fork_ipc_recv_fd_table(int ipc_fd, guest_t *g)
     return 0;
 }
 
+/* Wire payload for one pty keepalive. The slave fd travels separately via
+ * SCM_RIGHTS; the parent's master_host_fd is intentionally omitted because the
+ * child's number will differ. The child re-derives it from fd_table[gfd].
+ */
+typedef struct {
+    int32_t guest_fd;
+    uint32_t linux_pts_num;
+    char slave_path[64];
+} ipc_pty_keepalive_t;
+
+int fork_ipc_send_pty_keepalives(int ipc_sock)
+{
+    /* PTY_KEEPALIVE_MAX upper bound on entries; allocate to that. */
+    proc_pty_ipc_entry_t snapshot[256];
+    int snapshot_slave_fds[256];
+    int num_snap = proc_pty_snapshot_keepalive(snapshot, snapshot_slave_fds,
+                                               ARRAY_SIZE(snapshot));
+
+    /* Match each keepalive's master_host_fd against a live fd_table entry to
+     * recover the guest_fd, which is the stable identifier across fork.
+     */
+    ipc_pty_keepalive_t payload[256];
+    int payload_slave_fds[256];
+    uint32_t num_send = 0;
+
+    pthread_mutex_lock(&fd_lock);
+    for (int i = 0; i < num_snap; i++) {
+        int matched_gfd = -1;
+        for (int gfd = 0; gfd < FD_TABLE_SIZE; gfd++) {
+            if (fd_table[gfd].type == FD_CLOSED)
+                continue;
+            if (fd_table[gfd].host_fd != snapshot[i].master_host_fd)
+                continue;
+            if (fd_type_is_synthetic(fd_table[gfd].type))
+                continue;
+            matched_gfd = gfd;
+            break;
+        }
+
+        if (matched_gfd < 0) {
+            /* Master was closed between snapshot and lookup, or never tracked
+             * in the guest fd table (defensive). Drop the duped slave; nothing
+             * else holds it.
+             */
+            close(snapshot_slave_fds[i]);
+            continue;
+        }
+
+        payload[num_send].guest_fd = matched_gfd;
+        payload[num_send].linux_pts_num = snapshot[i].linux_pts_num;
+        _Static_assert(
+            sizeof(payload[0].slave_path) == sizeof(snapshot[0].slave_path),
+            "keepalive slave_path size must match payload");
+        memcpy(payload[num_send].slave_path, snapshot[i].slave_path,
+               sizeof(payload[0].slave_path));
+        payload_slave_fds[num_send] = snapshot_slave_fds[i];
+        num_send++;
+    }
+    pthread_mutex_unlock(&fd_lock);
+
+    int rc = 0;
+    if (fork_ipc_write_all(ipc_sock, &num_send, sizeof(num_send)) < 0) {
+        rc = -1;
+    } else if (num_send > 0) {
+        if (fork_ipc_write_all(ipc_sock, payload,
+                               num_send * sizeof(payload[0])) < 0) {
+            rc = -1;
+        } else if (fork_ipc_send_fds(ipc_sock, payload_slave_fds,
+                                     (int) num_send) < 0) {
+            log_error("clone: failed to send pty keepalive fds");
+            rc = -1;
+        }
+    }
+    for (uint32_t i = 0; i < num_send; i++)
+        close(payload_slave_fds[i]);
+    return rc;
+}
+
+int fork_ipc_recv_pty_keepalives(int ipc_fd)
+{
+    uint32_t num;
+    if (fork_ipc_read_all(ipc_fd, &num, sizeof(num)) < 0) {
+        log_error("fork-child: failed to read pty keepalive count");
+        return -1;
+    }
+    if (num == 0)
+        return 0;
+    if (num > FD_TABLE_SIZE) {
+        log_error("fork-child: pty keepalive count %u exceeds FD_TABLE_SIZE",
+                  num);
+        return -1;
+    }
+
+    ipc_pty_keepalive_t *payload = calloc(num, sizeof(*payload));
+    if (!payload)
+        return -1;
+
+    if (fork_ipc_read_all(ipc_fd, payload, num * sizeof(*payload)) < 0) {
+        free(payload);
+        return -1;
+    }
+
+    int *slave_fds = calloc(num, sizeof(int));
+    if (!slave_fds) {
+        free(payload);
+        return -1;
+    }
+    int got = 0;
+    if (fork_ipc_recv_fds(ipc_fd, slave_fds, (int) num, &got) < 0 ||
+        got != (int) num) {
+        log_error("fork-child: pty keepalive recv mismatch: got %d expected %u",
+                  got, num);
+        for (int i = 0; i < got; i++)
+            close(slave_fds[i]);
+        free(slave_fds);
+        free(payload);
+        return -1;
+    }
+
+    for (uint32_t i = 0; i < num; i++) {
+        int gfd = payload[i].guest_fd;
+        int child_master = -1;
+        if (RANGE_CHECK(gfd, 0, FD_TABLE_SIZE)) {
+            pthread_mutex_lock(&fd_lock);
+            if (fd_table[gfd].type != FD_CLOSED)
+                child_master = fd_table[gfd].host_fd;
+            pthread_mutex_unlock(&fd_lock);
+        }
+        if (child_master < 0) {
+            /* Master fd did not survive the fd_table batch (synthetic-type
+             * filter, or the slot was rejected). Drop the keepalive cleanly.
+             */
+            close(slave_fds[i]);
+            continue;
+        }
+
+        /* Force-NUL the path before passing it on so a malformed sender cannot
+         * trick the child into reading past the buffer.
+         */
+        payload[i].slave_path[sizeof(payload[i].slave_path) - 1] = '\0';
+        proc_pty_restore_keepalive(child_master, slave_fds[i],
+                                   payload[i].linux_pts_num,
+                                   payload[i].slave_path);
+    }
+
+    free(slave_fds);
+    free(payload);
+    return 0;
+}
+
 static int fork_ipc_send_backing_fds(int ipc_sock,
                                      const guest_region_t *regions_snapshot,
                                      uint32_t num_guest_regions)
@@ -714,12 +865,14 @@ int fork_ipc_recv_process_state(int ipc_fd, guest_t *g, signal_state_t *sig)
         log_error("fork-child: failed to read region count");
         return -1;
     }
+
     uint8_t regions_tracker_stale = 0;
     if (fork_ipc_read_all(ipc_fd, &regions_tracker_stale,
                           sizeof(regions_tracker_stale)) < 0) {
         log_error("fork-child: failed to read region tracker state");
         return -1;
     }
+
     uint32_t recv_regions = num_guest_regions;
     if (recv_regions > GUEST_MAX_REGIONS)
         recv_regions = GUEST_MAX_REGIONS;
@@ -729,15 +882,17 @@ int fork_ipc_recv_process_state(int ipc_fd, guest_t *g, signal_state_t *sig)
         log_error("fork-child: failed to read regions");
         return -1;
     }
+
     /* Drain any excess records the parent serialized beyond the local cap.
      * Without this drain, the next read (num_preannounced) consumes stale
-     * region bytes and desynchronizes the rest of the IPC payload. Mirrors
-     * the preannounced-region drain below.
+     * region bytes and desynchronizes the rest of the IPC payload. Mirrors the
+     * preannounced-region drain below.
      */
     if (num_guest_regions > recv_regions &&
         fork_ipc_drain_bytes(ipc_fd, (num_guest_regions - recv_regions) *
                                          sizeof(guest_region_t)) < 0)
         return -1;
+
     g->nregions = (int) recv_regions;
     g->regions_tracker_stale =
         (regions_tracker_stale != 0) || (num_guest_regions > recv_regions);

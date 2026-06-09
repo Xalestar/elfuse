@@ -1478,6 +1478,26 @@ static int hvf_apply_file_overlay_quiesced(guest_t *g,
     return 0;
 }
 
+/* True when the backing fd allows writes through. The overlay path replaces
+ * the slab's RW host VA with MAP_SHARED|MAP_FIXED of this fd, and Apple HVF
+ * refuses hv_vm_map of any permission onto a host VA whose write capability
+ * does not cover the requested stage-2 perms. A read-only fd lands there
+ * with the kernel rejecting either PROT_WRITE on the host mmap or, after a
+ * PROT_READ downgrade, the post-overlay hv_vm_map with HV_DENIED.
+ * Centralises that decision: both the overlay entry (hvf_apply_file_overlay)
+ * and the sys_mmap fast-path skip share this gate so read-only backers are
+ * routed straight to the snapshot pread path. Returns true on the optimistic
+ * path when fcntl itself fails: the subsequent mmap / hv_vm_map will surface
+ * the real error rather than this helper synthesising one.
+ */
+static bool overlay_fd_writable(int fd)
+{
+    int fl = fcntl(fd, F_GETFL);
+    if (fl < 0)
+        return true;
+    return (fl & O_ACCMODE) != O_RDONLY;
+}
+
 /* Apply a real MAP_SHARED file overlay at [ipa, ipa+len) backed by [fd,
  * file_off). The IPA range may be sub-2 MiB; the containing 2 MiB
  * segment is split out first if it is not already isolated. Caller
@@ -1491,6 +1511,8 @@ static int hvf_apply_file_overlay(guest_t *g,
                                   int fd,
                                   off_t file_off)
 {
+    if (!overlay_fd_writable(fd))
+        return -LINUX_EACCES;
     thread_quiesce_siblings();
     int err = hvf_apply_file_overlay_quiesced(g, ipa, len, fd, file_off);
     thread_resume_siblings();
@@ -2267,7 +2289,14 @@ int64_t sys_mmap(guest_t *g,
          * gap-finder advances the hint to the next host-page boundary
          * after each allocation.
          */
+        /* overlay_fd_writable rejects read-only backing fds inside
+         * hvf_apply_file_overlay; mirror the check here so a read-only
+         * mmap takes the snapshot pread path directly, skipping the
+         * thread_quiesce / segment_split cycle the overlay would
+         * otherwise perform before returning EACCES.
+         */
         bool overlay_aligned = (flags & LINUX_MAP_SHARED) &&
+                               overlay_fd_writable(host_backing_fd) &&
                                (result_off % hps == 0) &&
                                ((uint64_t) offset % hps == 0);
         if (overlay_aligned) {
@@ -3977,9 +4006,25 @@ int mmap_fork_restore_overlays(guest_t *g,
         int err = hvf_apply_file_overlay(g, ovl_s, ovl_e - ovl_s, r->backing_fd,
                                          (off_t) file_off);
         if (err < 0) {
-            log_warn(
-                "fork-child: overlay re-install [0x%llx, 0x%llx) failed: %d",
-                (unsigned long long) ovl_s, (unsigned long long) ovl_e, err);
+            /* -LINUX_EACCES is the writable-fd gate in hvf_apply_file_overlay
+             * rejecting a read-only backing fd (foot's fontconfig caches,
+             * shared library file-backed regions, etc.). The fallback to
+             * snapshot semantics is correct for those: the child reads the
+             * pre-fork bytes and never writes back, which is what the parent
+             * already did. Log at debug level so the success path stays
+             * quiet. Any other failure is unexpected and stays at warn.
+             */
+            if (err == -LINUX_EACCES)
+                log_debug(
+                    "fork-child: read-only backing fd, skipping overlay "
+                    "[0x%llx, 0x%llx) (snapshot semantics)",
+                    (unsigned long long) ovl_s, (unsigned long long) ovl_e);
+            else
+                log_warn(
+                    "fork-child: overlay re-install [0x%llx, 0x%llx) failed: "
+                    "%d",
+                    (unsigned long long) ovl_s, (unsigned long long) ovl_e,
+                    err);
             rc = err;
             continue;
         }

@@ -165,6 +165,37 @@ int main(void)
             FAIL("open failed");
     }
 
+    TEST("fallocate punch hole keeps size past EOF");
+    {
+        const char *punch_path = "/tmp/elfuse-test-punch.bin";
+        unlink(punch_path);
+        int fd = open(punch_path, O_CREAT | O_RDWR, 0644);
+        if (fd >= 0) {
+            const char data[] = "abc";
+            const off_t data_size = (off_t) sizeof(data) - 1;
+            if (write(fd, data, sizeof(data) - 1) == (ssize_t) data_size &&
+                fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, 1,
+                          4096) == 0) {
+                struct stat st;
+                char buf[sizeof(data) - 1];
+                int stat_ok = fstat(fd, &st) == 0;
+                ssize_t nr = -1;
+                if (stat_ok)
+                    nr = pread(fd, buf, sizeof(buf), 0);
+                if (stat_ok && st.st_size == data_size &&
+                    nr == (ssize_t) sizeof(buf) && buf[0] == 'a' &&
+                    buf[1] == '\0' && buf[2] == '\0')
+                    PASS();
+                else
+                    FAIL("punch hole did not preserve size and zero bytes");
+            } else
+                FAIL("punch hole setup failed");
+            close(fd);
+            unlink(punch_path);
+        } else
+            FAIL("open failed");
+    }
+
     /* Test copy_file_range (via off_t-based API) */
     TEST("copy_file_range");
     {
