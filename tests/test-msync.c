@@ -20,6 +20,10 @@
 
 #include "test-harness.h"
 
+#ifndef MAP_FIXED_NOREPLACE
+#define MAP_FIXED_NOREPLACE 0x100000
+#endif
+
 int passes = 0, fails = 0;
 
 /* glibc 2.28 static: shm_open is broken (returns ENOSYS without trying).
@@ -190,10 +194,10 @@ static void test_shm_name_visible_after_fork(void)
 
     char name[64];
     snprintf(name, sizeof(name), "/elfuse-msync-fork-%ld", (long) getpid());
-    /* Best-effort cleanup of stale shm objects from a previous run that
-     * was killed between create and the final unlink. macOS shm objects
-     * persist across process death, so without this O_EXCL fails with
-     * EEXIST and the test reports a spurious shm_open failure.
+    /* Best-effort cleanup of stale shm objects from a previous run that was
+     * killed between create and the final unlink. macOS shm objects persist
+     * across process death, so without this O_EXCL fails with EEXIST and the
+     * test reports a spurious shm_open failure.
      */
     my_shm_unlink(name);
     int fd = my_shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0600);
@@ -257,11 +261,10 @@ static void test_shm_name_visible_after_fork(void)
     my_shm_unlink(name);
 }
 
-/* Real MAP_SHARED requires that host writes to the backing file are
- * observable through the mapping without the guest calling msync. The
- * pre-overlay implementation snapshotted file contents into private
- * guest pages and only reconciled on msync, so this is the regression
- * lock-in for the overlay path.
+/* Real MAP_SHARED requires that host writes to the backing file are observable
+ * through the mapping without the guest calling msync. The pre-overlay
+ * implementation snapshotted file contents into private guest pages and only
+ * reconciled on msync, so this is the regression lock-in for the overlay path.
  */
 static void test_shared_host_write_visible_without_msync(void)
 {
@@ -306,8 +309,8 @@ static void test_shared_host_write_visible_without_msync(void)
         return;
     }
 
-    /* Mutate the file via pwrite (host-side write). The mapping must
-     * reflect the new bytes immediately, with no msync from the guest.
+    /* Mutate the file via pwrite (host-side write). The mapping must reflect
+     * the new bytes immediately, with no msync from the guest.
      */
     char update[16];
     memset(update, 0x22, sizeof(update));
@@ -334,10 +337,9 @@ static void test_shared_host_write_visible_without_msync(void)
     close(fd);
 }
 
-/* Guest writes to a MAP_SHARED file mapping must reach the file
- * immediately so other readers (here, a sibling pread) see them without
- * the guest needing to call msync. This is the converse of the
- * host-write-visible test.
+/* Guest writes to a MAP_SHARED file mapping must reach the file immediately so
+ * other readers (here, a sibling pread) see them without the guest needing to
+ * call msync. This is the converse of the host-write-visible test.
  */
 static void test_shared_guest_write_lands_in_file(void)
 {
@@ -448,6 +450,98 @@ static void test_shared_adjacent_fixed_mapping_does_not_alias_file(void)
     close(fd);
 }
 
+static void test_shared_large_mapping_crosses_split_hvf_segments(void)
+{
+    TEST("large MAP_SHARED mmap crosses split HVF segments");
+
+    const size_t reserve_len = 8u * 1024u * 1024u;
+    const size_t large_len = 4u * 1024u * 1024u;
+    const size_t split_offset = 2u * 1024u * 1024u;
+    char small_name[64];
+    char large_name[64];
+    int small_fd = -1;
+    int large_fd = -1;
+    char *reserve;
+    char *small = MAP_FAILED;
+    char *large = MAP_FAILED;
+
+    reserve =
+        mmap(NULL, reserve_len, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (reserve == MAP_FAILED) {
+        FAIL("reserve mmap failed");
+        return;
+    }
+    if (munmap(reserve, reserve_len) != 0) {
+        FAIL("reserve munmap failed");
+        return;
+    }
+
+    snprintf(small_name, sizeof(small_name), "/elfuse-msync-split-%ld",
+             (long) getpid());
+    snprintf(large_name, sizeof(large_name), "/elfuse-msync-large-%ld",
+             (long) getpid());
+    my_shm_unlink(small_name);
+    my_shm_unlink(large_name);
+
+    small_fd = my_shm_open(small_name, O_CREAT | O_EXCL | O_RDWR, 0600);
+    large_fd = my_shm_open(large_name, O_CREAT | O_EXCL | O_RDWR, 0600);
+    my_shm_unlink(small_name);
+    my_shm_unlink(large_name);
+    if (small_fd < 0 || large_fd < 0) {
+        FAIL("shm_open failed");
+        goto out;
+    }
+    if (ftruncate(small_fd, 4096) != 0 ||
+        ftruncate(large_fd, (off_t) large_len) != 0) {
+        FAIL("ftruncate failed");
+        goto out;
+    }
+
+    small = mmap(reserve + split_offset, 4096, PROT_READ | PROT_WRITE,
+                 MAP_SHARED | MAP_FIXED_NOREPLACE, small_fd, 0);
+    if (small == MAP_FAILED) {
+        FAIL("splitter mmap failed");
+        goto out;
+    }
+    small[0] = 0x5a;
+    if (munmap(small, 4096) != 0) {
+        FAIL("splitter munmap failed");
+        small = MAP_FAILED;
+        goto out;
+    }
+    small = MAP_FAILED;
+
+    large = mmap(reserve, large_len, PROT_READ | PROT_WRITE,
+                 MAP_SHARED | MAP_FIXED_NOREPLACE, large_fd, 0);
+    if (large == MAP_FAILED) {
+        FAIL("large mmap failed");
+        goto out;
+    }
+
+    large[0] = 0x11;
+    large[split_offset] = 0x22;
+    unsigned char first = 0;
+    unsigned char across_split = 0;
+    if (pread(large_fd, &first, 1, 0) != 1 ||
+        pread(large_fd, &across_split, 1, (off_t) split_offset) != 1) {
+        FAIL("pread failed");
+    } else if (first == 0x11 && across_split == 0x22) {
+        PASS();
+    } else {
+        FAIL("large shared mapping did not stay file-backed");
+    }
+
+out:
+    if (large != MAP_FAILED)
+        munmap(large, large_len);
+    if (small != MAP_FAILED)
+        munmap(small, 4096);
+    if (small_fd >= 0)
+        close(small_fd);
+    if (large_fd >= 0)
+        close(large_fd);
+}
+
 int main(void)
 {
     printf("test-msync: MAP_SHARED msync tests\n\n");
@@ -458,6 +552,7 @@ int main(void)
     test_shared_host_write_visible_without_msync();
     test_shared_guest_write_lands_in_file();
     test_shared_adjacent_fixed_mapping_does_not_alias_file();
+    test_shared_large_mapping_crosses_split_hvf_segments();
     test_shm_name_visible_after_fork();
 
     SUMMARY("test-msync");
