@@ -4,8 +4,8 @@
  * Copyright 2025 Moritz Angermann, zw3rk pte. ltd.
  * SPDX-License-Identifier: Apache-2.0
  *
- * ppoll, pselect6, and epoll (emulated via macOS kqueue). All functions
- * are called from syscall_dispatch() in syscall/syscall.c.
+ * ppoll, pselect6, and epoll (emulated via macOS kqueue). All functions are
+ * called from syscall_dispatch() in syscall/syscall.c.
  */
 
 #include <stdbool.h>
@@ -182,10 +182,10 @@ int64_t sys_ppoll(guest_t *g,
         mask_installed = true;
     }
 
-    /* For indefinite polls, add the wakeup pipe so exit_group can
-     * interrupt threads blocked in host poll(). Without this, threads
-     * in poll(timeout=-1) cannot be interrupted by hv_vcpus_exit()
-     * because they're not in hv_vcpu_run().
+    /* For indefinite polls, add the wakeup pipe so exit_group can interrupt
+     * threads blocked in host poll(). Without this, threads in poll(timeout=-1)
+     * cannot be interrupted by hv_vcpus_exit() because they're not in
+     * hv_vcpu_run().
      */
     bool added_wakeup = false;
     if (timeout_ms < 0 && wakeup_pipe_rd >= 0 && nfds < 256) {
@@ -205,6 +205,7 @@ int64_t sys_ppoll(guest_t *g,
         poll_timeout_ms = 0;
 
     int ret;
+ppoll_retry:
     do {
         ret = poll(host_fds, nfds + added_wakeup,
                    poll_timeout_ms < 0 ? 200 : poll_timeout_ms);
@@ -222,9 +223,9 @@ int64_t sys_ppoll(guest_t *g,
          */
     } while (ret == 0 && poll_timeout_ms < 0);
 
-    /* POSIX poll() ignores entries with fd < 0 and resets revents to 0,
-     * so re-stamp POLLNVAL on the invalid slots and credit them to the
-     * return count.
+    /* POSIX poll() ignores entries with fd < 0 and resets revents to 0, so
+     * re-stamp POLLNVAL on the invalid slots and credit them to the return
+     * count.
      */
     if (ret >= 0 && invalid_count > 0) {
         for (uint32_t i = 0; i < nfds; i++)
@@ -244,6 +245,8 @@ int64_t sys_ppoll(guest_t *g,
             ;
         if (ret > 0)
             ret--;
+        if (ret == 0 && poll_timeout_ms < 0)
+            goto ppoll_retry;
     }
 
     /* Restore original signal mask */
@@ -284,8 +287,8 @@ int64_t sys_pselect6(guest_t *g,
                      uint64_t timeout_gva,
                      uint64_t sigmask_gva)
 {
-    /* pselect6 atomically sets the signal mask during the wait, then
-     * restores it. The sixth argument is a pointer to a struct:
+    /* pselect6 atomically sets the signal mask during the wait, then restores
+     * it. The sixth argument is a pointer to a struct:
      *   { const sigset_t *ss; size_t ss_len; }
      */
     if (nfds < 0 || nfds > FD_SETSIZE)
@@ -424,10 +427,9 @@ int64_t sys_pselect6(guest_t *g,
         ts.tv_nsec = lts.tv_nsec;
     }
 
-    /* Apply signal mask atomically around the select.
-     * Linux pselect6 arg6 points to { sigset_t *ss; size_t ss_len }.
-     * Save the current blocked mask, apply the new one, do the select, then
-     * restore the original mask.
+    /* Apply signal mask atomically around the select. Linux pselect6 arg6
+     * points to { sigset_t *ss; size_t ss_len }. Save the current blocked mask,
+     * apply the new one, do the select, then restore the original mask.
      */
     uint64_t saved_blocked = 0;
     bool mask_applied = false;
@@ -492,6 +494,10 @@ int64_t sys_pselect6(guest_t *g,
 
     int ret;
     bool poll_wakeup_fired = false;
+pselect_retry:
+    poll_wakeup_fired = false;
+    for (int i = 0; i < req_count; i++)
+        reqs[i].revents = 0;
     do {
         if (!has_timeout) {
             if (read_setp)
@@ -573,6 +579,8 @@ int64_t sys_pselect6(guest_t *g,
             FD_CLR(wakeup_pipe_rd, &read_set);
         if (ret > 0)
             ret--;
+        if (ret == 0 && !has_timeout)
+            goto pselect_retry;
     }
 
     /* Restore original signal mask */
@@ -657,9 +665,9 @@ pselect_cleanup:
 
 /* epoll emulation via kqueue
  *
- * Linux epoll is emulated using macOS kqueue. Each epoll_create1() creates
- * a kqueue fd. epoll_ctl translates to kevent() calls. epoll_pwait translates
- * to kevent() with timeout.
+ * Linux epoll is emulated using macOS kqueue. Each epoll_create1() creates a
+ * kqueue fd. epoll_ctl translates to kevent() calls. epoll_pwait translates to
+ * kevent() with timeout.
  *
  * Limitations:
  *   - EPOLLEXCLUSIVE not supported (rare, for load balancing)
@@ -707,9 +715,9 @@ typedef struct {
                           */
 } epoll_reg_t;
 
-/* Per-epoll-instance data, stored in fd_table[epfd].dir. Each instance
- * has its own registration table so multiple epoll instances watching
- * the same FD do not overwrite each other's user data.
+/* Per-epoll-instance data, stored in fd_table[epfd].dir. Each instance has its
+ * own registration table so multiple epoll instances watching the same FD do
+ * not overwrite each other's user data.
  */
 typedef struct {
     epoll_reg_t regs[FD_TABLE_SIZE];
@@ -797,7 +805,8 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd, uint64_t event_gva)
      * separate fd_to_host()) keeps the validate and the ident read atomic under
      * one fd_lock. The snapshot's generation then guards the cross-call ABA
      * below. Result mapping uses udata (the guest fd), so the ident only needs
-     * to stay open and refer to the same open file description. */
+     * to stay open and refer to the same open file description.
+     */
     fd_entry_t target_snap;
     if (!fd_snapshot(fd, &target_snap)) {
         host_fd_ref_close(&epoll_ref);
@@ -813,7 +822,8 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd, uint64_t event_gva)
      * number -- and thus reg->active -- still looks live. Acting on it would
      * EV_DELETE/EV_MOD the wrong knote on the reused host fd. A mismatched
      * generation means the registration is gone: drop it so DEL/MOD report
-     * ENOENT (matching Linux's auto-removal on close) and ADD starts fresh. */
+     * ENOENT (matching Linux's auto-removal on close) and ADD starts fresh.
+     */
     if ((reg->active || reg->oneshot_armed) &&
         reg->generation != target_snap.generation) {
         reg->active = false;
@@ -854,8 +864,8 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd, uint64_t event_gva)
     }
 
     /* Linux semantics: ADD fails with EEXIST if already registered; MOD fails
-     * with ENOENT if not registered. oneshot_armed registrations
-     * (EPOLLONESHOT fired, waiting for re-arm) are still valid for MOD.
+     * with ENOENT if not registered. oneshot_armed registrations (EPOLLONESHOT
+     * fired, waiting for re-arm) are still valid for MOD.
      */
     if (op == LINUX_EPOLL_CTL_ADD && reg->active) {
         host_fd_ref_close(&epoll_ref);
@@ -876,12 +886,12 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd, uint64_t event_gva)
     /* For MOD, remove old registrations first if they exist in kqueue.
      * EPOLLRDHUP alone registers EVFILT_READ (see ADD path), so check both
      * EPOLLIN and EPOLLRDHUP (same logic as CTL_DEL). Always attempt the
-     * deletes even when oneshot_armed: with multi-filter EPOLLONESHOT, only
-     * the filter that fired was removed by EV_ONESHOT; the other filter is
-     * still registered and must be cleaned. Issue each delete in its own
-     * kevent call so an ENOENT on one filter does not abort the other --
-     * with a single batched call and NULL eventlist, kevent stops at the
-     * first failed change and leaks the survivor.
+     * deletes even when oneshot_armed: with multi-filter EPOLLONESHOT, only the
+     * filter that fired was removed by EV_ONESHOT; the other filter is still
+     * registered and must be cleaned. Issue each delete in its own kevent call
+     * so an ENOENT on one filter does not abort the other -- with a single
+     * batched call and NULL eventlist, kevent stops at the first failed change
+     * and leaks the survivor.
      */
     if (op == LINUX_EPOLL_CTL_MOD && reg->active) {
         struct kevent del;
@@ -937,10 +947,10 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd, uint64_t event_gva)
         }
     }
 
-    /* Store registration data in per-instance table.
-     * Clear oneshot_armed when MOD successfully re-arms. Stamp the snapshot's
-     * generation so a later close+reopen of this guest fd is detected as a
-     * stale registration by the ABA guard above.
+    /* Store registration data in per-instance table. Clear oneshot_armed when
+     * MOD successfully re-arms. Stamp the snapshot's generation so a later
+     * close+reopen of this guest fd is detected as a stale registration by the
+     * ABA guard above.
      */
     reg->events = ev.events;
     reg->data = ev.data;
@@ -998,8 +1008,9 @@ int64_t sys_epoll_pwait(guest_t *g,
         ts.tv_nsec = (timeout_ms % 1000) * 1000000L;
     }
 
-    /* For indefinite waits, register the wakeup pipe with the kqueue
-     * so exit_group can interrupt threads blocked in kevent().
+epoll_retry:;
+    /* For indefinite waits, register the wakeup pipe with the kqueue so
+     * exit_group can interrupt threads blocked in kevent().
      */
     bool added_wakeup = false;
     if (!has_timeout && wakeup_pipe_rd >= 0) {
@@ -1056,6 +1067,8 @@ int64_t sys_epoll_pwait(guest_t *g,
                 i--;
             }
         }
+        if (nready == 0 && !has_timeout)
+            goto epoll_retry;
     }
 
     /* Restore original signal mask after the blocking wait */
@@ -1069,9 +1082,9 @@ int64_t sys_epoll_pwait(guest_t *g,
     }
 
     /* Merge kevent results into epoll_event results. Multiple kevents for the
-     * same fd (READ + WRITE) merge into one epoll_event.
-     * Use guest FD (not user data) as the merge key, since two different FDs
-     * could legitimately share the same epoll_data value.
+     * same fd (READ + WRITE) merge into one epoll_event. Use guest FD (not user
+     * data) as the merge key, since two different FDs could legitimately share
+     * the same epoll_data value.
      */
     linux_epoll_event_t out[256];
     /* Parallel array tracking which guest FD each output entry represents. */
@@ -1086,8 +1099,8 @@ int64_t sys_epoll_pwait(guest_t *g,
         if (!RANGE_CHECK(gfd, 0, FD_TABLE_SIZE) || !inst->regs[gfd].active)
             continue;
 
-        /* EPOLLONESHOT semantics: once any event fired and was reported, the
-         * fd stays disarmed until EPOLL_CTL_MOD re-arms it. With multi-filter
+        /* EPOLLONESHOT semantics: once any event fired and was reported, the fd
+         * stays disarmed until EPOLL_CTL_MOD re-arms it. With multi-filter
          * registrations (e.g. EPOLLIN | EPOLLOUT), EV_ONESHOT only removed the
          * filter that fired; surviving filters can still fire later and would
          * be reported here without this guard.
@@ -1112,9 +1125,9 @@ int64_t sys_epoll_pwait(guest_t *g,
         epoll_merge_event(&out[idx], &kevents[i], reg);
     }
 
-    /* Mark EPOLLONESHOT FDs as armed (fired but waiting for MOD re-arm).
-     * kqueue already removed the event (EV_ONESHOT), so poll emulation marks
-     * the registration as oneshot_armed to allow MOD but prevent further event
+    /* Mark EPOLLONESHOT FDs as armed (fired but waiting for MOD re-arm). kqueue
+     * already removed the event (EV_ONESHOT), so poll emulation marks the
+     * registration as oneshot_armed to allow MOD but prevent further event
      * reporting until re-armed.
      */
     for (int i = 0; i < nout; i++) {
