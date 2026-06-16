@@ -266,17 +266,21 @@ static void split_regions_at_boundary(guest_t *g, uint64_t boundary)
 static uint64_t find_free_gap_inner(const guest_t *g,
                                     uint64_t length,
                                     uint64_t min_addr,
-                                    uint64_t max_addr)
+                                    uint64_t max_addr,
+                                    uint64_t align)
 {
-    /* Round the search start up to the next host-page boundary so an unaligned
-     * addr hint cannot return a result that lands inside a host page already
-     * covered by a preceding region's overlay tail (the overlay extends to
+    /* Round the search start up to the requested alignment so an unaligned addr
+     * hint cannot return a result that lands inside a host page already covered
+     * by a preceding region's overlay tail (the overlay extends to
      * ALIGN_UP(r->end, hps)). Apple Silicon enforces 16 KiB host pages;
      * aligning to the guest 4 KiB page is not enough. Advance past each walked
-     * region to the same boundary for the same reason.
+     * region to the same boundary for the same reason. MAP_SHARED file-backed
+     * allocations may request 2 MiB alignment as a best-effort placement
+     * preference so consecutive mappings usually avoid sharing an HVF stage-2
+     * segment, which reduces segment-table fragmentation for memfd-style
+     * allocation patterns.
      */
-    size_t hps = host_page_size_cached();
-    uint64_t gap_start = ALIGN_UP(min_addr, hps);
+    uint64_t gap_start = ALIGN_UP(min_addr, align);
 
     /* Skip the prefix of regions entirely below gap_start in O(log n). After a
      * successful allocation the gap hint advances near or past the existing
@@ -307,8 +311,10 @@ static uint64_t find_free_gap_inner(const guest_t *g,
             g->regions[i].start >= gap_start + length)
             return gap_start;
 
-        /* Region overlaps; advance past it and round to the next host page */
-        gap_start = ALIGN_UP(g->regions[i].end, hps);
+        /* Region overlaps; advance past it and round to the next aligned
+         * boundary so the caller's alignment promise holds across allocations.
+         */
+        gap_start = ALIGN_UP(g->regions[i].end, align);
     }
 
     /* Check trailing space after all regions */
@@ -321,12 +327,16 @@ static uint64_t find_free_gap_inner(const guest_t *g,
  * The hint tracks the first address after the last successful mapping in each
  * region, which avoids rescanning the same prefix on sequential mmap activity.
  * A miss falls back to the region base so holes reopened by munmap are still
- * reusable.
+ * reusable. The align argument is the per-call start boundary the result must
+ * satisfy; some sys_mmap callers first pass BLOCK_2MIB as a best-effort
+ * placement preference for MAP_SHARED file-backed allocations, then retry with
+ * host-page alignment when no 2 MiB-aligned gap is available.
  */
 static uint64_t find_free_gap(guest_t *g,
                               uint64_t length,
                               uint64_t min_addr,
-                              uint64_t max_addr)
+                              uint64_t max_addr,
+                              uint64_t align)
 {
     /* RX and RW mappings advance independently, so keep separate hints. */
     uint64_t *hint =
@@ -334,15 +344,20 @@ static uint64_t find_free_gap(guest_t *g,
 
     /* Advance the hint to the next host-page boundary so the following
      * sequential allocation lands on an address that the kernel accepts for
-     * mmap MAP_FIXED (Apple Silicon enforces 16 KiB host pages). The tradeoff
-     * is up to host_page-1 bytes of address-space waste per small allocation;
-     * physical pages are still demand-paged, so RAM cost is unchanged.
+     * mmap MAP_FIXED (Apple Silicon enforces 16 KiB host pages). Round to the
+     * host page even when the current call requested a larger align (e.g.
+     * BLOCK_2MIB for MAP_SHARED file-backed): a subsequent MAP_PRIVATE 4 KiB
+     * allocation should still be able to occupy the trailing space inside the
+     * 2 MiB block. find_free_gap_inner re-applies the caller's align on its
+     * next entry, so a subsequent MAP_SHARED allocation skips past the small
+     * tenant and lands on the next 2 MiB boundary anyway.
      */
     size_t hps = host_page_size_cached();
 
     /* Try cached hint first (only if within the valid range) */
     if (*hint >= min_addr && *hint < max_addr) {
-        uint64_t result = find_free_gap_inner(g, length, *hint, max_addr);
+        uint64_t result =
+            find_free_gap_inner(g, length, *hint, max_addr, align);
         if (result != UINT64_MAX) {
             *hint = ALIGN_UP(result + length, hps);
             return result;
@@ -350,7 +365,7 @@ static uint64_t find_free_gap(guest_t *g,
     }
 
     /* Full scan from base */
-    uint64_t result = find_free_gap_inner(g, length, min_addr, max_addr);
+    uint64_t result = find_free_gap_inner(g, length, min_addr, max_addr, align);
     if (result != UINT64_MAX)
         *hint = ALIGN_UP(result + length, hps);
     return result;
@@ -2184,6 +2199,35 @@ int64_t sys_mmap(guest_t *g,
             if (high_hint >= 0)
                 return high_hint;
         }
+        /* Open the backing fd before the gap-finder so the alignment heuristic
+         * can read the host fd's access mode through overlay_fd_writable.
+         * Closes on every failure path within the non-fixed branch.
+         */
+        if (!is_anon) {
+            if (host_fd_ref_open(fd, &backing_ref) < 0)
+                return -LINUX_EBADF;
+            host_backing_fd = backing_ref.fd;
+        }
+        /* Prefer stage-2 2 MiB block boundaries for non-fixed MAP_SHARED
+         * file-backed allocations. Without this each shared file mmap whose
+         * result lands mid-block forces hvf_apply_file_overlay_quiesced to
+         * split the containing HVF segment at both ends; back-to-back memfd
+         * allocations burn segments at roughly two per mmap and run the table
+         * to GUEST_MAX_HVF_SEGMENTS quickly. This is a placement preference,
+         * not a Linux-visible constraint: if no 2 MiB-aligned gap exists, the
+         * allocation retries with host-page alignment. The condition mirrors
+         * the overlay fast-path's gate (host-page-aligned offset, writable
+         * backer) so read-only MAP_SHARED mappings that fall through to the
+         * pread snapshot do not pay the alignment cost without the
+         * segment-table benefit.
+         */
+        size_t hps = host_page_size_cached();
+        uint64_t align = (uint64_t) hps;
+        if (!is_anon && fd >= 0 && (flags & LINUX_MAP_SHARED) &&
+            ((uint64_t) offset % hps == 0) &&
+            overlay_fd_writable(host_backing_fd))
+            align = BLOCK_2MIB;
+        uint64_t fallback_align = (uint64_t) hps;
         if (needs_exec && !(prot & LINUX_PROT_WRITE)) {
             /* PROT_EXEC without PROT_WRITE: allocate from the RX mmap region.
              * Apple HVF enforces W^X on 2MiB block page table entries, so
@@ -2191,7 +2235,11 @@ int64_t sys_mmap(guest_t *g,
              * ones. The RX region at MMAP_RX_BASE is pre-mapped with execute
              * permission.
              */
-            result_off = find_free_gap(g, length, MMAP_RX_BASE, g->mmap_limit);
+            result_off =
+                find_free_gap(g, length, MMAP_RX_BASE, g->mmap_limit, align);
+            if (result_off == UINT64_MAX && align != fallback_align)
+                result_off = find_free_gap(g, length, MMAP_RX_BASE,
+                                           g->mmap_limit, fallback_align);
             if (result_off == UINT64_MAX) {
                 log_debug(
                     "mmap: RX address space exhausted "
@@ -2199,6 +2247,7 @@ int64_t sys_mmap(guest_t *g,
                     (unsigned long long) length,
                     (unsigned long long) g->mmap_limit, g->ipa_bits,
                     (unsigned long long) (g->guest_size >> 30));
+                host_fd_ref_close(&backing_ref);
                 return -LINUX_ENOMEM;
             }
             /* High-water mark for fork IPC state transfer */
@@ -2232,12 +2281,26 @@ int64_t sys_mmap(guest_t *g,
                      */
                     uint64_t hint_max =
                         (hint_off < MMAP_BASE) ? MMAP_BASE : g->mmap_limit;
-                    result_off =
-                        find_free_gap_inner(g, length, hint_off, hint_max);
+                    if (align != fallback_align) {
+                        uint64_t exact_hint_max = hint_off + length;
+                        result_off =
+                            find_free_gap_inner(g, length, hint_off,
+                                                exact_hint_max, fallback_align);
+                    }
+                    if (result_off == UINT64_MAX)
+                        result_off = find_free_gap_inner(g, length, hint_off,
+                                                         hint_max, align);
+                    if (result_off == UINT64_MAX && align != fallback_align)
+                        result_off = find_free_gap_inner(
+                            g, length, hint_off, hint_max, fallback_align);
                 }
             }
             if (result_off == UINT64_MAX)
-                result_off = find_free_gap(g, length, MMAP_BASE, g->mmap_limit);
+                result_off =
+                    find_free_gap(g, length, MMAP_BASE, g->mmap_limit, align);
+            if (result_off == UINT64_MAX && align != fallback_align)
+                result_off = find_free_gap(g, length, MMAP_BASE, g->mmap_limit,
+                                           fallback_align);
             if (result_off == UINT64_MAX) {
                 log_debug(
                     "mmap: RW address space exhausted "
@@ -2245,17 +2308,13 @@ int64_t sys_mmap(guest_t *g,
                     (unsigned long long) length,
                     (unsigned long long) g->mmap_limit, g->ipa_bits,
                     (unsigned long long) (g->guest_size >> 30));
+                host_fd_ref_close(&backing_ref);
                 return -LINUX_ENOMEM;
             }
             /* High-water mark for fork IPC state transfer */
             uint64_t rw_hwm = result_off + length;
             if (rw_hwm > g->mmap_next)
                 g->mmap_next = rw_hwm;
-        }
-        if (!is_anon) {
-            if (host_fd_ref_open(fd, &backing_ref) < 0)
-                return -LINUX_EBADF;
-            host_backing_fd = backing_ref.fd;
         }
         if (!region_has_capacity_after_removes(g, NULL, 0, 1)) {
             host_fd_ref_close(&backing_ref);
@@ -2931,10 +2990,17 @@ int64_t sys_mremap(guest_t *g,
         int needs_exec = (prot & LINUX_PROT_EXEC) != 0;
 
         uint64_t new_off;
+        /* mremap moves the data via read_file_range_to_guest and does not
+         * reinstall a file overlay at the destination, so 2 MiB alignment
+         * would not narrow segment-table growth. Stay at host-page alignment.
+         */
+        size_t mremap_align = host_page_size_cached();
         if (needs_exec && !(prot & LINUX_PROT_WRITE))
-            new_off = find_free_gap(g, new_size, MMAP_RX_BASE, g->mmap_limit);
+            new_off = find_free_gap(g, new_size, MMAP_RX_BASE, g->mmap_limit,
+                                    mremap_align);
         else
-            new_off = find_free_gap(g, new_size, MMAP_BASE, g->mmap_limit);
+            new_off = find_free_gap(g, new_size, MMAP_BASE, g->mmap_limit,
+                                    mremap_align);
 
         if (new_off == UINT64_MAX) {
             if (track_backing_fd >= 0)

@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -542,6 +543,84 @@ out:
         close(large_fd);
 }
 
+/* Consecutive non-fixed MAP_SHARED file-backed mmap allocations must succeed
+ * even when a previous shared mmap split an HVF stage-2 segment. The overlay
+ * path tolerates multi-segment ranges and the gap finder keeps shared
+ * file-backed allocations aligned to 2 MiB so subsequent mmaps do not re-split
+ * mid-segment. Cover both: each chunk must mmap, accept guest writes, and
+ * stay backed by its own memfd.
+ */
+static void test_shared_back_to_back_memfd_mappings(void)
+{
+    TEST("back-to-back non-fixed MAP_SHARED memfd mappings stay file-backed");
+#ifndef SYS_memfd_create
+#define SYS_memfd_create 279
+#endif
+#define CHUNKS 4
+    const size_t chunk_len = (size_t) 16 * 1024 * 1024;
+    int fds[CHUNKS];
+    void *maps[CHUNKS];
+    for (int i = 0; i < CHUNKS; i++) {
+        fds[i] = -1;
+        maps[i] = MAP_FAILED;
+    }
+
+    bool ok = true;
+    for (int i = 0; i < CHUNKS; i++) {
+        char name[32];
+        snprintf(name, sizeof(name), "elfuse-msync-bb-%d", i);
+        fds[i] = (int) syscall(SYS_memfd_create, name, 0u);
+        if (fds[i] < 0) {
+            FAIL("memfd_create failed");
+            ok = false;
+            goto out;
+        }
+        if (ftruncate(fds[i], (off_t) chunk_len) != 0) {
+            FAIL("ftruncate failed");
+            ok = false;
+            goto out;
+        }
+        maps[i] = mmap(NULL, chunk_len, PROT_READ | PROT_WRITE, MAP_SHARED,
+                       fds[i], 0);
+        if (maps[i] == MAP_FAILED) {
+            FAIL("consecutive shared mmap failed");
+            ok = false;
+            goto out;
+        }
+    }
+
+    for (int i = 0; i < CHUNKS; i++) {
+        unsigned char *p = (unsigned char *) maps[i];
+        p[0] = (unsigned char) (0xA0 + i);
+        p[chunk_len - 1] = (unsigned char) (0xB0 + i);
+    }
+    for (int i = 0; i < CHUNKS; i++) {
+        unsigned char first = 0, last = 0;
+        if (pread(fds[i], &first, 1, 0) != 1 ||
+            pread(fds[i], &last, 1, (off_t) (chunk_len - 1)) != 1) {
+            FAIL("pread failed");
+            ok = false;
+            goto out;
+        }
+        if (first != (unsigned char) (0xA0 + i) ||
+            last != (unsigned char) (0xB0 + i)) {
+            FAIL("shared write did not reach its own memfd");
+            ok = false;
+            goto out;
+        }
+    }
+    if (ok)
+        PASS();
+
+out:
+    for (int i = 0; i < CHUNKS; i++) {
+        if (maps[i] != MAP_FAILED)
+            munmap(maps[i], chunk_len);
+        if (fds[i] >= 0)
+            close(fds[i]);
+    }
+}
+
 int main(void)
 {
     printf("test-msync: MAP_SHARED msync tests\n\n");
@@ -553,6 +632,7 @@ int main(void)
     test_shared_guest_write_lands_in_file();
     test_shared_adjacent_fixed_mapping_does_not_alias_file();
     test_shared_large_mapping_crosses_split_hvf_segments();
+    test_shared_back_to_back_memfd_mappings();
     test_shm_name_visible_after_fork();
 
     SUMMARY("test-msync");
