@@ -6,8 +6,10 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/xattr.h>
 #include <unistd.h>
 
@@ -57,6 +59,23 @@ int main(int argc, char **argv)
 
     printf("test-sysroot-create-paths: create-path routing tests\n");
 
+    TEST("root create path stays inside sysroot");
+    {
+        const char *roots[] = {"/", "///"};
+        bool ok = true;
+        for (size_t i = 0; i < sizeof(roots) / sizeof(roots[0]); i++) {
+            errno = 0;
+            if (mkdir(roots[i], 0777) == 0 || errno != EEXIST) {
+                ok = false;
+                break;
+            }
+        }
+        if (ok)
+            PASS();
+        else
+            FAIL("mkdir root path returned wrong result");
+    }
+
     TEST("/tmp create is redirected into sysroot");
     {
         if (write_file(guest_tmp_path, "tmp-redir\n") < 0) {
@@ -71,6 +90,31 @@ int main(int argc, char **argv)
         } else if (strcmp(buf, "tmp-redir\n")) {
             FAIL("mounted sysroot tmp file contents mismatch");
         } else {
+            PASS();
+        }
+    }
+
+    TEST("trailing-slash mkdir resolves against the real parent");
+    {
+        /* Issue #100: a trailing slash made the parent-existence check split
+         * the target off itself, so the create wrongly fell back / returned
+         * EEXIST instead of creating the directory in the sysroot.
+         */
+        const char *parent = "/tmp/elfuse-trailing-slash";
+        const char *child = "/tmp/elfuse-trailing-slash/child/";
+        struct stat st;
+        rmdir("/tmp/elfuse-trailing-slash/child");
+        rmdir(parent);
+        if (mkdir(parent, 0777) < 0 && errno != EEXIST) {
+            FAIL("parent mkdir failed");
+        } else if (mkdir(child, 0777) < 0) {
+            FAIL("trailing-slash mkdir failed");
+        } else if (stat("/tmp/elfuse-trailing-slash/child", &st) < 0 ||
+                   !S_ISDIR(st.st_mode)) {
+            FAIL("trailing-slash target is not a directory");
+        } else {
+            rmdir("/tmp/elfuse-trailing-slash/child");
+            rmdir(parent);
             PASS();
         }
     }

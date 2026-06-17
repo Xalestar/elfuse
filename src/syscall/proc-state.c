@@ -592,8 +592,24 @@ const char *proc_resolve_sysroot_create_path(const char *path,
         return NULL;
     }
 
+    /* An all-slash guest path ("/", "///") names the root, which always exists
+     * and has no parent to check; trimming it would walk strrchr into the
+     * sysroot prefix and trip the containment guard.
+     *
+     * Return buf as-is.
+     */
+    if (path[strspn(path, "/")] == '\0')
+        return buf;
+
     char parent[LINUX_PATH_MAX];
     str_copy_trunc(parent, buf, sizeof(parent));
+    /* Trailing slashes name the same directory (POSIX); drop them so the final
+     * separator splits off the leaf component rather than matching the trailing
+     * slash itself, which would leave the target as its own parent.
+     */
+    size_t plen = strlen(parent);
+    while (plen > 1 && parent[plen - 1] == '/')
+        parent[--plen] = '\0';
     char *slash = strrchr(parent, '/');
     if (!slash || slash == parent)
         return buf;
