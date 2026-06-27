@@ -100,7 +100,9 @@ static void exec_republish_shim_globals_or_die(hv_vcpu_t vcpu,
  * before crossing the point of no return. Used by both the Rosetta and the
  * aarch64 success paths.
  */
-static void exec_cleanup_inputs(char *argv_buf,
+static void exec_cleanup_inputs(char **argv,
+                                char **envp,
+                                char *argv_buf,
                                 char *envp_buf,
                                 const char *path_host_buf,
                                 bool path_host_temp,
@@ -111,6 +113,8 @@ static void exec_cleanup_inputs(char *argv_buf,
         unlink(path_host_buf);
     if (interp_host_temp)
         unlink(interp_host_buf);
+    free(argv);
+    free(envp);
     free(argv_buf);
     free(envp_buf);
 }
@@ -174,53 +178,99 @@ static int exec_resolve_interp_host_path(const char *sysroot,
 
 /* Read a NULL-terminated pointer array from guest memory. Each pointer in the
  * array is a 64-bit GVA pointing to a string.
- * Returns the count of entries (excluding the NULL terminator), or -1 on error.
- * Strings are copied into the provided buffer.
+ * Returns the count of entries (excluding the NULL terminator), or a negative
+ * error code: -1: EFAULT (guest read error) -2: E2BIG (exceeded limits) -3:
+ * ENOMEM (host out of memory)
+ *
+ * *out_argv will be set to a heap-allocated array of pointers, which must be
+ * freed by caller. *out_buf will be set to a heap-allocated buffer containing
+ * all the strings, which must be freed by caller.
  */
 static int read_string_array(guest_t *g,
                              uint64_t array_gva,
-                             char **out,
-                             int max_count,
-                             char *str_buf,
-                             size_t str_buf_size)
+                             char ***out_argv,
+                             char **out_buf,
+                             size_t *out_buf_size,
+                             char *temp_str,
+                             size_t *running_bytes)
 {
-    size_t str_off = 0;
     int count = 0;
-
-    for (int i = 0; i < max_count; i++) {
+    while (true) {
         uint64_t ptr;
-        if (guest_read_small(g, array_gva + (uint64_t) i * 8, &ptr,
+        if (guest_read_small(g, array_gva + (uint64_t) count * 8, &ptr,
                              sizeof(ptr)) < 0)
             return -1;
         if (ptr == 0)
             break;
-
-        char *dst = str_buf + str_off;
-        size_t remaining = str_buf_size - str_off;
-        if (remaining < 2)
-            return -1;
-
-        if (guest_read_str(g, ptr, dst, remaining) < 0)
-            return -1;
-
-        out[count] = dst;
-        str_off += strlen(dst) + 1;
         count++;
+        if (count > 131072)
+            return -2;
     }
 
-    /* If all max_count slots are consumed, check whether the array continues
-     * (non-NULL next entry).
-     *
-     * Return -2 to signal E2BIG rather than silently truncating.
-     */
-    if (count == max_count) {
-        uint64_t next;
-        if (guest_read_small(g, array_gva + (uint64_t) count * 8, &next,
-                             sizeof(next)) == 0 &&
-            next != 0)
-            return -2; /* too many entries */
+    char **argv = malloc(sizeof(char *) * (count + 1));
+    if (!argv)
+        return -3;
+
+    size_t buf_size = 4096;
+    char *buf = malloc(buf_size);
+    if (!buf) {
+        free(argv);
+        return -3;
     }
 
+    size_t buf_off = 0;
+    for (int i = 0; i < count; i++) {
+        uint64_t ptr;
+        if (guest_read_small(g, array_gva + (uint64_t) i * 8, &ptr,
+                             sizeof(ptr)) < 0) {
+            free(argv);
+            free(buf);
+            return -1;
+        }
+
+        int rc = guest_read_str(g, ptr, temp_str, 131072);
+        if (rc < 0) {
+            size_t temp_len = strlen(temp_str);
+            free(argv);
+            free(buf);
+            return (temp_len >= 131072 - 1) ? -2 : -1;
+        }
+
+        size_t len = (size_t) rc;
+
+        if (*running_bytes + len + 1 > 2048 * 1024) {
+            free(argv);
+            free(buf);
+            return -2;
+        }
+
+        if (buf_off + len + 1 > buf_size) {
+            size_t new_size = (buf_off + len + 1 + 4095) & ~4095ULL;
+            char *new_buf = realloc(buf, new_size);
+            if (!new_buf) {
+                free(argv);
+                free(buf);
+                return -3;
+            }
+            if (new_buf != buf) {
+                ptrdiff_t diff = new_buf - buf;
+                for (int j = 0; j < i; j++)
+                    argv[j] += diff;
+                buf = new_buf;
+            }
+            buf_size = new_size;
+        }
+
+        memcpy(buf + buf_off, temp_str, len + 1);
+        argv[i] = buf + buf_off;
+        buf_off += len + 1;
+        *running_bytes += len + 1;
+    }
+
+    argv[count] = NULL;
+    *out_argv = argv;
+    *out_buf = buf;
+    *out_buf_size = buf_size;
     return count;
 }
 
@@ -255,38 +305,39 @@ int64_t sys_execve(hv_vcpu_t vcpu,
     char interp_host_buf[LINUX_PATH_MAX];
     bool interp_host_temp = false;
 
-#define MAX_ARGS 256
-#define MAX_ENVS 4096
-#define STR_BUF_SIZE ((size_t) 256 * 1024)
-
     int64_t err = 0;
-    char *argv[MAX_ARGS + 1];
-    char *envp[MAX_ENVS + 1];
-    char *argv_buf = malloc(STR_BUF_SIZE);
-    char *envp_buf = malloc(STR_BUF_SIZE);
-    if (!argv_buf || !envp_buf) {
+    char **argv = NULL;
+    char **envp = NULL;
+    char *argv_buf = NULL;
+    char *envp_buf = NULL;
+    size_t argv_buf_size = 0;
+    size_t envp_buf_size = 0;
+    size_t running_bytes = 0;
+
+    char *temp_str = malloc(131072);
+    if (!temp_str) {
         err = -LINUX_ENOMEM;
         goto fail;
     }
 
-    int argc =
-        read_string_array(g, argv_gva, argv, MAX_ARGS, argv_buf, STR_BUF_SIZE);
+    int argc = read_string_array(g, argv_gva, &argv, &argv_buf, &argv_buf_size,
+                                 temp_str, &running_bytes);
     if (argc < 0) {
-        err = (argc == -2) ? -LINUX_E2BIG : -LINUX_EFAULT;
+        err = (argc == -2) ? -LINUX_E2BIG
+                           : ((argc == -3) ? -LINUX_ENOMEM : -LINUX_EFAULT);
         goto fail;
     }
-    argv[argc] = NULL;
 
     int envc = 0;
     if (envp_gva != 0) {
-        envc = read_string_array(g, envp_gva, envp, MAX_ENVS, envp_buf,
-                                 STR_BUF_SIZE);
+        envc = read_string_array(g, envp_gva, &envp, &envp_buf, &envp_buf_size,
+                                 temp_str, &running_bytes);
         if (envc < 0) {
-            err = (envc == -2) ? -LINUX_E2BIG : -LINUX_EFAULT;
+            err = (envc == -2) ? -LINUX_E2BIG
+                               : ((envc == -3) ? -LINUX_ENOMEM : -LINUX_EFAULT);
             goto fail;
         }
     }
-    envp[envc] = NULL;
 
     /* Resolve /proc/self/exe to the actual binary path. Busybox sh execs
      * applets via execve("/proc/self/exe", ["applet", ...]) and macOS has no
@@ -364,15 +415,17 @@ int64_t sys_execve(hv_vcpu_t vcpu,
          * original-argv[1:]]
          */
         int prefix = (has_arg ? 2 : 1) + 1;
-        if (argc > MAX_ARGS - prefix + 1) {
+        if (argc + prefix - 1 > 131072) {
             err = -LINUX_E2BIG;
             goto fail;
         }
-        /* Use a fixed-size stack array (MAX_ARGS+3 covers interpreter +
-         * optional arg + script + original argv[1:]).
-         */
-        char *new_argv[MAX_ARGS + 3];
         int ni = 0;
+        int new_cap = argc + prefix;
+        char **new_argv = malloc(sizeof(char *) * (new_cap + 1));
+        if (!new_argv) {
+            err = -LINUX_ENOMEM;
+            goto fail;
+        }
         new_argv[ni++] = interp_start;
         if (has_arg)
             new_argv[ni++] = interp_arg;
@@ -393,17 +446,34 @@ int64_t sys_execve(hv_vcpu_t vcpu,
         int prefix_end = ni - (argc > 1 ? argc - 1 : 0);
         for (int i = 0; i < prefix_end; i++) {
             size_t len = strlen(new_argv[i]);
-            if (buf_off + len + 1 > STR_BUF_SIZE) {
+            if (running_bytes + len + 1 > 2048 * 1024) {
+                free(new_argv);
                 err = -LINUX_E2BIG;
                 goto fail;
             }
+            if (buf_off + len + 1 > argv_buf_size) {
+                size_t new_size = (buf_off + len + 1 + 4095) & ~4095ULL;
+                char *new_buf = realloc(argv_buf, new_size);
+                if (!new_buf) {
+                    free(new_argv);
+                    err = -LINUX_ENOMEM;
+                    goto fail;
+                }
+                if (new_buf != argv_buf) {
+                    ptrdiff_t diff = new_buf - argv_buf;
+                    for (int j = prefix_end; j < ni; j++)
+                        new_argv[j] += diff;
+                    argv_buf = new_buf;
+                }
+                argv_buf_size = new_size;
+            }
             memcpy(argv_buf + buf_off, new_argv[i], len + 1);
-            argv[i] = argv_buf + buf_off;
+            new_argv[i] = argv_buf + buf_off;
             buf_off += len + 1;
+            running_bytes += len + 1;
         }
-        for (int i = prefix_end; i < ni; i++)
-            argv[i] = new_argv[i];
-        argv[ni] = NULL;
+        free(argv);
+        argv = new_argv;
         argc = ni;
 
         /* Continue the same exec transaction using the interpreter image. */
@@ -536,8 +606,9 @@ int64_t sys_execve(hv_vcpu_t vcpu,
      */
     if (0) {
     fail:
-        exec_cleanup_inputs(argv_buf, envp_buf, path_host_buf, path_host_temp,
-                            interp_host_buf, interp_host_temp);
+        free(temp_str);
+        exec_cleanup_inputs(argv, envp, argv_buf, envp_buf, path_host_buf,
+                            path_host_temp, interp_host_buf, interp_host_temp);
         return err;
     }
 
@@ -754,8 +825,9 @@ int64_t sys_execve(hv_vcpu_t vcpu,
 
         log_debug("execve: rosetta target %s, entry=0x%llx sp=0x%llx", path,
                   (unsigned long long) entry_ipa, (unsigned long long) sp_ipa);
-        exec_cleanup_inputs(argv_buf, envp_buf, path_host_buf, path_host_temp,
-                            interp_host_buf, interp_host_temp);
+        free(temp_str);
+        exec_cleanup_inputs(argv, envp, argv_buf, envp_buf, path_host_buf,
+                            path_host_temp, interp_host_buf, interp_host_temp);
         return SYSCALL_EXEC_HAPPENED;
     }
 
@@ -1063,8 +1135,9 @@ int64_t sys_execve(hv_vcpu_t vcpu,
     log_debug("execve: loaded %s, entry=0x%llx sp=0x%llx", path_host,
               (unsigned long long) entry_ipa, (unsigned long long) sp_ipa);
 
-    exec_cleanup_inputs(argv_buf, envp_buf, path_host_buf, path_host_temp,
-                        interp_host_buf, interp_host_temp);
+    free(temp_str);
+    exec_cleanup_inputs(argv, envp, argv_buf, envp_buf, path_host_buf,
+                        path_host_temp, interp_host_buf, interp_host_temp);
 
     return SYSCALL_EXEC_HAPPENED;
 
@@ -1075,7 +1148,3 @@ too_many_regions:
         MAX_REGIONS);
     exit(128);
 }
-
-#undef MAX_ARGS
-#undef MAX_ENVS
-#undef STR_BUF_SIZE

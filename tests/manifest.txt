@@ -30,6 +30,7 @@ test-comprehensive
 
 [section] Process tests
 test-exec $TESTDIR/echo-test exec-works
+test-exec-limits
 test-fork
 test-session
 test-pidfd                         # diff=skip
