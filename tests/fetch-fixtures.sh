@@ -36,7 +36,10 @@ set -euo pipefail
 . "$(dirname "$0")/lib/bash-compat.sh"
 
 ALPINE_VERSION="${ALPINE_VERSION:-3.21}"
-ALPINE_PATCH="${ALPINE_PATCH:-3.21.0}"
+# Empty by default -- the exact point release is resolved from the live
+# releases listing at fetch time (see resolve_minirootfs), then written back
+# here so the x86_64 path reuses the same patch. Set explicitly to pin one.
+ALPINE_PATCH="${ALPINE_PATCH:-}"
 ALPINE_ARCH="${ALPINE_ARCH:-aarch64}"
 
 CDN_BASE="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_VERSION}"
@@ -53,60 +56,71 @@ KEYS_DIR="${FIXTURES}/keys"
 STATICBIN="${FIXTURES}/aarch64-musl/staticbin/bin"
 INITRAMFS="${FIXTURES}/initramfs.cpio.gz"
 
-# Pinned package versions (Alpine 3.21). When bumping ALPINE_VERSION,
-# refresh these by querying the repo's APKINDEX.
+# Required packages as "repo:name". Versions are NOT pinned here: Alpine's
+# mirror keeps only the latest build of each package, so any hard-coded
+# version 404s once a newer build supersedes it. resolve_versions() reads
+# each repo's live APKINDEX and fills PKG_RESOLVED with "repo:name:version"
+# tuples; the rest of the script and pkg_version go through that.
 #
-# Encoded as "repo:name:version" tuples so bash 3.2 hosts (stock macOS
-# /bin/bash) do not need associative arrays. Lookup goes through
-# pkg_version below.
+# Tuples (not associative arrays) keep this working on bash 3.2 hosts (stock
+# macOS /bin/bash) -- see tests/lib/bash-compat.sh.
 PKGS=(
-    "main:linux-virt:6.12.91-r0"
-    "main:busybox-static:1.37.0-r14"
-    "main:dropbear:2024.86-r0"
-    "main:zlib:1.3.2-r0"
-    "main:utmps-libs:0.1.2.3-r2"
-    "main:skalibs-libs:2.14.3.0-r0"
-    "main:musl:1.2.5-r11"
-    "main:musl-dev:1.2.5-r11"
-    "main:musl-utils:1.2.5-r11"
-    "main:libgcc:14.2.0-r4"
-    "main:libcrypto3:3.3.7-r0"
-    "main:acl-libs:2.3.2-r1"
-    "main:libattr:2.5.2-r2"
-    "main:pcre2:10.43-r0"
-    "main:coreutils:9.5-r2"
-    "main:coreutils-env:9.5-r2"
-    "main:coreutils-fmt:9.5-r2"
-    "main:coreutils-sha512sum:9.5-r2"
-    "main:bash:5.2.37-r0"
-    "main:dash:0.5.12-r2"
-    "main:findutils:4.10.0-r0"
-    "main:diffutils:3.10-r0"
-    "main:grep:3.11-r0"
-    "main:sed:4.9-r2"
-    "main:gawk:5.3.1-r0"
-    "main:gmp:6.3.0-r2"
-    "main:readline:8.2.13-r0"
-    "main:libncursesw:6.5_p20241006-r3"
-    "main:ncurses-terminfo-base:6.5_p20241006-r3"
-    "main:lua5.4:5.4.7-r0"
-    "main:lua5.4-libs:5.4.7-r0"
-    "main:luajit:2.1_p20240815-r0"
-    "main:jq:1.7.1-r0"
-    "main:oniguruma:6.9.9-r0"
-    "main:sqlite:3.48.0-r4"
-    "main:sqlite-libs:3.48.0-r4"
-    "main:tree:2.2.1-r0"
+    "main:linux-virt"
+    "main:busybox-static"
+    "main:dropbear"
+    "main:zlib"
+    "main:utmps-libs"
+    "main:skalibs-libs"
+    "main:musl"
+    "main:musl-dev"
+    "main:musl-utils"
+    "main:libgcc"
+    "main:libcrypto3"
+    "main:acl-libs"
+    "main:libattr"
+    "main:pcre2"
+    "main:coreutils"
+    "main:coreutils-env"
+    "main:coreutils-fmt"
+    "main:coreutils-sha512sum"
+    "main:bash"
+    "main:dash"
+    "main:findutils"
+    "main:diffutils"
+    "main:grep"
+    "main:sed"
+    "main:gawk"
+    "main:gmp"
+    "main:readline"
+    "main:libncursesw"
+    "main:ncurses-terminfo-base"
+    "main:lua5.4"
+    "main:lua5.4-libs"
+    "main:luajit"
+    "main:jq"
+    "main:oniguruma"
+    "main:sqlite"
+    "main:sqlite-libs"
+    "main:tree"
 )
 
-# Look up a package version by its "repo:name" prefix. Returns the
+# "repo:name:version" tuples, populated by resolve_versions() from live
+# APKINDEX data. Same shape the staging loops and pkg_version expect.
+PKG_RESOLVED=()
+
+# Set to 1 by main() when the resolved version set differs from versions.lock,
+# forcing a rebuild of the staged tree even without FORCE. Global so the
+# x86_64 path can honor it too.
+REBUILD=0
+
+# Look up a resolved package version by its "repo:name" prefix. Returns the
 # version on stdout and rc=0 on hit, rc=1 (silently) on miss so the
 # old ${PKGS[key]:-} fallback callers keep working.
 pkg_version()
 {
     local target="$1:"
     local entry
-    for entry in "${PKGS[@]}"; do
+    for entry in ${PKG_RESOLVED[@]+"${PKG_RESOLVED[@]}"}; do
         case "$entry" in
             "$target"*)
                 printf '%s\n' "${entry#"$target"}"
@@ -132,7 +146,8 @@ STATIC_APPLETS=(
     cmp diff find sed grep awk
 )
 
-MINIROOTFS_TGZ="alpine-minirootfs-${ALPINE_PATCH}-${ALPINE_ARCH}.tar.gz"
+# Resolved by resolve_minirootfs() before staging.
+MINIROOTFS_TGZ=""
 
 c_blue()
 {
@@ -186,6 +201,113 @@ apk_path()
     echo "${CACHE}/${name}-${version}.apk"
 }
 
+repo_url()
+{
+    case "$1" in
+        main) echo "$MAIN_REPO" ;;
+        community) echo "$COMMUNITY_REPO" ;;
+        *)
+            echo "unknown repo: $1" >&2
+            return 1
+            ;;
+    esac
+}
+
+# Resolve the current version of every package in PKGS by parsing each
+# referenced repo's APKINDEX, populating PKG_RESOLVED with "repo:name:version"
+# tuples. Alpine prunes superseded builds from the mirror, so reading the live
+# index is the only reliable way to keep the fixture build from 404-ing on a
+# stale pin. Flattened "name version" indexes are cached so warm re-runs work
+# offline.
+resolve_versions()
+{
+    # Unique set of repos referenced by PKGS (no associative arrays: track a
+    # space-padded string for membership tests).
+    local entry repo repos=""
+    for entry in "${PKGS[@]}"; do
+        repo="${entry%%:*}"
+        case " $repos " in
+            *" $repo "*) ;;
+            *) repos="$repos $repo" ;;
+        esac
+    done
+
+    local base idxtgz idxfile
+    for repo in $repos; do
+        base="$(repo_url "$repo")"
+        idxtgz="${CACHE}/APKINDEX-${repo}.tar.gz"
+        idxfile="${CACHE}/APKINDEX-${repo}.versions"
+        log "resolve versions ($repo)"
+        # Always try to refresh the index -- tracking the live mirror is the
+        # point -- but fall back to a cached copy so warm re-runs work offline.
+        # APKINDEX records are blank-line separated; P: is the package name,
+        # V: its version. Flatten to "name version" lines.
+        if curl -fsSL --retry 3 -o "${idxtgz}.partial" "${base}/APKINDEX.tar.gz"; then
+            mv "${idxtgz}.partial" "$idxtgz"
+            tar xzOf "$idxtgz" APKINDEX 2> /dev/null | awk '
+                /^P:/ { name = substr($0, 3) }
+                /^V:/ { ver  = substr($0, 3) }
+                /^$/  { if (name != "") print name, ver; name = ""; ver = "" }
+                END   { if (name != "") print name, ver }
+            ' > "${idxfile}.partial"
+            mv "${idxfile}.partial" "$idxfile"
+        else
+            rm -f "${idxtgz}.partial"
+            [ -s "$idxfile" ] || {
+                echo "error: cannot fetch APKINDEX for $repo (mirror unreachable, no cache)" >&2
+                exit 1
+            }
+            log "offline: reusing cached APKINDEX ($repo)"
+        fi
+    done
+
+    # Resolve each package against its repo's flattened index.
+    local name version missing=0
+    PKG_RESOLVED=()
+    for entry in "${PKGS[@]}"; do
+        repo="${entry%%:*}"
+        name="${entry#*:}"
+        idxfile="${CACHE}/APKINDEX-${repo}.versions"
+        version="$(awk -v n="$name" '$1 == n { print $2; exit }' "$idxfile")"
+        if [ -z "$version" ]; then
+            echo "error: package ${repo}:${name} not present in APKINDEX" >&2
+            missing=1
+            continue
+        fi
+        PKG_RESOLVED+=("${repo}:${name}:${version}")
+    done
+    [ "$missing" = 0 ] || exit 1
+}
+
+# Resolve the minirootfs point release. Alpine keeps only a handful of recent
+# releases under releases/, so honor an explicit ALPINE_PATCH but otherwise
+# pick the newest the mirror advertises and write it back to ALPINE_PATCH so
+# the x86_64 path reuses the same patch. Sets MINIROOTFS_TGZ.
+resolve_minirootfs()
+{
+    if [ -z "$ALPINE_PATCH" ]; then
+        log "resolve minirootfs"
+        local listing=""
+        listing="$(curl -fsSL --retry 3 "${RELEASES}/" 2> /dev/null || true)"
+        ALPINE_PATCH="$(printf '%s\n' "$listing" \
+            | grep -oE "alpine-minirootfs-[0-9.]+-${ALPINE_ARCH}\.tar\.gz" \
+            | sed -E "s/^alpine-minirootfs-([0-9.]+)-${ALPINE_ARCH}\.tar\.gz/\1/" \
+            | sort -uV | tail -1 || true)"
+        if [ -z "$ALPINE_PATCH" ]; then
+            # Offline fallback: newest minirootfs already in the cache.
+            ALPINE_PATCH="$(ls "${CACHE}"/alpine-minirootfs-*-"${ALPINE_ARCH}".tar.gz \
+                2> /dev/null \
+                | sed -E "s#.*/alpine-minirootfs-([0-9.]+)-${ALPINE_ARCH}\.tar\.gz#\1#" \
+                | sort -V | tail -1 || true)"
+        fi
+        if [ -z "$ALPINE_PATCH" ]; then
+            echo "error: no minirootfs tarball found (mirror unreachable, cache empty)" >&2
+            exit 1
+        fi
+    fi
+    MINIROOTFS_TGZ="alpine-minirootfs-${ALPINE_PATCH}-${ALPINE_ARCH}.tar.gz"
+}
+
 # Strip Alpine apk metadata (.PKGINFO, .SIGN.*, .pre-install, etc.) when
 # extracting into a target tree.  These are not real files and pollute the
 # rootfs.
@@ -209,9 +331,26 @@ main()
 {
     mkdir -p "$CACHE" "$KERNEL_DIR" "$KEYS_DIR" "$STATICBIN" "$ROOTFS"
 
+    # Resolve all package versions and the minirootfs name from the live mirror
+    # before downloading anything.
+    resolve_versions
+    resolve_minirootfs
+
+    # If the resolved version set changed since the last run, the staged
+    # rootfs/kernel/initramfs are built from stale apks and must be rebuilt
+    # even without an explicit FORCE.
+    local entry manifest lockfile
+    manifest="$( { for entry in "${PKG_RESOLVED[@]}"; do
+        printf '%s\n' "$entry"
+    done | LC_ALL=C sort; printf 'minirootfs=%s\n' "$MINIROOTFS_TGZ"; } )"
+    lockfile="${FIXTURES}/versions.lock"
+    if [ ! -f "$lockfile" ] || [ "$manifest" != "$(cat "$lockfile")" ]; then
+        REBUILD=1
+    fi
+
     # Download all required apk packages.
     local entry repo name version
-    for entry in "${PKGS[@]}"; do
+    for entry in "${PKG_RESOLVED[@]}"; do
         repo="${entry%%:*}"
         name="${entry#*:}"
         name="${name%:*}"
@@ -222,7 +361,7 @@ main()
     fetch "${RELEASES}/${MINIROOTFS_TGZ}" "${CACHE}/${MINIROOTFS_TGZ}"
 
     # Stage the rootfs.
-    if [ "${FORCE:-0}" = "1" ] || [ ! -e "${ROOTFS}/.staged" ]; then
+    if [ "${FORCE:-0}" = "1" ] || [ "$REBUILD" = 1 ] || [ ! -e "${ROOTFS}/.staged" ]; then
         log "stage rootfs"
         rm -rf "$ROOTFS"
         mkdir -p "$ROOTFS"
@@ -231,7 +370,7 @@ main()
         # Overlay every cached apk except linux-virt (kernel goes elsewhere).
         # The kernel apk's lib/modules/ tree IS overlayed (needed for modprobe).
         local entry name version
-        for entry in "${PKGS[@]}"; do
+        for entry in "${PKG_RESOLVED[@]}"; do
             name="${entry#*:}"
             name="${name%:*}"
             version="${entry##*:}"
@@ -326,7 +465,7 @@ EOF
     ok "ssh keypair installed"
 
     # Extract the kernel from linux-virt.
-    if [ ! -s "${KERNEL_DIR}/vmlinuz-virt" ] || [ "${FORCE:-0}" = "1" ]; then
+    if [ ! -s "${KERNEL_DIR}/vmlinuz-virt" ] || [ "${FORCE:-0}" = "1" ] || [ "$REBUILD" = 1 ]; then
         log "extract kernel"
         local linux_virt_ver
         linux_virt_ver="$(pkg_version "main:linux-virt")"
@@ -340,7 +479,7 @@ EOF
     ok "kernel: ${KERNEL_DIR}/vmlinuz-virt"
 
     # Build the initramfs archive.
-    if [ ! -s "$INITRAMFS" ] || [ "$ROOTFS/.staged" -nt "$INITRAMFS" ]; then
+    if [ ! -s "$INITRAMFS" ] || [ "$REBUILD" = 1 ] || [ "$ROOTFS/.staged" -nt "$INITRAMFS" ]; then
         log "build initramfs"
         (cd "$ROOTFS" && find . -print0 | LC_ALL=C sort -z \
             | cpio --quiet --null -o -H newc 2> /dev/null | gzip -9) > "$INITRAMFS"
@@ -353,7 +492,7 @@ EOF
     # AND by qemu's guest kernel after a 9p mount, where any absolute host
     # path would no longer resolve.
     local dynbin="${FIXTURES}/aarch64-musl/dyn-bin"
-    if [ ! -d "$dynbin" ] || [ "${FORCE:-0}" = "1" ]; then
+    if [ ! -d "$dynbin" ] || [ "${FORCE:-0}" = "1" ] || [ "$REBUILD" = 1 ]; then
         log "stage dyn-bin aggregate"
         rm -rf "$dynbin"
         mkdir -p "$dynbin"
@@ -373,7 +512,7 @@ EOF
     ok "dyn-bin: $(find "$dynbin" -maxdepth 1 -type l 2> /dev/null | wc -l | tr -d ' ') entries"
 
     # Stage the static-bin tree.
-    if [ ! -s "${STATICBIN}/busybox" ] || [ "${FORCE:-0}" = "1" ]; then
+    if [ ! -s "${STATICBIN}/busybox" ] || [ "${FORCE:-0}" = "1" ] || [ "$REBUILD" = 1 ]; then
         log "stage static-bin tree"
         local busybox_ver
         busybox_ver="$(pkg_version "main:busybox-static")"
@@ -394,6 +533,10 @@ EOF
     if [ "${INCLUDE_X86_64:-0}" = "1" ]; then
         fetch_x86_64_userspace
     fi
+
+    # Record the resolved version set so the next run can detect a mirror bump
+    # and rebuild the staged tree instead of silently reusing stale apks.
+    printf '%s\n' "$manifest" > "$lockfile"
 
     printf '\n%s\n' "$(c_yellow 'Fixtures ready.')"
     printf 'rootfs/sysroot:  %s\n' "$ROOTFS"
@@ -426,7 +569,7 @@ fetch_x86_64_userspace()
 
     log "x86_64: fetch packages"
     local entry repo name version x86_url x86_dest
-    for entry in "${PKGS[@]}"; do
+    for entry in "${PKG_RESOLVED[@]}"; do
         repo="${entry%%:*}"
         name="${entry#*:}"
         name="${name%:*}"
@@ -438,13 +581,13 @@ fetch_x86_64_userspace()
     done
     fetch "${x86_releases}/${x86_minirootfs}" "${x86_cache}/${x86_minirootfs}"
 
-    if [ "${FORCE:-0}" = "1" ] || [ ! -e "${x86_rootfs}/.staged" ]; then
+    if [ "${FORCE:-0}" = "1" ] || [ "$REBUILD" = 1 ] || [ ! -e "${x86_rootfs}/.staged" ]; then
         log "x86_64: stage rootfs"
         rm -rf "$x86_rootfs"
         mkdir -p "$x86_rootfs"
         tar xzf "${x86_cache}/${x86_minirootfs}" -C "$x86_rootfs" 2> /dev/null
         local stage_entry stage_repo stage_name stage_version
-        for stage_entry in "${PKGS[@]}"; do
+        for stage_entry in "${PKG_RESOLVED[@]}"; do
             stage_repo="${stage_entry%%:*}"
             stage_name="${stage_entry#*:}"
             stage_name="${stage_name%:*}"
@@ -457,7 +600,7 @@ fetch_x86_64_userspace()
     fi
     ok "x86_64 rootfs ($(du -sh "$x86_rootfs" 2> /dev/null | cut -f1))"
 
-    if [ ! -s "${x86_staticbin}/busybox" ] || [ "${FORCE:-0}" = "1" ]; then
+    if [ ! -s "${x86_staticbin}/busybox" ] || [ "${FORCE:-0}" = "1" ] || [ "$REBUILD" = 1 ]; then
         log "x86_64: stage static-bin tree"
         local busybox_ver
         busybox_ver="$(pkg_version "main:busybox-static")"
@@ -477,7 +620,7 @@ fetch_x86_64_userspace()
     ok "x86_64 static-bin: ${x86_staticbin}/busybox + ${#STATIC_APPLETS[@]} applets"
 
     if [ ! -d "$x86_dynbin" ] || [ -z "$(ls -A "$x86_dynbin" 2> /dev/null)" ] \
-        || [ "${FORCE:-0}" = "1" ]; then
+        || [ "${FORCE:-0}" = "1" ] || [ "$REBUILD" = 1 ]; then
         log "x86_64: stage dyn-bin aggregate"
         rm -rf "$x86_dynbin"
         mkdir -p "$x86_dynbin"
