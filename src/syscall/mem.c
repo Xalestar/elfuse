@@ -81,6 +81,7 @@ typedef struct {
     bool overlay_active;
     uint64_t overlay_start;
     uint64_t overlay_end;
+    bool backing_ro;
     char name[sizeof(((guest_region_t *) 0)->name)];
 } region_snapshot_t;
 
@@ -202,6 +203,21 @@ static void mark_overlay_metadata_range(guest_t *g,
         r->overlay_start = overlay_start;
         r->overlay_end = overlay_end;
         region_clip_overlay(r);
+    }
+}
+
+/* Mark the region spanning exactly [start, end) as backed by a fd that lost
+ * write access, so sys_mprotect rejects a later PROT_WRITE upgrade. Exact
+ * match (not overlap) because callers use this right after installing a
+ * single freshly-added region.
+ */
+static void mark_region_backing_ro(guest_t *g, uint64_t start, uint64_t end)
+{
+    for (int i = 0; i < g->nregions; i++) {
+        if (g->regions[i].start == start && g->regions[i].end == end) {
+            g->regions[i].backing_ro = true;
+            break;
+        }
     }
 }
 
@@ -1099,6 +1115,7 @@ static int capture_region_snapshots(guest_t *g,
         snap->overlay_active = r->overlay_active;
         snap->overlay_start = r->overlay_start;
         snap->overlay_end = r->overlay_end;
+        snap->backing_ro = r->backing_ro;
         str_copy_trunc(snap->name, r->name, sizeof(snap->name));
     }
 
@@ -1211,6 +1228,8 @@ static int restore_region_snapshots(guest_t *g, region_snapshot_t *snaps, int n)
             return -LINUX_ENOMEM;
         }
         snap->backing_fd = -1;
+        if (snap->backing_ro)
+            mark_region_backing_ro(g, snap->start, snap->end);
     }
 
     for (int i = 0; i < n; i++) {
@@ -2426,6 +2445,26 @@ int64_t sys_mmap(guest_t *g,
          * never reachable by the guest because the gap-finder advances the hint
          * to the next host-page boundary after each allocation.
          */
+        /* MAP_SHARED | PROT_WRITE against a backing fd opened without write
+         * access must fail EACCES, matching Linux. The alignment-mismatch and
+         * read-only-fd cases below both fall through to the pread snapshot
+         * path, which always succeeds -- without this check a writable shared
+         * mapping request on a read-only fd would be silently downgraded to a
+         * private snapshot instead of being rejected.
+         */
+        if ((flags & LINUX_MAP_SHARED) && (prot & LINUX_PROT_WRITE) &&
+            !overlay_fd_writable(host_backing_fd)) {
+            int rollback_err = rollback_fresh_mmap_allocation(
+                g, result_off, length, false, 0, 0, saved_mmap_next,
+                saved_mmap_end, saved_mmap_rx_next, saved_mmap_rx_end,
+                saved_rw_gap_hint, saved_rx_gap_hint);
+            if (track_backing_fd >= 0)
+                close(track_backing_fd);
+            host_fd_ref_close(&backing_ref);
+            if (rollback_err < 0)
+                return rollback_err;
+            return -LINUX_EACCES;
+        }
         /* overlay_fd_writable rejects read-only backing fds inside
          * hvf_apply_file_overlay; mirror the check here so a read-only mmap
          * takes the snapshot pread path directly, skipping the thread_quiesce /
@@ -2553,6 +2592,15 @@ int64_t sys_mmap(guest_t *g,
             }
         }
     }
+
+    /* A MAP_SHARED mapping whose backing fd cannot be written to has Linux
+     * max_prot capped to PROT_READ, whether or not the pread snapshot path
+     * above actually installed a live overlay. sys_mprotect consults this to
+     * reject a later PROT_WRITE upgrade with EACCES.
+     */
+    if (!is_anon && fd >= 0 && !is_prot_none && (flags & LINUX_MAP_SHARED) &&
+        !overlay_fd_writable(host_backing_fd))
+        mark_region_backing_ro(g, result_off, result_off + length);
 
     host_fd_ref_close(&backing_ref);
     dispose_region_snapshots(&replaced_snaps, &replaced_nsnaps);
@@ -2697,6 +2745,7 @@ int64_t sys_mremap(guest_t *g,
         if (old_reg && old_reg->backing_fd >= 0 && track_backing_fd < 0)
             return -LINUX_ENOMEM;
         bool source_overlay = old_reg && region_has_live_overlay(old_reg);
+        bool source_backing_ro = old_reg && old_reg->backing_ro;
         uint64_t source_file_off =
             old_reg ? old_reg->offset + (old_off - old_reg->start) : 0;
         char track_name[sizeof(old_reg->name)] = {0};
@@ -2867,6 +2916,8 @@ int64_t sys_mremap(guest_t *g,
             dispose_region_snapshots(&dest_snaps, &dest_nsnaps);
             return -LINUX_ENOMEM;
         }
+        if (source_backing_ro)
+            mark_region_backing_ro(g, new_off, new_off + new_size);
         dispose_region_snapshots(&source_snaps, &source_nsnaps);
         dispose_region_snapshots(&dest_snaps, &dest_nsnaps);
         return (int64_t) guest_ipa(g, new_off);
@@ -2919,6 +2970,7 @@ int64_t sys_mremap(guest_t *g,
                     old_overlay ? old_reg->overlay_start : 0;
                 uint64_t old_overlay_end =
                     old_overlay ? old_reg->overlay_end : 0;
+                bool old_backing_ro = old_reg && old_reg->backing_ro;
                 if (old_reg && old_reg->backing_fd >= 0 && track_backing_fd < 0)
                     return -LINUX_ENOMEM;
                 char track_name[sizeof(old_reg->name)] = {0};
@@ -2945,6 +2997,8 @@ int64_t sys_mremap(guest_t *g,
                     mark_overlay_metadata_range(g, old_off, old_off + old_size,
                                                 old_overlay_start,
                                                 old_overlay_end);
+                if (old_backing_ro)
+                    mark_region_backing_ro(g, old_off, old_off + new_size);
 
                 /* Update high-water marks */
                 uint64_t hwm = old_off + new_size;
@@ -2978,6 +3032,7 @@ int64_t sys_mremap(guest_t *g,
         uint64_t source_overlay_start =
             source_overlay ? old_reg->overlay_start : 0;
         uint64_t source_overlay_end = source_overlay ? old_reg->overlay_end : 0;
+        bool source_backing_ro = old_reg && old_reg->backing_ro;
         uint64_t source_file_off =
             old_reg ? old_reg->offset + (old_off - old_reg->start) : 0;
         uint64_t source_overlay_file_off =
@@ -3092,6 +3147,8 @@ int64_t sys_mremap(guest_t *g,
                 g, new_off, new_off + new_size, prot, track_flags, track_offset,
                 track_name[0] ? track_name : NULL, track_backing_fd) < 0)
             return -LINUX_ENOMEM;
+        if (source_backing_ro)
+            mark_region_backing_ro(g, new_off, new_off + new_size);
 
         /* Update high-water marks */
         uint64_t hwm = new_off + new_size;
@@ -3457,6 +3514,14 @@ int64_t sys_mprotect(guest_t *g, uint64_t addr, uint64_t length, int prot)
                 (prot & LINUX_PROT_EXEC))
                 return -LINUX_EINVAL;
 
+            /* A MAP_SHARED region whose backing fd cannot be written to has
+             * Linux max_prot capped to PROT_READ; reject an upgrade the same
+             * way a real kernel's VMA max_prot check would.
+             */
+            if ((prot & LINUX_PROT_WRITE) &&
+                guest_region_range_has_ro_shared_backing(g, addr, mprot_end))
+                return -LINUX_EACCES;
+
             /* Fast path: if the tracker already records this prot for every
              * overlapping region and none are MAP_NORESERVE, page tables are
              * already in sync and no PTE work is required. The tracker update
@@ -3497,6 +3562,12 @@ int64_t sys_mprotect(guest_t *g, uint64_t addr, uint64_t length, int prot)
              */
             if (guest_range_hits_infra(g, mprot_off, mprot_end))
                 return -LINUX_EINVAL;
+
+            /* Same max_prot check as the high-VA branch above. */
+            if ((prot & LINUX_PROT_WRITE) &&
+                guest_region_range_has_ro_shared_backing(g, mprot_off,
+                                                         mprot_end))
+                return -LINUX_EACCES;
 
             /* Same fast path / ordering / staleness gate as above. */
             if (mprotect_same_prot_fast_path_safe(prot) &&

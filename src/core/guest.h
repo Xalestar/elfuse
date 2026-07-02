@@ -235,6 +235,12 @@ typedef struct {
     int backing_fd;    /* Duplicated host fd for file-backed mappings, or -1 */
     bool shared;       /* MAP_SHARED (writes should propagate) */
     bool noreserve;    /* MAP_NORESERVE: PTEs deferred until fault */
+    bool backing_ro;   /* MAP_SHARED region whose backing_fd was opened
+                        * without write access, so its Linux max_prot is
+                        * capped to PROT_READ. sys_mprotect must reject any
+                        * later PROT_WRITE request against it with EACCES,
+                        * matching a real kernel's VMA max_prot tracking.
+                        */
     bool overlay_active; /* Region has a live host MAP_FIXED|MAP_SHARED overlay
                           * of backing_fd at host_base+start. The kernel's page
                           * cache keeps it coherent with the file and with peer
@@ -1230,6 +1236,15 @@ bool guest_region_range_prot_uniform(const guest_t *g,
 bool guest_region_range_has_noreserve(const guest_t *g,
                                       uint64_t start,
                                       uint64_t end);
+
+/* True if any tracked region overlapping [start, end) is MAP_SHARED with a
+ * backing_fd that lost write access (backing_ro), i.e. its Linux max_prot is
+ * capped to PROT_READ. sys_mprotect uses this to reject PROT_WRITE upgrades
+ * with EACCES.
+ */
+bool guest_region_range_has_ro_shared_backing(const guest_t *g,
+                                              uint64_t start,
+                                              uint64_t end);
 
 /* Try to materialize a lazy (MAP_NORESERVE) page at the given offset. Called
  * from the data/instruction abort handler when the faulting address falls

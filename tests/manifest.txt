@@ -130,6 +130,9 @@ test-shim-cred-race
 [section] msync MAP_SHARED tests
 test-msync
 
+[section] Read-only MAP_SHARED file overlay tests
+test-mmap-shared-ro
+
 [section] Cross-fork MAP_SHARED coherence tests
 test-cross-fork-mapshared          # diff=skip
 
