@@ -382,6 +382,75 @@ int main(void)
     close(sv[0]);
     close(sv[1]);
 
+    /* Test 12: SOCK_SEQPACKET UNIX socketpair */
+    printf("test-socket: 12. socketpair(AF_UNIX, SOCK_SEQPACKET)... ");
+    int seq_sv[2];
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, seq_sv) < 0) {
+        printf("FAIL (socketpair: %m)\n");
+        failures++;
+    } else {
+        const char *seq_msg1 = "msg1";
+        const char *seq_msg2 = "longer_msg2";
+        if (write(seq_sv[0], seq_msg1, strlen(seq_msg1)) !=
+                (ssize_t) strlen(seq_msg1) ||
+            write(seq_sv[0], seq_msg2, strlen(seq_msg2)) !=
+                (ssize_t) strlen(seq_msg2)) {
+            printf("FAIL (write)\n");
+            failures++;
+        } else {
+            char seq_buf1[64] = {0};
+            char seq_buf2[64] = {0};
+            ssize_t seq_n1 = read(seq_sv[1], seq_buf1, sizeof(seq_buf1) - 1);
+            ssize_t seq_n2 = read(seq_sv[1], seq_buf2, sizeof(seq_buf2) - 1);
+            if (seq_n1 == (ssize_t) strlen(seq_msg1) &&
+                !memcmp(seq_buf1, seq_msg1, strlen(seq_msg1)) &&
+                seq_n2 == (ssize_t) strlen(seq_msg2) &&
+                !memcmp(seq_buf2, seq_msg2, strlen(seq_msg2))) {
+                int seq_type = 0;
+                socklen_t seq_optlen = sizeof(seq_type);
+                if (getsockopt(seq_sv[0], SOL_SOCKET, SO_TYPE, &seq_type,
+                               &seq_optlen) < 0) {
+                    printf("FAIL (getsockopt SO_TYPE: %m)\n");
+                    failures++;
+                } else if (seq_type == SOCK_SEQPACKET) {
+                    printf("PASS\n");
+                } else {
+                    printf("FAIL (type=%d, expected %d)\n", seq_type,
+                           SOCK_SEQPACKET);
+                    failures++;
+                }
+            } else {
+                printf("FAIL (read: n1=%zd got '%s', n2=%zd got '%s')\n",
+                       seq_n1, seq_buf1, seq_n2, seq_buf2);
+                failures++;
+            }
+        }
+        close(seq_sv[0]);
+        close(seq_sv[1]);
+    }
+
+    /* Test 13: socket(AF_UNIX, SOCK_SEQPACKET, 0) */
+    printf("test-socket: 13. socket(AF_UNIX, SOCK_SEQPACKET)... ");
+    int seq_fd = socket(AF_UNIX, SOCK_SEQPACKET, 0);
+    if (seq_fd < 0) {
+        printf("FAIL (socket: %m)\n");
+        failures++;
+    } else {
+        int seq_type = 0;
+        socklen_t seq_optlen = sizeof(seq_type);
+        if (getsockopt(seq_fd, SOL_SOCKET, SO_TYPE, &seq_type, &seq_optlen) <
+            0) {
+            printf("FAIL (getsockopt: %m)\n");
+            failures++;
+        } else if (seq_type == SOCK_SEQPACKET) {
+            printf("PASS\n");
+        } else {
+            printf("FAIL (type=%d, expected %d)\n", seq_type, SOCK_SEQPACKET);
+            failures++;
+        }
+        close(seq_fd);
+    }
+
     if (failures == 0) {
         printf("test-socket: all tests passed -- PASS\n");
         return 0;

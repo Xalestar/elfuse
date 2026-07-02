@@ -92,6 +92,11 @@ int64_t sys_socket(guest_t *g, int domain, int type, int protocol)
     int nonblock = extract_sock_nonblock(type);
     int cloexec = extract_sock_cloexec(type);
 
+    int original_type = real_type;
+    if (mac_domain == AF_UNIX && real_type == LINUX_SOCK_SEQPACKET) {
+        real_type = SOCK_STREAM;
+    }
+
     /* Rosetta opens AF_UNIX SOCK_SEQPACKET to talk to rosettad. macOS does not
      * support SOCK_SEQPACKET on AF_UNIX, so while the translator process is
      * active we create an unconnected SOCK_STREAM placeholder instead.
@@ -100,7 +105,7 @@ int64_t sys_socket(guest_t *g, int domain, int type, int protocol)
      * so unrelated Unix IPC is not silently downgraded to STREAM.
      */
     if (rosetta_socket_shim_enabled(g) && mac_domain == AF_UNIX &&
-        real_type == LINUX_SOCK_SEQPACKET) {
+        original_type == LINUX_SOCK_SEQPACKET) {
         int fd = socket(AF_UNIX, SOCK_STREAM, 0);
         if (fd < 0)
             return linux_errno();
@@ -119,7 +124,7 @@ int64_t sys_socket(guest_t *g, int domain, int type, int protocol)
         }
         if (cloexec)
             fd_table[gfd].linux_flags |= LINUX_O_CLOEXEC;
-        net_socket_cache_init_defaults(gfd, domain, real_type);
+        net_socket_cache_init_defaults(gfd, domain, original_type);
         return gfd;
     }
 
@@ -148,7 +153,7 @@ int64_t sys_socket(guest_t *g, int domain, int type, int protocol)
     if (cloexec)
         linux_flags |= LINUX_O_CLOEXEC;
     fd_table[gfd].linux_flags = linux_flags;
-    net_socket_cache_init_defaults(gfd, domain, real_type);
+    net_socket_cache_init_defaults(gfd, domain, original_type);
 
     return gfd;
 }
@@ -163,6 +168,11 @@ int64_t sys_socketpair(guest_t *g,
     int real_type = extract_sock_type(type);
     int nonblock = extract_sock_nonblock(type);
     int cloexec = extract_sock_cloexec(type);
+
+    int original_type = real_type;
+    if (mac_domain == AF_UNIX && real_type == LINUX_SOCK_SEQPACKET) {
+        real_type = SOCK_DGRAM;
+    }
 
     int fds[2];
     if (socketpair(mac_domain, real_type, protocol, fds) < 0)
@@ -197,8 +207,8 @@ int64_t sys_socketpair(guest_t *g,
     int linux_flags = cloexec ? LINUX_O_CLOEXEC : 0;
     fd_table[gfd0].linux_flags = linux_flags;
     fd_table[gfd1].linux_flags = linux_flags;
-    net_socket_cache_init_defaults(gfd0, domain, real_type);
-    net_socket_cache_init_defaults(gfd1, domain, real_type);
+    net_socket_cache_init_defaults(gfd0, domain, original_type);
+    net_socket_cache_init_defaults(gfd1, domain, original_type);
 
     int32_t guest_fds[2] = {gfd0, gfd1};
     if (guest_write_small(g, sv_gva, guest_fds, sizeof(guest_fds)) < 0) {
