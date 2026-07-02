@@ -610,6 +610,18 @@ int sidecar_translate_lookup_at(guest_fd_t dirfd,
     if (sidecar_open_base(dirfd, path, out, outsz, &cur_fd, &absolute) < 0)
         return -1;
 
+    /* Sidecar only speaks for entries that live inside the sysroot tree (or
+     * are reachable through an index mapping). The sysroot resolver
+     * (proc_resolve_sysroot_path_flags) falls back to the literal host path
+     * when the guest path does not exist under the sysroot; a walk that
+     * unconditionally re-anchored such paths at the sysroot would veto that
+     * fallback and break host-resource access (mktemp dirs, /etc/resolv.conf).
+     * Track whether any component actually consulted an index mapping: with a
+     * mapped prefix the sysroot view is authoritative and missing suffixes
+     * must surface as ENOENT against the translated path; without one, a walk
+     * that leaves the tree simply is not sidecar's business (return 0).
+     */
+    bool used_mapping = false;
     size_t out_len = strlen(out);
     const char *comp;
     size_t comp_len;
@@ -638,7 +650,12 @@ int sidecar_translate_lookup_at(guest_fd_t dirfd,
                 int next_fd = openat(cur_fd, guest_comp,
                                      O_RDONLY | O_DIRECTORY | O_CLOEXEC);
                 if (next_fd < 0) {
+                    int saved_errno = errno;
                     close(cur_fd);
+                    if (!used_mapping &&
+                        (saved_errno == ENOENT || saved_errno == ENOTDIR))
+                        return 0;
+                    errno = saved_errno;
                     return -1;
                 }
                 close(cur_fd);
@@ -654,10 +671,12 @@ int sidecar_translate_lookup_at(guest_fd_t dirfd,
         }
         const char *mapped = sidecar_lookup_guest(&index, guest_comp);
         char host_comp[NAME_MAX + 1];
-        if (mapped)
+        if (mapped) {
+            used_mapping = true;
             str_copy_trunc(host_comp, mapped, sizeof(host_comp));
-        else
+        } else {
             str_copy_trunc(host_comp, guest_comp, sizeof(host_comp));
+        }
 
         if (sidecar_append_component(out, outsz, &out_len, host_comp,
                                      absolute) < 0) {
@@ -670,14 +689,54 @@ int sidecar_translate_lookup_at(guest_fd_t dirfd,
         const char *peek = scan;
         while (*peek == '/')
             peek++;
-        if (*peek == '\0')
+        if (*peek == '\0') {
+            /* Final component: an unmapped walk is the identity translation
+             * ${sysroot}${path}; claim it only if the entry actually exists
+             * there so the resolver's host-literal fallback stands otherwise.
+             */
+            if (!used_mapping) {
+                struct stat st;
+                if (fstatat(cur_fd, host_comp, &st, AT_SYMLINK_NOFOLLOW) < 0) {
+                    int saved_errno = errno;
+                    close(cur_fd);
+                    if (saved_errno == ENOENT || saved_errno == ENOTDIR)
+                        return 0;
+                    errno = saved_errno;
+                    return -1;
+                }
+            }
             break;
+        }
 
         int next_fd =
             openat(cur_fd, host_comp, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
         if (next_fd < 0) {
+            int saved_errno = errno;
             close(cur_fd);
-            return -1;
+            if (saved_errno != ENOENT && saved_errno != ENOTDIR) {
+                errno = saved_errno;
+                return -1;
+            }
+            if (!used_mapping)
+                return 0;
+            /* The walk left the sysroot beneath an index-mapped prefix. No
+             * index can exist under a missing directory, so the remaining
+             * components translate to themselves; the caller's syscall then
+             * reports ENOENT against the translated path.
+             */
+            while (sidecar_next_component(&scan, &comp, &comp_len)) {
+                char rest_comp[NAME_MAX + 1];
+                if (comp_len >= sizeof(rest_comp)) {
+                    errno = ENAMETOOLONG;
+                    return -1;
+                }
+                memcpy(rest_comp, comp, comp_len);
+                rest_comp[comp_len] = '\0';
+                if (sidecar_append_component(out, outsz, &out_len, rest_comp,
+                                             absolute) < 0)
+                    return -1;
+            }
+            return 1;
         }
         close(cur_fd);
         cur_fd = next_fd;
@@ -1155,6 +1214,12 @@ static int sidecar_generate_token(char token[SIDECAR_TOKEN_NAME_LEN + 1])
     return 0;
 }
 
+/* Open the parent directory sidecar would maintain an index in for `path`.
+ * Returns 0 with parent->dirfd open on success, -1 on error, and 1 when the
+ * parent resolves outside the sysroot: such paths follow the resolver's
+ * host-literal fallback (proc_resolve_sysroot_path_flags) and carry no index,
+ * so the mutation entry points hand them back as SIDECAR_NOT_HANDLED.
+ */
 static int sidecar_walk_parent_at(guest_fd_t dirfd,
                                   const char *path,
                                   sidecar_parent_t *parent)
@@ -1239,17 +1304,11 @@ static int sidecar_walk_parent_at(guest_fd_t dirfd,
             host_fd_ref_close(&ref);
         }
     } else if (path[0] == '/') {
-        char sysroot[LINUX_PATH_MAX];
-        if (!proc_sysroot_snapshot(sysroot, sizeof(sysroot))) {
-            errno = ENOENT;
-            return -1;
-        }
-        if (snprintf(host_parent, sizeof(host_parent), "%s/%s", sysroot,
-                     work) >= (int) sizeof(host_parent)) {
-            errno = ENAMETOOLONG;
-            return -1;
-        }
-        parent->dirfd = open(host_parent, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        /* The parent does not resolve inside the sysroot (or lives on a
+         * procemu-backed prefix): the operation belongs to the regular
+         * translation flow, not the sidecar index.
+         */
+        return 1;
     } else if (dirfd == LINUX_AT_FDCWD) {
         parent->dirfd = open(work, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     } else {
@@ -1303,8 +1362,11 @@ int sidecar_openat(guest_fd_t dirfd,
         return (int) SIDECAR_NOT_HANDLED;
 
     sidecar_parent_t parent;
-    if (sidecar_walk_parent_at(dirfd, path, &parent) < 0)
+    int walk_rc = sidecar_walk_parent_at(dirfd, path, &parent);
+    if (walk_rc < 0)
         return -1;
+    if (walk_rc > 0)
+        return (int) SIDECAR_NOT_HANDLED;
     if (sidecar_name_reserved(parent.basename)) {
         sidecar_parent_close(&parent);
         errno = ENOENT;
@@ -1399,8 +1461,11 @@ int64_t sidecar_mkdirat(guest_fd_t dirfd, const char *path, mode_t mode)
         return SIDECAR_NOT_HANDLED;
 
     sidecar_parent_t parent;
-    if (sidecar_walk_parent_at(dirfd, path, &parent) < 0)
+    int walk_rc = sidecar_walk_parent_at(dirfd, path, &parent);
+    if (walk_rc < 0)
         return linux_errno();
+    if (walk_rc > 0)
+        return SIDECAR_NOT_HANDLED;
 
     int lock_fd = -1;
     if (sidecar_lock_index(parent.dirfd, &lock_fd) < 0) {
@@ -1476,8 +1541,11 @@ int64_t sidecar_unlinkat(guest_fd_t dirfd, const char *path, int flags)
         return SIDECAR_NOT_HANDLED;
 
     sidecar_parent_t parent;
-    if (sidecar_walk_parent_at(dirfd, path, &parent) < 0)
+    int walk_rc = sidecar_walk_parent_at(dirfd, path, &parent);
+    if (walk_rc < 0)
         return linux_errno();
+    if (walk_rc > 0)
+        return SIDECAR_NOT_HANDLED;
 
     int lock_fd = -1;
     if (sidecar_lock_index(parent.dirfd, &lock_fd) < 0) {
@@ -1564,13 +1632,17 @@ int64_t sidecar_unlinkat(guest_fd_t dirfd, const char *path, int flags)
     return rc;
 }
 
+/* Same contract as sidecar_walk_parent_at: 0 resolved, -1 error, 1 when the
+ * path lives outside the sysroot and the caller should not handle it.
+ */
 static int sidecar_resolve_existing_at(guest_fd_t dirfd,
                                        const char *path,
                                        sidecar_parent_t *parent,
                                        char host_name[NAME_MAX + 1])
 {
-    if (sidecar_walk_parent_at(dirfd, path, parent) < 0)
-        return -1;
+    int walk_rc = sidecar_walk_parent_at(dirfd, path, parent);
+    if (walk_rc != 0)
+        return walk_rc;
 
     sidecar_index_t index;
     if (sidecar_load_index(parent->dirfd, &index) < 0) {
@@ -1611,15 +1683,18 @@ int64_t sidecar_linkat(guest_fd_t olddirfd,
 
     sidecar_parent_t old_parent;
     char old_host[NAME_MAX + 1];
-    if (sidecar_resolve_existing_at(olddirfd, oldpath, &old_parent, old_host) <
-        0) {
+    int old_rc =
+        sidecar_resolve_existing_at(olddirfd, oldpath, &old_parent, old_host);
+    if (old_rc < 0)
         return linux_errno();
-    }
+    if (old_rc > 0)
+        return SIDECAR_NOT_HANDLED;
 
     sidecar_parent_t new_parent;
-    if (sidecar_walk_parent_at(newdirfd, newpath, &new_parent) < 0) {
+    int new_rc = sidecar_walk_parent_at(newdirfd, newpath, &new_parent);
+    if (new_rc != 0) {
         sidecar_parent_close(&old_parent);
-        return linux_errno();
+        return new_rc < 0 ? linux_errno() : SIDECAR_NOT_HANDLED;
     }
 
     int lock_fd = -1;
@@ -1810,13 +1885,17 @@ int64_t sidecar_renameat(guest_fd_t olddirfd,
     }
 
     sidecar_parent_t old_parent;
-    if (sidecar_walk_parent_at(olddirfd, oldpath, &old_parent) < 0)
+    int old_walk_rc = sidecar_walk_parent_at(olddirfd, oldpath, &old_parent);
+    if (old_walk_rc < 0)
         return linux_errno();
+    if (old_walk_rc > 0)
+        return SIDECAR_NOT_HANDLED;
 
     sidecar_parent_t new_parent;
-    if (sidecar_walk_parent_at(newdirfd, newpath, &new_parent) < 0) {
+    int new_walk_rc = sidecar_walk_parent_at(newdirfd, newpath, &new_parent);
+    if (new_walk_rc != 0) {
         sidecar_parent_close(&old_parent);
-        return linux_errno();
+        return new_walk_rc < 0 ? linux_errno() : SIDECAR_NOT_HANDLED;
     }
 
     if (!strcmp(old_parent.basename, new_parent.basename)) {

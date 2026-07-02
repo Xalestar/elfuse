@@ -10,6 +10,7 @@
         test-matrix test-matrix-elfuse-aarch64 test-matrix-qemu-aarch64 \
         test-full test-multi-vcpu test-rwx test-sysroot-rename \
         test-case-collision test-case-collision-fallback test-getdents64-overlong \
+        test-sysroot-host-fallback \
         test-sysroot-create-paths test-fork-ipc-protocol-host test-identity-override-host \
         test-proctitle-host test-proctitle-low-stack \
         test-sysroot-procfs-exec test-timeout-disable test-fuse-alpine \
@@ -57,6 +58,8 @@ check: $(ELFUSE_BIN) $(TEST_DEPS) check-syscall-coverage \
 	@$(MAKE) --no-print-directory test-sysroot-procfs-exec
 	@printf "\n$(BLUE)━━━ getdents64 overlong-UTF-8 dirent skip ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-getdents64-overlong
+	@printf "\n$(BLUE)━━━ sysroot host-fallback validation ━━━$(RESET)\n"
+	@$(MAKE) --no-print-directory test-sysroot-host-fallback
 	@printf "\n$(BLUE)━━━ Alpine sysroot FUSE validation ━━━$(RESET)\n"
 	@$(MAKE) --no-print-directory test-fuse-alpine
 	@printf "\n$(BLUE)━━━ timeout=0 validation ━━━$(RESET)\n"
@@ -125,6 +128,29 @@ test-case-collision-fallback: $(ELFUSE_BIN) $(BUILD_DIR)/test-case-collision
 	@tmpdir=$$(mktemp -d); \
 	trap 'rm -rf "$$tmpdir"' EXIT; \
 	$(ELFUSE_BIN) --sysroot "$$tmpdir" $(BUILD_DIR)/test-case-collision
+
+## Host paths outside the sysroot must stay reachable when the sysroot is
+## case-insensitive (sidecar active): the sidecar walk defers to the
+## resolver's host-literal fallback instead of vetoing it with ENOENT.
+## Regression test for the test-matrix "musl dyn" coreutils failures.
+test-sysroot-host-fallback: $(ELFUSE_BIN) $(BUILD_DIR)/test-sysroot-host-fallback
+	@set -e; \
+	tmpdir=$$(mktemp -d); \
+	trap 'rm -rf "$$tmpdir"' EXIT; \
+	sysroot="$$tmpdir/sysroot"; \
+	hostdir="$$tmpdir/host-data"; \
+	mkdir -p "$$sysroot" "$$hostdir"; \
+	first=$${tmpdir#/}; first=$${first%%/*}; \
+	mkdir -p "$$sysroot/$$first"; \
+	printf 'host-visible\n' > "$$hostdir/hello.txt"; \
+	mirror="$$tmpdir/mirrored"; \
+	mkdir -p "$$mirror" "$$sysroot$$mirror"; \
+	printf 'host-final\n' > "$$mirror/final.txt"; \
+	printf 'host-loses\n' > "$$mirror/both.txt"; \
+	printf 'sysroot-wins\n' > "$$sysroot$$mirror/both.txt"; \
+	$(ELFUSE_BIN) --sysroot "$$sysroot" \
+	    $(BUILD_DIR)/test-sysroot-host-fallback \
+	    "$$hostdir" "$$mirror/final.txt" "$$mirror/both.txt"
 
 # Build APFS-side dirents whose UTF-8 byte length exceeds Linux
 # NAME_MAX (255). 89 copies of U+3042 (3-byte UTF-8) plus a 1-byte
