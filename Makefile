@@ -195,6 +195,13 @@ $(BUILD_DIR)/test-pthread: tests/test-pthread.c | $(BUILD_DIR)
 	@echo "  CROSS   $< (with -lpthread)"
 	$(Q)$(CROSS_COMPILE)gcc -D_GNU_SOURCE -static -O2 -o $@ $< -lpthread
 
+# test-osync-requeue drives a raw FUTEX_REQUEUE against a plain-FUTEX_WAIT
+# waiter (musl unlock_requeue pattern) to guard the os_sync wake-at-source
+# degradation; needs -lpthread.
+$(BUILD_DIR)/test-osync-requeue: tests/test-osync-requeue.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc -D_GNU_SOURCE -static -O2 -o $@ $< -lpthread
+
 # test-scm-creds blocks accept in a pthread while the listener option changes.
 $(BUILD_DIR)/test-scm-creds: tests/test-scm-creds.c | $(BUILD_DIR)
 	@echo "  CROSS   $< (with -lpthread)"

@@ -197,6 +197,10 @@ _GUEST_EXTRA=""
 # runs are distinguishable in the merged output.
 _COREUTILS_SUFFIX=""
 
+# Guest path of the coreutils bindir for exec-child targets under --sysroot.
+# Empty means "use the host launch path" (native/static runs).
+_COREUTILS_GUEST_BINDIR=""
+
 run_elfuse_sysroot()
 {
     local bin="$1"
@@ -205,6 +209,40 @@ run_elfuse_sysroot()
     [ -n "$_SYSROOT" ] && sysroot_args="--sysroot $_SYSROOT"
     # shellcheck disable=SC2086
     timeout "$_ELFUSE_TIMEOUT" "$ELFUSE" $sysroot_args "$bin" $_GUEST_EXTRA "$@" 2> /dev/null
+}
+
+# Coreutils fixtures (hello.txt / lines.txt / unsorted.txt) live in the host
+# TEST_TMPDIR, which the static runs read directly. Under --sysroot the guest
+# view is chrooted to the sysroot, so a host-absolute path is redirected inside
+# it and the fixture is not found. For a sysroot run, copy the fixtures into a
+# scratch dir inside the sysroot and repoint TEST_TMPDIR at the guest-visible
+# path so run_coreutils_tests addresses them by a path that resolves under the
+# redirect. Reversed by unstage_sysroot_fixtures.
+_HOST_TMPDIR=""
+_STAGED_SYSROOT_DIR=""
+stage_sysroot_fixtures()
+{
+    local sysroot="$1"
+    local guest_rel="/tmp/matrix-coreutils.$$"
+    local host_dir="${sysroot}${guest_rel}"
+    mkdir -p "$host_dir"
+    # Copy the fixtures setup_fixtures already authored rather than re-creating
+    # their content here, so the two stay in sync from one definition.
+    cp "$TEST_TMPDIR/hello.txt" "$TEST_TMPDIR/unsorted.txt" \
+        "$TEST_TMPDIR/lines.txt" "$host_dir/"
+    _HOST_TMPDIR="$TEST_TMPDIR"
+    _STAGED_SYSROOT_DIR="$host_dir"
+    TEST_TMPDIR="$guest_rel"
+}
+
+unstage_sysroot_fixtures()
+{
+    if [ -n "$_STAGED_SYSROOT_DIR" ]; then
+        rm -rf "$_STAGED_SYSROOT_DIR"
+    fi
+    _STAGED_SYSROOT_DIR=""
+    TEST_TMPDIR="$_HOST_TMPDIR"
+    _HOST_TMPDIR=""
 }
 
 # Generic test helpers.
@@ -217,7 +255,7 @@ run_elfuse_sysroot()
 # cpuN count == online count) which a real kernel does not honor. All listed
 # tests still run in elfuse-aarch64 mode and in 'make check'; the qemu
 # reference run skips them.
-QEMU_SKIP="test-thread test-stress test-futex-pi test-io-opt test-sysfs-cpu"
+QEMU_SKIP="test-thread test-stress test-futex-pi test-osync-requeue test-io-opt test-sysfs-cpu"
 
 is_qemu_skipped()
 {
@@ -491,6 +529,7 @@ run_unit_tests()
     printf "\nThreading\n"
     test_check "$runner" "test-thread" "0 failed" "$bindir/test-thread"
     test_check "$runner" "test-pthread" "0 failed" "$bindir/test-pthread"
+    test_check "$runner" "test-osync-requeue" "0 failed" "$bindir/test-osync-requeue"
     test_check "$runner" "test-simd-clone" "0 failed" "$bindir/test-simd-clone"
     test_check "$runner" "test-stress" "0 failed" "$bindir/test-stress"
 
@@ -519,6 +558,11 @@ run_unit_tests()
 run_coreutils_tests()
 {
     local runner="$1" bindir="$2"
+    # Exec-child targets (env/nice/... run "<dir>/true") must resolve inside the
+    # guest. Native/static runs address them by the same host path they launch
+    # from; a --sysroot run overrides this with the binary's guest path via
+    # _COREUTILS_GUEST_BINDIR so the redirected execve finds the child.
+    local guest_bindir="${_COREUTILS_GUEST_BINDIR:-$bindir}"
 
     printf "Coreutils text%s\n" "$_COREUTILS_SUFFIX"
     test_check "$runner" "echo" "hello" "$bindir/echo" hello
@@ -557,10 +601,10 @@ run_coreutils_tests()
     test_rc "$runner" "true" 0 "$bindir/true"
     test_rc "$runner" "false" 1 "$bindir/false"
     test_rc "$runner" "sleep" 0 "$bindir/sleep" 0
-    test_rc "$runner" "env" 0 "$bindir/env" "$bindir/true"
-    test_rc "$runner" "nice" 0 "$bindir/nice" "$bindir/true"
-    test_rc "$runner" "nohup" 0 "$bindir/nohup" "$bindir/true"
-    test_rc "$runner" "timeout" 0 "$bindir/timeout" 5 "$bindir/true"
+    test_rc "$runner" "env" 0 "$bindir/env" "$guest_bindir/true"
+    test_rc "$runner" "nice" 0 "$bindir/nice" "$guest_bindir/true"
+    test_rc "$runner" "nohup" 0 "$bindir/nohup" "$guest_bindir/true"
+    test_rc "$runner" "timeout" 0 "$bindir/timeout" 5 "$guest_bindir/true"
 
     printf "\nCoreutils encoding%s\n" "$_COREUTILS_SUFFIX"
     # The if/then form contains require_binary's exit status so missing
@@ -797,7 +841,23 @@ run_suite()
     run_busybox_tests "$runner" "$GUEST_BUSYBOX"
 
     if [ -d "$GUEST_STATIC_BINS" ]; then
+        # run_elfuse auto-adds --sysroot for binaries under GUEST_SYSROOT or the
+        # dyn-bin dir (see its case), so tree/find/diff here run chrooted and
+        # must read the fixtures from inside the sysroot, same as the dynamic
+        # coreutils run. Stage them only for elfuse runs when that trigger applies.
+        local static_staged=0
+        if [ "$mode" = "elfuse-aarch64" ] && [ -n "${GUEST_SYSROOT:-}" ]; then
+            case "$GUEST_STATIC_BINS" in
+                "${GUEST_SYSROOT}"/* | "${FIXTURES}/aarch64-musl/dyn-bin"*)
+                    stage_sysroot_fixtures "$GUEST_SYSROOT"
+                    static_staged=1
+                    ;;
+            esac
+        fi
         run_static_tests "$runner" "$GUEST_STATIC_BINS"
+        if [ "$static_staged" = 1 ]; then
+            unstage_sysroot_fixtures
+        fi
     else
         skip_suite "static-bins" "no $GUEST_STATIC_BINS"
     fi
@@ -815,7 +875,17 @@ run_suite()
         else
             _COREUTILS_SUFFIX=" (musl dyn)"
             _SYSROOT="$GUEST_SYSROOT"
+            if [ "$mode" = "elfuse-aarch64" ]; then
+                # dyn-bin binaries symlink to the rootfs /bin multiplexer, so
+                # their guest path under --sysroot is /bin.
+                _COREUTILS_GUEST_BINDIR="/bin"
+                stage_sysroot_fixtures "$GUEST_SYSROOT"
+            fi
             run_coreutils_tests "$dyn_runner" "$GUEST_DYNAMIC_COREUTILS"
+            if [ "$mode" = "elfuse-aarch64" ]; then
+                unstage_sysroot_fixtures
+                _COREUTILS_GUEST_BINDIR=""
+            fi
             _COREUTILS_SUFFIX=""
         fi
     else
@@ -831,7 +901,15 @@ run_suite()
         else
             _COREUTILS_SUFFIX=" (glibc dyn)"
             _SYSROOT="$GUEST_GLIBC_SYSROOT"
+            if [ "$mode" = "elfuse-aarch64" ]; then
+                _COREUTILS_GUEST_BINDIR="/usr/bin"
+                stage_sysroot_fixtures "$GUEST_GLIBC_SYSROOT"
+            fi
             run_coreutils_tests "$dyn_runner" "$GUEST_GLIBC_DYNAMIC_COREUTILS"
+            if [ "$mode" = "elfuse-aarch64" ]; then
+                unstage_sysroot_fixtures
+                _COREUTILS_GUEST_BINDIR=""
+            fi
             _COREUTILS_SUFFIX=""
         fi
     else
