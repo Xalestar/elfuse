@@ -158,6 +158,13 @@ qemu_start()
         fi
         sleep 1
     done
+
+    # The Alpine initramfs keeps /tmp on "rootfs", which busybox df cannot
+    # resolve to a /proc/mounts entry ("df: ...: can't find mount point").
+    # Mount a dedicated tmpfs, as any regular system has, so paths under
+    # /tmp map to a resolvable st_dev. Guarded so a repeated qemu_start
+    # against a running VM does not stack mounts.
+    _qemu_ssh_raw 'grep -q " /tmp tmpfs " /proc/mounts || mount -t tmpfs tmpfs /tmp'
 }
 
 # Each call opens a fresh ssh connection.  Avoids ControlMaster pitfalls

@@ -977,8 +977,8 @@ run_suite()
 # observed counts diverge. apple-unknown is the fallback row for SoC
 # strings the detector does not recognize yet.
 EXPECTED_BASELINES=(
-    "elfuse-aarch64|180|0"
-    "qemu-aarch64|180|1"
+    "elfuse-aarch64|169|0"
+    "qemu-aarch64|163|0"
     "elfuse-x86_64:apple-m1-m2|71|0"
     "elfuse-x86_64:apple-m3-plus|71|0"
     "elfuse-x86_64:apple-unknown|71|0"
@@ -1060,8 +1060,11 @@ detect_x86_64_host_class()
 # reporting), but this list is the canonical reference for "expected to
 # fail" in code review and CI triage.
 #
-# qemu-aarch64: test-poll diverges only inside the qemu reference VM.
-KNOWN_FAILURES_QEMU_AARCH64="test-poll"
+# qemu-aarch64: none. test-poll used to diverge inside the qemu reference
+# VM but now passes there (observed on the self-hosted runner and in local
+# captures); the qemu row in EXPECTED_BASELINES therefore pins exactly
+# zero failures.
+KNOWN_FAILURES_QEMU_AARCH64=""
 # elfuse-x86_64: rosetta limitations documented in the upstream hyper-linux
 # audit. test-signal-thread fails because rosetta shadows signal state
 # internally (SA_RESETHAND not reset); test-thread / test-stress hang on
