@@ -3667,6 +3667,50 @@ int proc_intercept_stat(const char *path, struct stat *st)
     return PROC_NOT_INTERCEPTED;
 }
 
+/* Resolve /proc/self/exe to the guest binary path in buf. Strips the sysroot
+ * prefix so a guest running under --sysroot=/opt/sr sees /bin/ls rather than
+ * /opt/sr/bin/ls, matching the chroot-like abstraction the rest of the path
+ * layer presents.
+ *
+ * Returns bytes written, or -1 with errno set. Under rosetta this still returns
+ * the real guest binary: the rosetta translator is an implementation detail,
+ * and guest apps (coreutils multi-call dispatch) expect the true path just as
+ * native binfmt_misc + rosetta exposes it.
+ */
+static int proc_readlink_self_exe(char *buf, size_t bufsiz)
+{
+    char exe_buf[LINUX_PATH_MAX];
+    if (!proc_elf_path_snapshot(exe_buf, sizeof(exe_buf))) {
+        errno = ENOENT;
+        return -1;
+    }
+    const char *exe = exe_buf;
+    char exe_real[LINUX_PATH_MAX];
+    char sysroot_snap[LINUX_PATH_MAX];
+    if (proc_sysroot_snapshot(sysroot_snap, sizeof(sysroot_snap))) {
+        /* proc_set_sysroot stores a realpath()-canonicalized form, so
+         * canonicalize exe before the prefix check or the strip fails when /var
+         * -> /private/var (and similar macOS symlinks) make the two strings
+         * diverge.
+         */
+        const char *exe_cmp = exe;
+        if (realpath(exe, exe_real))
+            exe_cmp = exe_real;
+        size_t sr_len = strlen(sysroot_snap);
+        if (sr_len > 0 && !strncmp(exe_cmp, sysroot_snap, sr_len) &&
+            (exe_cmp[sr_len] == '/' || exe_cmp[sr_len] == '\0')) {
+            exe = exe_cmp + sr_len;
+            if (*exe == '\0')
+                exe = "/";
+        }
+    }
+    size_t len = strlen(exe);
+    if (len > bufsiz)
+        len = bufsiz;
+    memcpy(buf, exe, len);
+    return (int) len;
+}
+
 int proc_intercept_readlink(const char *path, char *buf, size_t bufsiz)
 {
     {
@@ -3678,54 +3722,8 @@ int proc_intercept_readlink(const char *path, char *buf, size_t bufsiz)
             return proc_intercept_readlink(alias, buf, bufsiz);
     }
 
-    /* /proc/self/exe -> path of current ELF binary. Strip the sysroot prefix so
-     * a guest running under --sysroot=/opt/sr sees /bin/ls rather than
-     * /opt/sr/bin/ls, matching the chroot-like abstraction the rest of the path
-     * layer presents.
-     */
-    if (!strcmp(path, "/proc/self/exe")) {
-        /* Under rosetta, readlink("/proc/self/exe") points at the rosetta
-         * translator (the binfmt_misc interpreter). Matches the behavior Linux
-         * exposes when binfmt_misc dispatch is active.
-         */
-        if (proc_rosetta_active()) {
-            size_t len = strlen(ROSETTA_PATH);
-            if (len > bufsiz)
-                len = bufsiz;
-            memcpy(buf, ROSETTA_PATH, len);
-            return (int) len;
-        }
-        char exe_buf[LINUX_PATH_MAX];
-        if (!proc_elf_path_snapshot(exe_buf, sizeof(exe_buf))) {
-            errno = ENOENT;
-            return -1;
-        }
-        const char *exe = exe_buf;
-        char exe_real[LINUX_PATH_MAX];
-        char sysroot_snap[LINUX_PATH_MAX];
-        if (proc_sysroot_snapshot(sysroot_snap, sizeof(sysroot_snap))) {
-            /* proc_set_sysroot stores a realpath()-canonicalized form, so
-             * canonicalize exe before the prefix check or the strip fails when
-             * /var -> /private/var (and similar macOS symlinks) make the two
-             * strings diverge.
-             */
-            const char *exe_cmp = exe;
-            if (realpath(exe, exe_real))
-                exe_cmp = exe_real;
-            size_t sr_len = strlen(sysroot_snap);
-            if (sr_len > 0 && !strncmp(exe_cmp, sysroot_snap, sr_len) &&
-                (exe_cmp[sr_len] == '/' || exe_cmp[sr_len] == '\0')) {
-                exe = exe_cmp + sr_len;
-                if (*exe == '\0')
-                    exe = "/";
-            }
-        }
-        size_t len = strlen(exe);
-        if (len > bufsiz)
-            len = bufsiz;
-        memcpy(buf, exe, len);
-        return (int) len;
-    }
+    if (!strcmp(path, "/proc/self/exe"))
+        return proc_readlink_self_exe(buf, bufsiz);
 
     /* /proc/self/cwd -> getcwd() */
     if (!strcmp(path, "/proc/self/cwd")) {
@@ -3760,6 +3758,14 @@ int proc_intercept_readlink(const char *path, char *buf, size_t bufsiz)
             errno = ENOENT;
             return -1;
         }
+        /* Under rosetta, open("/proc/self/exe") returns a host fd pointing at
+         * the rosetta translator (needed by the VZ ioctl gate). readlink on
+         * that fd must still report the guest binary, not the translator, or
+         * coreutils multi-call dispatch reads back "rosetta" as the applet name
+         * and aborts.
+         */
+        if (proc_rosetta_active() && !strcmp(fdpath, ROSETTA_PATH))
+            return proc_readlink_self_exe(buf, bufsiz);
         size_t len = strlen(fdpath);
         if (len > bufsiz)
             len = bufsiz;

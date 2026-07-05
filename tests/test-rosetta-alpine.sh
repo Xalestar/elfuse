@@ -4,21 +4,21 @@
 # Copyright 2026 elfuse contributors
 # SPDX-License-Identifier: Apache-2.0
 #
-# Extends test-rosetta-statics.sh with workloads that exercise the
-# Alpine static-binary suite end-to-end:
+# Extends test-rosetta-statics.sh with workloads that exercise the Alpine
+# static-binary suite end-to-end:
 #   - file I/O against a real on-disk corpus (read, hash, sort, find)
 #   - text-processing pipelines stitched through the host shell
 #   - exit-code propagation through pipe chains
 #   - filesystem readback (ls, find, du, wc)
 #
-# Each test runs an Alpine x86_64 static binary (busybox or applet) under
-# elfuse + Rosetta. The host shell stitches multi-step pipelines so each
-# stage is a separate elfuse invocation - that catches per-launch
-# regressions (bootstrap, /proc/self/exe, vDSO) on every step.
+# Each test runs an Alpine x86_64 static binary (busybox or applet) under elfuse
+# + Rosetta. The host shell stitches multi-step pipelines so each stage is a
+# separate elfuse invocation - that catches per-launch regressions (bootstrap,
+# /proc/self/exe, vDSO) on every step.
 #
-# Fixture: tests/fetch-fixtures.sh INCLUDE_X86_64=1.
-# Path cap: stages a /tmp/elfuse-ra/ symlink farm so paths stay inside
-# rosetta's 42-byte ROSETTA_CAPS_BINARY_PATH_LEN.
+# Fixture: tests/fetch-fixtures.sh INCLUDE_X86_64=1. Path cap: stages a
+# /tmp/elfuse-ra/ symlink farm so paths stay inside rosetta's 42-byte
+# ROSETTA_CAPS_BINARY_PATH_LEN.
 #
 # Usage: tests/test-rosetta-alpine.sh [path/to/elfuse]
 
@@ -39,9 +39,9 @@ SHORTDIR=/tmp/elfuse-ra
 STATICBIN="${SHORTDIR}/bin"
 DATA="${SHORTDIR}/data"
 
-# Shared report_pass / report_fail / report_skip + Results: summary
-# emitter. Matches the matrix runner's aarch64 per-binary format so
-# tests/test-matrix.sh elfuse-x86_64 output reads uniformly.
+# Shared report_pass / report_fail / report_skip + Results: summary emitter.
+# Matches the matrix runner's aarch64 per-binary format so tests/test-matrix.sh
+# elfuse-x86_64 output reads uniformly.
 # shellcheck source=tests/lib/rosetta-test.sh
 . "$(dirname "$0")/lib/rosetta-test.sh"
 
@@ -72,10 +72,10 @@ rm -rf "$SHORTDIR"
 mkdir -p "$STATICBIN" "$DATA"
 staticbin_abs="$(cd "$STATICBIN_LONG" && pwd)"
 
-# Point HOME at the per-run tmp so the rosettad AOT cache stays empty
-# across re-runs. Without this, the cache from a previous run can serve
-# the digest fast-path and silently bypass the path-publishing surface
-# the smoke probes are meant to exercise.
+# Point HOME at the per-run tmp so the rosettad AOT cache stays empty across
+# re-runs. Without this, the cache from a previous run can serve the digest
+# fast-path and silently bypass the path-publishing surface the smoke probes are
+# meant to exercise.
 export HOME="$SHORTDIR"
 
 ln -s "${staticbin_abs}/busybox" "${STATICBIN}/busybox"
@@ -90,31 +90,31 @@ done
 
 trap 'rm -rf "$SHORTDIR"' EXIT
 
-# Build a small data corpus the tests can chew on. Deterministic content
-# so hash and sort results are stable across runs. fruits-unsorted.txt is
-# deliberately out of order so sort + diff exercise the comparison paths.
+# Build a small data corpus the tests can chew on. Deterministic content so hash
+# and sort results are stable across runs. fruits-unsorted.txt is deliberately
+# out of order so sort + diff exercise the comparison paths.
 printf 'cherry\napple\ngrape\nbanana\nfig\ndurian\neggplant\n' \
     > "${DATA}/fruits-unsorted.txt"
 printf 'apple\nbanana\ncherry\ndurian\neggplant\nfig\ngrape\n' \
     > "${DATA}/fruits-sorted.txt"
 
-# 8 KiB of repeated ASCII (printable so wc/grep/sort don't choke). The
-# pattern is deterministic so the SHA-256 expectation below is stable.
+# 8 KiB of repeated ASCII (printable so wc/grep/sort don't choke). The pattern
+# is deterministic so the SHA-256 expectation below is stable.
 {
     for i in $(seq 1 256); do
         printf 'rosetta line %03d - the quick brown fox\n' "$i"
     done
 } > "${DATA}/lines.txt"
 
-# Capture an expected SHA-256 of lines.txt computed locally so the test
-# can compare without hardcoding a fragile constant.
+# Capture an expected SHA-256 of lines.txt computed locally so the test can
+# compare without hardcoding a fragile constant.
 expected_sha="$(shasum -a 256 "${DATA}/lines.txt" | awk '{print $1}')"
 
 # A pair of identical files for diff -q to confirm.
 cp "${DATA}/lines.txt" "${DATA}/lines-copy.txt"
 
-# Test helpers.
-# run_eq: command's stdout must equal expected exactly. rc must be 0.
+# Test helpers. run_eq: command's stdout must equal expected exactly. rc must be
+# 0.
 run_eq()
 {
     local label="$1" expected="$2"
@@ -161,10 +161,10 @@ run_re()
     report_pass "$label"
 }
 
-# run_pipe: two-stage pipeline. Stage A produces stdout, piped to stage
-# B which is also a guest binary under elfuse. Final stdout must equal
-# expected. Each stage is its own elfuse invocation, so bootstrap +
-# /proc/self/exe + vDSO run twice per test.
+# run_pipe: two-stage pipeline. Stage A produces stdout, piped to stage B which
+# is also a guest binary under elfuse. Final stdout must equal expected. Each
+# stage is its own elfuse invocation, so bootstrap + /proc/self/exe + vDSO run
+# twice per test.
 run_pipe()
 {
     local label="$1" expected="$2"
@@ -190,9 +190,9 @@ run_pipe()
     fi
     local out rc
     set +e
-    # set -o pipefail inside the subshell so the captured $? reflects the
-    # first non-zero stage exit, not just the last. Without this a producer
-    # that fails after emitting matching text would silently pass.
+    # set -o pipefail inside the subshell so the captured $? reflects the first
+    # non-zero stage exit, not just the last. Without this a producer that fails
+    # after emitting matching text would silently pass.
     out="$(
         set -o pipefail
         "$TIMEOUT" 15 "$ELFUSE" ${args_a[@]+"${args_a[@]}"} 2> /dev/null \
@@ -217,18 +217,16 @@ printf 'elfuse:    %s\n' "$ELFUSE"
 printf 'fixtures:  %s -> %s\n' "$STATICBIN" "$staticbin_abs"
 printf 'rosetta:   %s\n\n' "$ROSETTA_PATH"
 
-# ---------------------------------------------------------------------------
 # Filesystem readback
-# ---------------------------------------------------------------------------
 
 # cat: openat + read + write + close. Read the first line of fruits.
-# fruits-unsorted.txt starts with "cherry" by construction (deliberately
-# out of order so sort + diff exercise the comparison paths).
+# fruits-unsorted.txt starts with "cherry" by construction (deliberately out of
+# order so sort + diff exercise the comparison paths).
 run_re "cat-fruits-first-line" "^cherry$" \
     "${STATICBIN}/head" "-n1" "${DATA}/fruits-unsorted.txt"
 
-# wc -l counts lines via read syscall over a file. The fixture file is
-# 7 fruit names; lines.txt has 256 lines of 39 bytes each (256*39 = 9984).
+# wc -l counts lines via read syscall over a file. The fixture file is 7 fruit
+# names; lines.txt has 256 lines of 39 bytes each (256*39 = 9984).
 run_re "wc-l-fruits" "^[[:space:]]*7 .*fruits-unsorted.txt$" \
     "${STATICBIN}/wc" "-l" "${DATA}/fruits-unsorted.txt"
 run_re "wc-l-lines" "^[[:space:]]*256 .*lines.txt$" \
@@ -248,14 +246,19 @@ run_re "stat-data" "regular file" \
 run_re "find-by-name" "lines.txt" \
     "${STATICBIN}/find" "$DATA" "-name" "lines.txt"
 
-# du -s: stat aggregation; output is "<size>\t<path>". Just sanity-check
-# that a non-zero size is reported.
+# du -s: stat aggregation; output is "<size>\t<path>". Just sanity-check that a
+# non-zero size is reported.
 run_re "du-sk-data" "^[1-9][0-9]*[[:space:]]" \
     "${STATICBIN}/du" "-sk" "$DATA"
 
-# ---------------------------------------------------------------------------
+# readlink /proc/self/exe must resolve to the guest binary, not the rosetta
+# translator (issue #107). A regression returns .../RosettaLinux/rosetta, so pin
+# the basename to busybox. Guards both readlink code paths: rosetta maps
+# readlink("/proc/self/exe") onto open + readlink("/proc/self/fd/N").
+run_re "readlink-self-exe-not-rosetta" "/busybox$" \
+    "${STATICBIN}/busybox" "readlink" "/proc/self/exe"
+
 # Hashing - libc per-byte loops + per-iteration computation
-# ---------------------------------------------------------------------------
 
 run_re "sha256-fruits" "^[0-9a-f]{64}  " \
     "${STATICBIN}/sha256sum" "${DATA}/fruits-sorted.txt"
@@ -274,9 +277,7 @@ run_re "md5-fruits" "^[0-9a-f]{32}  " \
 run_re "cksum-fruits" "^[0-9]+ [0-9]+ " \
     "${STATICBIN}/cksum" "${DATA}/fruits-sorted.txt"
 
-# ---------------------------------------------------------------------------
 # Text processing
-# ---------------------------------------------------------------------------
 
 # sort: in-place tmpfile + qsort + write back. Verify first and last lines.
 run_re "sort-first" "^apple$" \
@@ -284,8 +285,8 @@ run_re "sort-first" "^apple$" \
 run_re "sort-reverse-first" "^grape$" \
     "${STATICBIN}/sort" "-r" "${DATA}/fruits-unsorted.txt"
 
-# Sort + count via two-stage pipeline. busybox wc on stdin does not pad
-# the count, so the expected output is the bare "7".
+# Sort + count via two-stage pipeline. busybox wc on stdin does not pad the
+# count, so the expected output is the bare "7".
 run_pipe "pipe-sort-wc" "7" \
     "${STATICBIN}/sort" "${DATA}/fruits-unsorted.txt" \
     -- \
@@ -340,14 +341,12 @@ run_pipe "pipe-rev" "olleh" \
     -- \
     "${STATICBIN}/rev"
 
-# tac: reverse line order on a file. The fruits-sorted.txt corpus starts
-# with "apple" and ends with "grape"; after tac the first line is "grape".
+# tac: reverse line order on a file. The fruits-sorted.txt corpus starts with
+# "apple" and ends with "grape"; after tac the first line is "grape".
 run_re "tac-reverse-first-line" "^grape$" \
     "${STATICBIN}/tac" "${DATA}/fruits-sorted.txt"
 
-# ---------------------------------------------------------------------------
 # Arithmetic and number generation
-# ---------------------------------------------------------------------------
 
 run_eq "seq-1-5" "$(printf '1\n2\n3\n4\n5')" \
     "${STATICBIN}/seq" "1" "5"
@@ -361,9 +360,7 @@ run_re "factor-prime" "^999983: 999983$" \
 run_re "factor-composite" "^60: 2 2 3 5$" \
     "${STATICBIN}/factor" "60"
 
-# ---------------------------------------------------------------------------
 # File comparison + base64 round-trip
-# ---------------------------------------------------------------------------
 
 # diff -q on identical files: rc=0 and no stdout.
 total=$((total + 1))
@@ -392,17 +389,15 @@ else
     report_fail "diff-differs: rc=$diff_rc (want 1)"
 fi
 
-# base64 decode of a pre-encoded constant. Verifies the encoder + decoder
-# share the same alphabet and padding rules. The encoded form below is the
-# canonical base64 of "rosetta-bridge".
+# base64 decode of a pre-encoded constant. Verifies the encoder + decoder share
+# the same alphabet and padding rules. The encoded form below is the canonical
+# base64 of "rosetta-bridge".
 run_pipe "pipe-base64-decode" "rosetta-bridge" \
     "${STATICBIN}/echo" "cm9zZXR0YS1icmlkZ2U=" \
     -- \
     "${STATICBIN}/base64" "-d"
 
-# ---------------------------------------------------------------------------
 # Summary
-# ---------------------------------------------------------------------------
 
 report_summary "$total"
 
