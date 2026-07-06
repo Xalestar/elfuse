@@ -60,6 +60,17 @@ typedef struct thread_entry {
                                * use __atomic_load_n on this field; the 32-bit width keeps
                                * the access pattern predictable across architectures.
                                */
+    uint64_t generation; /* Bumped by thread_alloc each time this slot is
+                          * reused. Lets a caller holding a t pointer detect
+                          * that its slot was recycled to a different logical
+                          * thread while it was not looking (e.g. a clone
+                          * parent that raced with a starting-up worker's own
+                          * failure path). Read/written under thread_lock,
+                          * except for the lock-free comparison in
+                          * thread_join_workers' teardown poll, which uses
+                          * acquire/release ordering against thread_alloc's
+                          * release-store.
+                          */
     /* Per-thread signal mask (POSIX requires each thread to have its own).
      * Initialized to the parent's mask on clone, modified via rt_sigprocmask.
      */
