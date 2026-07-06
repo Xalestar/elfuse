@@ -8,7 +8,8 @@
  * Tests readv/writev scatter-gather I/O operations including pipe round-trips,
  * file I/O, and edge cases.
  *
- * Syscalls exercised: writev(66), readv(65), pipe2(59), openat(56),
+ * Syscalls exercised: writev(66), readv(65), preadv(69), pwritev(70),
+ *                     preadv2(286), pwritev2(287), pipe2(59), openat(56),
  *                     lseek(62), close(57), unlink(35)
  */
 
@@ -24,6 +25,10 @@ int passes = 0, fails = 0;
 
 #ifndef RWF_APPEND
 #define RWF_APPEND 0x00000010
+#endif
+
+#ifndef O_PATH
+#define O_PATH 010000000
 #endif
 
 /* Test 1: writev + readv via pipe */
@@ -281,7 +286,11 @@ static void test_pwritev2_append(void)
     EXPECT_TRUE(nr == 6 && !memcmp(buf, "baseXY", 6), "append data mismatch");
 }
 
-/* Test 8: zero iovcnt must not move the append file offset */
+/* Test 8: zero iovcnt returns 0 without moving the append file offset.
+ * Linux reference (verified under qemu-system-aarch64): import_iovec()
+ * yields an empty iterator, do_iter_write returns 0 before the offset is
+ * touched, so pwritev2(RWF_APPEND) with iovcnt == 0 is a complete no-op.
+ */
 
 static void test_pwritev2_append_zero_iovcnt(void)
 {
@@ -308,7 +317,135 @@ static void test_pwritev2_append_zero_iovcnt(void)
     close(fd);
     unlink(path);
 
-    EXPECT_TRUE(ret == -EINVAL && pos == 1, "zero iovcnt changed offset");
+    EXPECT_TRUE(ret == 0 && pos == 1, "zero iovcnt not a no-op");
+}
+
+/* Test 8: zero-iovcnt validation ordering across all six vector entry
+ * points. Linux reference (fs/read_write.c): a negative offset fails EINVAL
+ * before the fd lookup (do_preadv/do_pwritev; -1 is a valid sentinel only
+ * for preadv2/pwritev2), the positional variants fail non-seekable files
+ * with ESPIPE (FMODE_PREAD/FMODE_PWRITE), wrong-direction and O_PATH fds
+ * fail EBADF (FMODE_READ/FMODE_WRITE in do_iter_read/do_iter_write), and
+ * RWF flags are never validated because do_iter_* return before
+ * kiocb_set_rw_flags for an empty vector.
+ */
+
+enum vec_op {
+    OP_READV,
+    OP_WRITEV,
+    OP_PREADV,
+    OP_PWRITEV,
+    OP_PREADV2,
+    OP_PWRITEV2
+};
+
+static long vec_zero_syscall(int op, int fd, long off, long flags)
+{
+    switch (op) {
+    case OP_READV:
+        return raw_syscall3(__NR_readv, fd, 0, 0);
+    case OP_WRITEV:
+        return raw_syscall3(__NR_writev, fd, 0, 0);
+    case OP_PREADV:
+        return raw_syscall5(__NR_preadv, fd, 0, 0, off, 0);
+    case OP_PWRITEV:
+        return raw_syscall5(__NR_pwritev, fd, 0, 0, off, 0);
+    case OP_PREADV2:
+        return raw_syscall6(__NR_preadv2, fd, 0, 0, off, 0, flags);
+    default:
+        return raw_syscall6(__NR_pwritev2, fd, 0, 0, off, 0, flags);
+    }
+}
+
+static void test_zero_iovcnt_validation(void)
+{
+    const char *path = "/tmp/elfuse-test-zero-iovcnt.txt";
+    int rw = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    int ro = open(path, O_RDONLY);
+    int wo = open(path, O_WRONLY);
+    int opath = open(path, O_PATH);
+    int stale = open(path, O_RDONLY);
+    int pfd[2] = {-1, -1};
+    if (rw < 0 || ro < 0 || wo < 0 || opath < 0 || stale < 0 ||
+        pipe(pfd) != 0) {
+        TEST("zero iovcnt setup");
+        FAIL("open/pipe");
+        goto out;
+    }
+    close(stale); /* keep the value: exercises the closed-fd path */
+
+    const struct {
+        const char *name;
+        int op;
+        int fd;
+        long off;
+        long flags;
+        long expect;
+    } cases[] = {
+        /* Valid fd, matching direction: 0 regardless of variant */
+        {"readv rdwr", OP_READV, rw, 0, 0, 0},
+        {"writev rdwr", OP_WRITEV, rw, 0, 0, 0},
+        {"preadv rdwr", OP_PREADV, rw, 0, 0, 0},
+        {"pwritev rdwr", OP_PWRITEV, rw, 0, 0, 0},
+        {"preadv2 rdwr", OP_PREADV2, rw, 0, 0, 0},
+        {"pwritev2 rdwr", OP_PWRITEV2, rw, 0, 0, 0},
+        {"readv rdonly", OP_READV, ro, 0, 0, 0},
+        {"writev wronly", OP_WRITEV, wo, 0, 0, 0},
+        /* Closed fd: EBADF */
+        {"readv closed", OP_READV, stale, 0, 0, -EBADF},
+        {"writev closed", OP_WRITEV, stale, 0, 0, -EBADF},
+        {"preadv closed", OP_PREADV, stale, 0, 0, -EBADF},
+        {"pwritev2 closed off=-1", OP_PWRITEV2, stale, -1, 0, -EBADF},
+        /* O_PATH: EBADF (no FMODE_READ/FMODE_WRITE) */
+        {"readv O_PATH", OP_READV, opath, 0, 0, -EBADF},
+        {"writev O_PATH", OP_WRITEV, opath, 0, 0, -EBADF},
+        /* Wrong access mode: EBADF */
+        {"writev rdonly", OP_WRITEV, ro, 0, 0, -EBADF},
+        {"pwritev rdonly", OP_PWRITEV, ro, 0, 0, -EBADF},
+        {"pwritev2 rdonly", OP_PWRITEV2, ro, 0, 0, -EBADF},
+        {"readv wronly", OP_READV, wo, 0, 0, -EBADF},
+        {"preadv wronly", OP_PREADV, wo, 0, 0, -EBADF},
+        {"preadv2 wronly", OP_PREADV2, wo, 0, 0, -EBADF},
+        /* Pipes: direction from the fd, ESPIPE for positional variants */
+        {"readv pipe rd-end", OP_READV, pfd[0], 0, 0, 0},
+        {"writev pipe wr-end", OP_WRITEV, pfd[1], 0, 0, 0},
+        {"writev pipe rd-end", OP_WRITEV, pfd[0], 0, 0, -EBADF},
+        {"readv pipe wr-end", OP_READV, pfd[1], 0, 0, -EBADF},
+        {"preadv pipe rd-end", OP_PREADV, pfd[0], 0, 0, -ESPIPE},
+        {"pwritev pipe wr-end", OP_PWRITEV, pfd[1], 0, 0, -ESPIPE},
+        {"preadv2 pipe off=-1", OP_PREADV2, pfd[0], -1, 0, 0},
+        /* Negative offsets: EINVAL, even before the fd lookup */
+        {"preadv rdwr off=-1", OP_PREADV, rw, -1, 0, -EINVAL},
+        {"pwritev rdwr off=-1", OP_PWRITEV, rw, -1, 0, -EINVAL},
+        {"preadv2 rdwr off=-2", OP_PREADV2, rw, -2, 0, -EINVAL},
+        {"pwritev2 rdwr off=-2", OP_PWRITEV2, rw, -2, 0, -EINVAL},
+        {"preadv closed off=-1", OP_PREADV, stale, -1, 0, -EINVAL},
+        /* RWF flags are not validated for an empty vector */
+        {"preadv2 rdwr RWF_APPEND", OP_PREADV2, rw, 0, RWF_APPEND, 0},
+        {"pwritev2 rdwr bogus flag", OP_PWRITEV2, rw, 0, 1L << 27, 0},
+    };
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        TEST(cases[i].name);
+        long got = vec_zero_syscall(cases[i].op, cases[i].fd, cases[i].off,
+                                    cases[i].flags);
+        EXPECT_EQ(got, cases[i].expect, "wrong return");
+    }
+
+out:
+    if (rw >= 0)
+        close(rw);
+    if (ro >= 0)
+        close(ro);
+    if (wo >= 0)
+        close(wo);
+    if (opath >= 0)
+        close(opath);
+    if (pfd[0] >= 0)
+        close(pfd[0]);
+    if (pfd[1] >= 0)
+        close(pfd[1]);
+    unlink(path);
 }
 
 /* Main */
@@ -325,6 +462,7 @@ int main(void)
     test_many_iovecs();
     test_pwritev2_append();
     test_pwritev2_append_zero_iovcnt();
+    test_zero_iovcnt_validation();
 
     SUMMARY("test-readv-writev");
     return fails > 0 ? 1 : 0;

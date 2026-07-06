@@ -1250,8 +1250,62 @@ static int64_t single_guest_iov(guest_t *g,
     return 0;
 }
 
+/* Linux returns 0 for zero-iovcnt vector I/O once the fd validates:
+ * import_iovec() yields an empty iterator and do_iter_read/do_iter_write
+ * return before the file offset is touched, so even pwritev2(RWF_APPEND)
+ * leaves the position alone. macOS readv/writev instead reject iovcnt == 0
+ * with EINVAL, so short-circuit before any host call -- the append path's
+ * SEEK_END would otherwise move the shared offset. The iov pointer is not
+ * dereferenced (Linux ignores it for an empty vector), and negative counts
+ * keep flowing into host_iov_prepare's EINVAL.
+ *
+ * The checks Linux runs before its empty-vector return still apply, in this
+ * order: the positional variants fail non-seekable files with ESPIPE
+ * (FMODE_PREAD/FMODE_PWRITE in do_preadv/do_pwritev), and all variants fail
+ * wrong-direction fds with EBADF (FMODE_READ/FMODE_WRITE in
+ * do_iter_read/do_iter_write). Both are probed on the host fd, whose open
+ * mode mirrors the guest's for host-backed types; fd_table linux_flags
+ * cannot be used because pipe/socket entries only track CLOEXEC there.
+ * Virtual multiplexed fds (eventfd/timerfd/signalfd/...) sit on host pipes
+ * or kqueues whose mode says nothing about the guest-visible fd (the Linux
+ * anon-inode equivalents are O_RDWR), so they validate existence only. No
+ * F_SEAL_WRITE check: Linux never reaches the write path for an empty
+ * vector, so a write-sealed memfd returns 0 here too.
+ */
+static int64_t vec_zero_iovcnt(int fd, bool op_is_write, bool positional)
+{
+    fd_entry_t snap;
+    if (!fd_snapshot(fd, &snap) || snap.type == FD_PATH)
+        return -LINUX_EBADF;
+
+    bool host_mode_mirrors_guest =
+        snap.type == FD_REGULAR || snap.type == FD_DIR ||
+        snap.type == FD_PIPE || snap.type == FD_SOCKET ||
+        snap.type == FD_STDIO || snap.type == FD_URANDOM;
+    if (!host_mode_mirrors_guest)
+        return 0;
+
+    host_fd_ref_t host_ref;
+    if (host_fd_ref_open(fd, &host_ref) < 0)
+        return -LINUX_EBADF;
+
+    int64_t ret = 0;
+    if (positional && lseek(host_ref.fd, 0, SEEK_CUR) < 0 && errno == ESPIPE)
+        ret = -LINUX_ESPIPE;
+    if (ret == 0) {
+        int fl = fcntl(host_ref.fd, F_GETFL);
+        int accmode = fl >= 0 ? (fl & O_ACCMODE) : O_RDWR;
+        if (op_is_write ? accmode == O_RDONLY : accmode == O_WRONLY)
+            ret = -LINUX_EBADF;
+    }
+    host_fd_ref_close(&host_ref);
+    return ret;
+}
+
 int64_t sys_readv(guest_t *g, int fd, uint64_t iov_gva, int iovcnt)
 {
+    if (iovcnt == 0)
+        return vec_zero_iovcnt(fd, false, false);
     if (iovcnt == 1) {
         linux_iovec_t giov;
         int64_t err = single_guest_iov(g, iov_gva, &giov);
@@ -1353,6 +1407,8 @@ int64_t sys_readv(guest_t *g, int fd, uint64_t iov_gva, int iovcnt)
 
 int64_t sys_writev(guest_t *g, int fd, uint64_t iov_gva, int iovcnt)
 {
+    if (iovcnt == 0)
+        return vec_zero_iovcnt(fd, true, false);
     if (iovcnt == 1) {
         linux_iovec_t giov;
         int64_t err = single_guest_iov(g, iov_gva, &giov);
@@ -1424,6 +1480,15 @@ int64_t sys_preadv(guest_t *g,
                    int iovcnt,
                    int64_t offset)
 {
+    if (iovcnt == 0) {
+        /* do_preadv rejects a negative offset before looking up the fd, so
+         * EINVAL outranks EBADF here; nonzero counts keep getting EINVAL
+         * from the host preadv instead.
+         */
+        if (offset < 0)
+            return -LINUX_EINVAL;
+        return vec_zero_iovcnt(fd, false, true);
+    }
     if (iovcnt == 1) {
         linux_iovec_t giov;
         int64_t err = single_guest_iov(g, iov_gva, &giov);
@@ -1465,6 +1530,12 @@ int64_t sys_pwritev(guest_t *g,
                     int iovcnt,
                     int64_t offset)
 {
+    if (iovcnt == 0) {
+        /* Same ordering as sys_preadv: negative offset EINVAL first. */
+        if (offset < 0)
+            return -LINUX_EINVAL;
+        return vec_zero_iovcnt(fd, true, true);
+    }
     if (iovcnt == 1) {
         linux_iovec_t giov;
         int64_t err = single_guest_iov(g, iov_gva, &giov);
@@ -1556,6 +1627,17 @@ int64_t sys_preadv2(guest_t *g,
                     int64_t offset,
                     int flags)
 {
+    /* Linux validates RWF flags only once the write/read actually proceeds
+     * (kiocb_set_rw_flags sits behind the empty-vector return in
+     * do_iter_read/do_iter_write), so an empty vector short-circuits before
+     * the flag checks. Offset -1 selects do_readv (no seekability check);
+     * any other negative offset fails EINVAL before the fd lookup.
+     */
+    if (iovcnt == 0) {
+        if (offset < -1)
+            return -LINUX_EINVAL;
+        return vec_zero_iovcnt(fd, false, offset != -1);
+    }
     if (flags & ~RWF_SUPPORTED)
         return -LINUX_EOPNOTSUPP;
     if (flags & RWF_APPEND)
@@ -1575,6 +1657,14 @@ int64_t sys_pwritev2(guest_t *g,
                      int64_t offset,
                      int flags)
 {
+    /* Same ordering as sys_preadv2: empty vectors return before RWF flag
+     * validation, which also keeps RWF_APPEND from moving the offset.
+     */
+    if (iovcnt == 0) {
+        if (offset < -1)
+            return -LINUX_EINVAL;
+        return vec_zero_iovcnt(fd, true, offset != -1);
+    }
     if (flags & ~RWF_SUPPORTED)
         return -LINUX_EOPNOTSUPP;
     int64_t r;
