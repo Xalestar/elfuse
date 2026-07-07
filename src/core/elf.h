@@ -137,6 +137,12 @@ void elf_resolve_interp(const char *sysroot,
                         char *out,
                         size_t out_sz);
 
+/* Maximum shebang resolutions before a chain is rejected with -ELOOP. Both the
+ * execve path and startup honor this so a max-depth chain ending in a real ELF
+ * still loads, matching the Linux kernel exec_binprm recursion limit.
+ */
+#define ELF_SHEBANG_MAX_DEPTH 5
+
 /* Read, probe, and parse a shebang script header from host_path. Writes
  * interpreter path to interp_out and the single optional argument (if present)
  * to arg_out. arg_out will be set to an empty string if there is no optional

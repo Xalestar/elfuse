@@ -466,9 +466,8 @@ int main(int argc, char **argv)
     proc_set_sysroot(sysroot);
 
     int shebang_depth = 0;
-    const int max_shebang_depth = 5;
 
-    while (shebang_depth < max_shebang_depth) {
+    while (true) {
         if (resolve_guest_elf_host_path(elf_path, elf_host_path,
                                         sizeof(elf_host_path),
                                         &elf_host_temp) < 0) {
@@ -502,6 +501,22 @@ int main(int argc, char **argv)
             return 1;
         }
 
+        /* The current path is a script. Bound the resolution chain only once a
+         * further shebang is confirmed, so a max-depth chain ending in a real
+         * ELF still boots (matches sys_execve and the Linux kernel).
+         */
+        if (shebang_depth >= ELF_SHEBANG_MAX_DEPTH) {
+            log_error(
+                "too many levels of shebang recursion (max %d) "
+                "resolving %s",
+                ELF_SHEBANG_MAX_DEPTH, argv[arg_start]);
+            cleanup_main_resources(&g, guest_initialized, &sysroot_mount,
+                                   have_host_cwd ? host_cwd : NULL, guest_argv,
+                                   guest_argc, elf_path, sysroot_path);
+            if (elf_host_temp)
+                unlink(elf_host_path);
+            return 1;
+        }
         shebang_depth++;
 
         /* Prepend interpreter (and argument if present) to guest_argv */
@@ -575,15 +590,6 @@ int main(int argc, char **argv)
             unlink(elf_host_path);
             elf_host_temp = false;
         }
-    }
-
-    if (shebang_depth >= max_shebang_depth) {
-        log_error("too many levels of shebang recursion (max %d) resolving %s",
-                  max_shebang_depth, argv[arg_start]);
-        cleanup_main_resources(&g, guest_initialized, &sysroot_mount,
-                               have_host_cwd ? host_cwd : NULL, guest_argv,
-                               guest_argc, elf_path, sysroot_path);
-        return 1;
     }
 
     if (gdb_port > 0) {

@@ -106,6 +106,10 @@ int main(void)
     const char case3[] = "#!/bin/bash -e\rline2\n";
     test_case(case3, sizeof(case3) - 1, 1, "/bin/bash", "-e");
 
+    /* 3b. Linux passes the whole optional suffix as one interpreter argument */
+    const char case3b[] = "#!/usr/bin/env -S python3 -O\n";
+    test_case(case3b, sizeof(case3b) - 1, 1, "/usr/bin/env", "-S python3 -O");
+
     /* 4. No trailing newline (EOF) */
     const char case4[] = "#!/bin/sh";
     test_case(case4, sizeof(case4) - 1, 1, "/bin/sh", "");

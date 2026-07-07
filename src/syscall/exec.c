@@ -89,11 +89,11 @@ static void exec_stage_mmu_off_reentry(hv_vcpu_t vcpu, guest_t *g)
     uint64_t sctlr =
         SCTLR_RES1 | SCTLR_C | SCTLR_I | SCTLR_DZE | SCTLR_UCT | SCTLR_UCI;
 
-    /* The old syscall frame on the EL1 stack is dead; _start never pops it,
-     * so reset SP_EL1 to the stack top as cold boot does. HV_CHECK on every
-     * write for parity with guest_bootstrap_create_vcpu: past the point of no
-     * return a silent HVF failure would resume the vCPU on half-staged
-     * register state, so abort instead.
+    /* The old syscall frame on the EL1 stack is dead; _start never pops it, so
+     * reset SP_EL1 to the stack top as cold boot does. HV_CHECK on every write
+     * for parity with guest_bootstrap_create_vcpu: past the point of no return
+     * a silent HVF failure would resume the vCPU on half-staged register state,
+     * so abort instead.
      */
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SP_EL1, el1_sp));
     HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_SCTLR_EL1, sctlr));
@@ -415,20 +415,13 @@ int64_t sys_execve(hv_vcpu_t vcpu,
         goto fail;
     }
 
-    /* Try loading as ELF; if that fails, emulate Linux binfmt_script for
-     * shebang files. Linux kernel handles shebangs transparently in
-     * binfmt_script.
+    /* Resolve binfmt_script before probing ELF. elf_load() logs parse errors,
+     * and a script is an expected non-ELF input here.
      */
     elf_info_t elf_info;
     int shebang_depth = 0;
-    const int max_shebang_depth = 5;
 
-    while (elf_load(path_host, &elf_info) < 0) {
-        if (shebang_depth >= max_shebang_depth) {
-            err = -LINUX_ELOOP;
-            goto fail;
-        }
-
+    while (true) {
         char interp_start[256];
         char interp_arg[256];
         int rc = elf_read_shebang(path_host, interp_start, sizeof(interp_start),
@@ -438,11 +431,17 @@ int64_t sys_execve(hv_vcpu_t vcpu,
             err = linux_errno();
             goto fail;
         }
-        if (rc == 0) {
-            err = -LINUX_ENOEXEC;
+        if (rc == 0)
+            break;
+
+        /* The current path is a script. Bound the resolution chain only once a
+         * further shebang is confirmed, so a max-depth chain ending in a real
+         * ELF still loads (matches the prior elf_load-first loop).
+         */
+        if (shebang_depth >= ELF_SHEBANG_MAX_DEPTH) {
+            err = -LINUX_ELOOP;
             goto fail;
         }
-
         shebang_depth++;
 
         bool has_arg = (interp_arg[0] != '\0');
@@ -545,6 +544,11 @@ int64_t sys_execve(hv_vcpu_t vcpu,
                            sizeof(path_host_buf));
             path_host = path_host_buf;
         }
+    }
+
+    if (elf_load(path_host, &elf_info) < 0) {
+        err = -LINUX_ENOEXEC;
+        goto fail;
     }
 
     /* Pre-PNR validation. All checks that can fail gracefully MUST happen
