@@ -47,6 +47,7 @@ SRCS := \
     syscall/io.c \
     syscall/poll.c \
     syscall/fd.c \
+    syscall/asyncio.c \
     syscall/inotify.c \
     syscall/time.c \
     syscall/sys.c \

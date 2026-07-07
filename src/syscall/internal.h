@@ -101,9 +101,16 @@ int fd_alloc_dir_at(int fd,
 /* Allocate the lowest available FD >= minfd.
  *
  * Returns -1 if none available. cleanup is set atomically under fd_lock (pass
- * NULL for plain fds).
+ * NULL for plain fds). out_gen (nullable) receives the generation stamped on
+ * the new slot, captured inside the allocating fd_lock critical section so dup
+ * can later prove the slot still holds this allocation and was not
+ * closed+reopened in the window.
  */
-int fd_alloc_from(int minfd, int type, int host_fd, void (*cleanup)(int));
+int fd_alloc_from(int minfd,
+                  int type,
+                  int host_fd,
+                  void (*cleanup)(int),
+                  uint64_t *out_gen);
 
 /* Allocate the lowest available FD >= minfd with a single-thread fast path.
  * Falls back to fd_alloc_from() when multiple guest threads are active.
@@ -111,18 +118,27 @@ int fd_alloc_from(int minfd, int type, int host_fd, void (*cleanup)(int));
 int fd_alloc_from_relaxed(int minfd,
                           int type,
                           int host_fd,
-                          void (*cleanup)(int));
+                          void (*cleanup)(int),
+                          uint64_t *out_gen);
 
 /* Allocate a specific FD slot.
  * Returns -1 if out of range. cleanup is set atomically under fd_lock (pass
- * NULL for plain fds).
+ * NULL for plain fds). out_gen: see fd_alloc_from().
  */
-int fd_alloc_at(int fd, int type, int host_fd, void (*cleanup)(int));
+int fd_alloc_at(int fd,
+                int type,
+                int host_fd,
+                void (*cleanup)(int),
+                uint64_t *out_gen);
 
 /* Allocate a specific FD slot with a single-thread fast path. Falls back to
  * fd_alloc_at() when replacement/cleanup must stay serialized.
  */
-int fd_alloc_at_relaxed(int fd, int type, int host_fd, void (*cleanup)(int));
+int fd_alloc_at_relaxed(int fd,
+                        int type,
+                        int host_fd,
+                        void (*cleanup)(int),
+                        uint64_t *out_gen);
 
 /* Report whether a guest FD slot >= minfd will be free after execve's CLOEXEC
  * sweep runs (free now, or open-but-CLOEXEC). sys_execve uses this before
@@ -250,13 +266,13 @@ bool fd_close_regular_relaxed(int fd, int *host_fd_out);
  */
 void fd_cleanup_entry(int guest_fd, const fd_entry_t *snap);
 
-/* Reference-counted wrapper around a directory stream, stored in
- * fd_table[].dir for FD_DIR entries (see syscall/fs.c). A raw DIR* would let a
- * sibling's close()/dup2()/fork-restore free it via closedir() while
- * sys_getdents64() is still mid-loop reading it; the wrapper defers the
- * closedir() until every acquirer -- the fd-table's own reference, plus any
- * in-flight sys_getdents64 -- has released it. Guarded by fd_lock, mirroring
- * poll.c's epoll_instance_t refcount.
+/* Reference-counted wrapper around a directory stream, stored in fd_table[].dir
+ * for FD_DIR entries (see syscall/fs.c). A raw DIR* would let a sibling's
+ * close()/dup2()/fork-restore free it via closedir() while sys_getdents64() is
+ * still mid-loop reading it; the wrapper defers the closedir() until every
+ * acquirer -- the fd-table's own reference, plus any in-flight sys_getdents64
+ * -- has released it. Guarded by fd_lock, mirroring poll.c's epoll_instance_t
+ * refcount.
  *
  * dir_stream_create() takes ownership of dir and returns the wrapper, or NULL
  * on allocation failure (caller still owns dir and must closedir() it itself).

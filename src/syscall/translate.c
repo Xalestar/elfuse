@@ -250,7 +250,11 @@ int linux_to_mac_status_flags(int linux_flags)
         mac_flags |= O_NONBLOCK;
     if (linux_flags & LINUX_O_APPEND)
         mac_flags |= O_APPEND;
-    if (linux_flags & LINUX_O_ASYNC)
-        mac_flags |= O_ASYNC;
+    /* O_ASYNC is deliberately NOT mapped onto the host fd. elfuse delivers
+     * SIGIO/SIGURG itself via the kqueue watcher (see asyncio.c); arming host
+     * O_ASYNC would let the host raise its own SIGIO at the elfuse process,
+     * whose default disposition would terminate it. The armed state lives in
+     * fd_entry_t.linux_flags and F_GETFL surfaces it from there.
+     */
     return mac_flags;
 }

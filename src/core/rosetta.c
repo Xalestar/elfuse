@@ -497,7 +497,7 @@ int rosetta_finalize(guest_t *g,
      * RLIMIT_NOFILE, so the pre-PNR elf_load host open does not catch this
      * first; the preflight is the real guard and this branch is the backstop.
      */
-    int bin_guest_fd = fd_alloc_from(3, FD_REGULAR, bin_host_fd, NULL);
+    int bin_guest_fd = fd_alloc_from(3, FD_REGULAR, bin_host_fd, NULL, NULL);
     if (bin_guest_fd < 0) {
         log_error("rosetta_finalize: fd_alloc_from(3) failed");
         goto fail;

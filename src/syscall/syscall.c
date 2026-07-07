@@ -46,6 +46,7 @@
 #include "runtime/futex.h"
 
 #include "syscall/abi.h"
+#include "syscall/asyncio.h"
 #include "syscall/exec.h"
 #include "syscall/fd.h"
 #include "syscall/fuse.h"
@@ -111,6 +112,7 @@ void syscall_init(void)
     io_init();
     fd_register_cleanup(FD_URANDOM, urandom_fd_cleanup);
     wakeup_pipe_init();
+    asyncio_init();
 }
 
 /* Memory syscall implementations (sys_brk, sys_mmap, sys_mremap, etc.) are in

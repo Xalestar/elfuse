@@ -613,7 +613,8 @@ int64_t sys_connect(guest_t *g, int fd, uint64_t addr_gva, uint32_t addrlen)
             return linux_errno();
         }
 
-        if (fd_alloc_at(fd, FD_SOCKET, pair[0], absock_unregister_fd) < 0) {
+        if (fd_alloc_at(fd, FD_SOCKET, pair[0], absock_unregister_fd, NULL) <
+            0) {
             close(pair[0]);
             close(pair[1]);
             host_fd_ref_close(&host_ref);

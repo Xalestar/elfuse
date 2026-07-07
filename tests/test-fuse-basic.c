@@ -153,11 +153,18 @@ typedef struct {
 } daemon_ctx_t;
 
 static volatile sig_atomic_t got_usr1;
+static volatile sig_atomic_t got_sigio;
 
 static void sigusr1_handler(int signum)
 {
     (void) signum;
     got_usr1 = 1;
+}
+
+static void sigio_handler(int signum)
+{
+    (void) signum;
+    got_sigio = 1;
 }
 
 static void *signal_sender_main(void *arg)
@@ -511,6 +518,17 @@ int main(void)
     fusefd = open("/dev/fuse", O_RDWR);
     if (fusefd < 0)
         die("open(/dev/fuse good)");
+    struct sigaction sigio_sa;
+    memset(&sigio_sa, 0, sizeof(sigio_sa));
+    sigio_sa.sa_handler = sigio_handler;
+    sigemptyset(&sigio_sa.sa_mask);
+    if (sigaction(SIGIO, &sigio_sa, NULL) < 0)
+        die("sigaction(SIGIO)");
+    if (fcntl(fusefd, F_SETOWN, getpid()) < 0)
+        die("fcntl(F_SETOWN fusefd)");
+    int fuse_fl = fcntl(fusefd, F_GETFL);
+    if (fuse_fl < 0 || fcntl(fusefd, F_SETFL, fuse_fl | O_ASYNC) < 0)
+        die("fcntl(F_SETFL O_ASYNC fusefd)");
 
     daemon_ctx_t ctx = {.fusefd = fusefd};
     pthread_t tid;
@@ -523,6 +541,12 @@ int main(void)
              fusefd, (unsigned) getuid(), (unsigned) getgid());
     if (syscall(SYS_mount, source_name, mount_dir, "fuse", 0, opts) < 0)
         die("mount(fuse)");
+    for (int i = 0; i < 2000 && !got_sigio; i++)
+        usleep(1000);
+    if (!got_sigio) {
+        fprintf(stderr, "no SIGIO on FUSE device readiness\n");
+        return 1;
+    }
 
     if (stat(mount_dir, &st) < 0)
         die("stat(mountpoint)");

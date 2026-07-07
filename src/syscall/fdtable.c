@@ -25,6 +25,7 @@
 #include "core/shim-globals.h"
 #include "runtime/procemu.h"
 #include "syscall/abi.h"
+#include "syscall/asyncio.h"
 #include "syscall/internal.h"
 #include "syscall/poll.h"
 
@@ -36,6 +37,7 @@ pthread_mutex_t fd_lock = PTHREAD_MUTEX_INITIALIZER; /* Lock order: 3 */
 /* FD table. */
 fd_entry_t fd_table[FD_TABLE_SIZE];
 static uint64_t fd_next_generation = 1;
+static uint64_t fd_next_ofd_id = 1;
 
 /* RLIMIT_NOFILE tracking. Guest-side soft limit for RLIMIT_NOFILE. fd_alloc
  * checks this. Default matches typical Linux default (1024). Updated by
@@ -114,6 +116,7 @@ static inline void fd_init_entry(int fd,
     fd_bitmap_set_used(fd);
     fd_table[fd].type = type;
     fd_table[fd].host_fd = host_fd;
+    fd_table[fd].ofd_id = fd_next_ofd_id++;
     fd_table[fd].generation = fd_next_generation++;
     fd_table[fd].linux_flags = 0;
     fd_table[fd].dir = NULL;
@@ -125,6 +128,8 @@ static inline void fd_init_entry(int fd,
      * here; pipes/sockets/synthetic fds resolve from the type alone.
      */
     fd_table[fd].can_block = type_may_block(type, host_fd);
+    fd_table[fd].fasync_owner_type = FASYNC_OWNER_NONE;
+    fd_table[fd].fasync_owner = 0;
     sock_opt_clear(&fd_table[fd]);
     fd_table[fd].cleanup = cleanup;
     /* Start conservative. Callers that set linux_flags after allocation
@@ -197,14 +202,18 @@ void fdtable_init(void)
 
     /* Pre-open stdin/stdout/stderr */
     fd_next_generation = 1;
+    fd_next_ofd_id = 1;
     fd_table[0] = (fd_entry_t) {.type = FD_STDIO,
                                 .host_fd = STDIN_FILENO,
+                                .ofd_id = fd_next_ofd_id++,
                                 .generation = fd_next_generation++};
     fd_table[1] = (fd_entry_t) {.type = FD_STDIO,
                                 .host_fd = STDOUT_FILENO,
+                                .ofd_id = fd_next_ofd_id++,
                                 .generation = fd_next_generation++};
     fd_table[2] = (fd_entry_t) {.type = FD_STDIO,
                                 .host_fd = STDERR_FILENO,
+                                .ofd_id = fd_next_ofd_id++,
                                 .generation = fd_next_generation++};
     /* The compound literals above zero can_block; recover the real value so a
      * terminal stdin still routes reads through the interruptible wait.
@@ -329,10 +338,21 @@ int fd_alloc_dir_at(int fd,
  *
  * Returns -1 if none available or RLIMIT_NOFILE would be exceeded.
  */
-int fd_alloc_from(int minfd, int type, int host_fd, void (*cleanup)(int))
+int fd_alloc_from(int minfd,
+                  int type,
+                  int host_fd,
+                  void (*cleanup)(int),
+                  uint64_t *out_gen)
 {
     pthread_mutex_lock(&fd_lock);
     int fd = fd_alloc_locked(minfd, type, host_fd, cleanup);
+    /* Capture the freshly-stamped generation inside the allocating critical
+     * section. Callers (dup) later revalidate it under fd_lock to prove the
+     * slot still holds this allocation and was not closed+reopened in the
+     * window, which a (type, host_fd) tuple alone cannot detect.
+     */
+    if (out_gen && fd >= 0)
+        *out_gen = fd_table[fd].generation;
     pthread_mutex_unlock(&fd_lock);
     return fd;
 }
@@ -340,11 +360,18 @@ int fd_alloc_from(int minfd, int type, int host_fd, void (*cleanup)(int))
 int fd_alloc_from_relaxed(int minfd,
                           int type,
                           int host_fd,
-                          void (*cleanup)(int))
+                          void (*cleanup)(int),
+                          uint64_t *out_gen)
 {
     if (!thread_is_single_active())
-        return fd_alloc_from(minfd, type, host_fd, cleanup);
-    return fd_alloc_locked(minfd, type, host_fd, cleanup);
+        return fd_alloc_from(minfd, type, host_fd, cleanup, out_gen);
+    /* Single active thread: no sibling can race the slot, so the unlocked
+     * generation read is safe.
+     */
+    int fd = fd_alloc_locked(minfd, type, host_fd, cleanup);
+    if (out_gen && fd >= 0)
+        *out_gen = fd_table[fd].generation;
+    return fd;
 }
 
 /* Report whether a guest fd slot >= minfd will be free for a fresh allocation
@@ -386,7 +413,11 @@ bool fd_reexec_slot_available(int minfd)
  *
  * Returns -1 if out of range.
  */
-int fd_alloc_at(int fd, int type, int host_fd, void (*cleanup)(int))
+int fd_alloc_at(int fd,
+                int type,
+                int host_fd,
+                void (*cleanup)(int),
+                uint64_t *out_gen)
 {
     if (!RANGE_CHECK(fd, 0, FD_TABLE_SIZE))
         return -1;
@@ -409,6 +440,8 @@ int fd_alloc_at(int fd, int type, int host_fd, void (*cleanup)(int))
         epoll_note_fd_closed(fd);
     }
     fd_init_entry(fd, type, host_fd, cleanup);
+    if (out_gen)
+        *out_gen = fd_table[fd].generation;
     pthread_mutex_unlock(&fd_lock);
 
     /* Clean up old resources outside fd_lock */
@@ -418,19 +451,28 @@ int fd_alloc_at(int fd, int type, int host_fd, void (*cleanup)(int))
     return fd;
 }
 
-int fd_alloc_at_relaxed(int fd, int type, int host_fd, void (*cleanup)(int))
+int fd_alloc_at_relaxed(int fd,
+                        int type,
+                        int host_fd,
+                        void (*cleanup)(int),
+                        uint64_t *out_gen)
 {
     if (!RANGE_CHECK(fd, 0, FD_TABLE_SIZE))
         return -1;
     if (fd >= rlimit_nofile_cur)
         return -1;
     if (!thread_is_single_active())
-        return fd_alloc_at(fd, type, host_fd, cleanup);
+        return fd_alloc_at(fd, type, host_fd, cleanup, out_gen);
 
     if (fd_table[fd].type != FD_CLOSED)
-        return fd_alloc_at(fd, type, host_fd, cleanup);
+        return fd_alloc_at(fd, type, host_fd, cleanup, out_gen);
 
+    /* Single active thread: no sibling can race the slot, so the unlocked init
+     * and generation read are safe.
+     */
     fd_init_entry(fd, type, host_fd, cleanup);
+    if (out_gen)
+        *out_gen = fd_table[fd].generation;
     return fd;
 }
 
@@ -448,10 +490,13 @@ void fd_mark_closed_unlocked(int fd)
     shim_globals_mark_urandom_fd(fd, false);
     fd_table[fd].type = FD_CLOSED;
     fd_table[fd].host_fd = -1;
+    fd_table[fd].ofd_id = 0;
     fd_table[fd].dir = NULL;
     fd_table[fd].proc_path[0] = '\0';
     fd_table[fd].linux_flags = 0;
     fd_table[fd].seals = 0;
+    fd_table[fd].fasync_owner_type = FASYNC_OWNER_NONE;
+    fd_table[fd].fasync_owner = 0;
     fd_bitmap_set_free(fd);
 
     /* Drop this fd from any epoll interest table. Matches Linux auto-removal on
@@ -672,6 +717,15 @@ void fd_cleanup_entry(int guest_fd, const fd_entry_t *snap)
      * still-live host master fd. No-op for non-pty fds.
      */
     proc_pty_close_keepalive(snap->host_fd);
+
+    /* Deregister any SIGIO/SIGURG readiness watch before the host fd closes.
+     * Closing the fd auto-removes the knote too, but doing it explicitly avoids
+     * a stale event landing on a host fd number reused by a racing open.
+     */
+    if ((snap->linux_flags & LINUX_O_ASYNC) ||
+        (snap->type == FD_SOCKET &&
+         snap->fasync_owner_type != FASYNC_OWNER_NONE))
+        asyncio_disarm(snap->host_fd);
 
     /* Keep stdin/stdout/stderr open on the host */
     if (snap->type != FD_STDIO)

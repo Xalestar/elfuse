@@ -38,6 +38,7 @@
 #include "runtime/thread.h"
 
 #include "syscall/abi.h"
+#include "syscall/asyncio.h"
 #include "syscall/fd.h"
 #include "syscall/fuse.h"
 #include "syscall/internal.h"
@@ -1251,26 +1252,26 @@ static int64_t single_guest_iov(guest_t *g,
 }
 
 /* Linux returns 0 for zero-iovcnt vector I/O once the fd validates:
- * import_iovec() yields an empty iterator and do_iter_read/do_iter_write
- * return before the file offset is touched, so even pwritev2(RWF_APPEND)
- * leaves the position alone. macOS readv/writev instead reject iovcnt == 0
- * with EINVAL, so short-circuit before any host call -- the append path's
- * SEEK_END would otherwise move the shared offset. The iov pointer is not
- * dereferenced (Linux ignores it for an empty vector), and negative counts
- * keep flowing into host_iov_prepare's EINVAL.
+ * import_iovec() yields an empty iterator and do_iter_read/do_iter_write return
+ * before the file offset is touched, so even pwritev2(RWF_APPEND) leaves the
+ * position alone. macOS readv/writev instead reject iovcnt == 0 with EINVAL, so
+ * short-circuit before any host call -- the append path's SEEK_END would
+ * otherwise move the shared offset. The iov pointer is not dereferenced (Linux
+ * ignores it for an empty vector), and negative counts keep flowing into
+ * host_iov_prepare's EINVAL.
  *
  * The checks Linux runs before its empty-vector return still apply, in this
  * order: the positional variants fail non-seekable files with ESPIPE
  * (FMODE_PREAD/FMODE_PWRITE in do_preadv/do_pwritev), and all variants fail
  * wrong-direction fds with EBADF (FMODE_READ/FMODE_WRITE in
- * do_iter_read/do_iter_write). Both are probed on the host fd, whose open
- * mode mirrors the guest's for host-backed types; fd_table linux_flags
- * cannot be used because pipe/socket entries only track CLOEXEC there.
- * Virtual multiplexed fds (eventfd/timerfd/signalfd/...) sit on host pipes
- * or kqueues whose mode says nothing about the guest-visible fd (the Linux
- * anon-inode equivalents are O_RDWR), so they validate existence only. No
- * F_SEAL_WRITE check: Linux never reaches the write path for an empty
- * vector, so a write-sealed memfd returns 0 here too.
+ * do_iter_read/do_iter_write). Both are probed on the host fd, whose open mode
+ * mirrors the guest's for host-backed types; fd_table linux_flags cannot be
+ * used because pipe/socket entries only track CLOEXEC there. Virtual
+ * multiplexed fds (eventfd/timerfd/signalfd/...) sit on host pipes or kqueues
+ * whose mode says nothing about the guest-visible fd (the Linux anon-inode
+ * equivalents are O_RDWR), so they validate existence only. No F_SEAL_WRITE
+ * check: Linux never reaches the write path for an empty vector, so a
+ * write-sealed memfd returns 0 here too.
  */
 static int64_t vec_zero_iovcnt(int fd, bool op_is_write, bool positional)
 {
@@ -1482,8 +1483,8 @@ int64_t sys_preadv(guest_t *g,
 {
     if (iovcnt == 0) {
         /* do_preadv rejects a negative offset before looking up the fd, so
-         * EINVAL outranks EBADF here; nonzero counts keep getting EINVAL
-         * from the host preadv instead.
+         * EINVAL outranks EBADF here; nonzero counts keep getting EINVAL from
+         * the host preadv instead.
          */
         if (offset < 0)
             return -LINUX_EINVAL;
@@ -1629,9 +1630,9 @@ int64_t sys_preadv2(guest_t *g,
 {
     /* Linux validates RWF flags only once the write/read actually proceeds
      * (kiocb_set_rw_flags sits behind the empty-vector return in
-     * do_iter_read/do_iter_write), so an empty vector short-circuits before
-     * the flag checks. Offset -1 selects do_readv (no seekability check);
-     * any other negative offset fails EINVAL before the fd lookup.
+     * do_iter_read/do_iter_write), so an empty vector short-circuits before the
+     * flag checks. Offset -1 selects do_readv (no seekability check); any other
+     * negative offset fails EINVAL before the fd lookup.
      */
     if (iovcnt == 0) {
         if (offset < -1)
@@ -1982,21 +1983,23 @@ int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg)
     }
 
     case LINUX_FIOASYNC: {
-        /* Set/clear O_ASYNC (SIGIO-driven I/O). nginx's ngx_spawn_process arms
-         * this on the master's channel socket right before fork() and treats a
-         * failure as fatal (ngx_close_channel + return NGX_INVALID_PID), so
-         * answering ENOTTY here aborts worker spawning entirely -- the master
-         * is left with no workers and accepted connections are never serviced.
-         * elfuse does not forward host SIGIO into the guest, and nginx workers
-         * receive both client I/O and channel commands via epoll rather than
-         * SIGIO, so accept the request as a no-op: read the int arg for EFAULT
-         * parity and report success without arming host async delivery.
+        /* Set/clear O_ASYNC (SIGIO-driven I/O). This is the ioctl form of
+         * fcntl(F_SETFL, O_ASYNC): unify both onto the same armed bit and
+         * kqueue watcher (asyncio.c) so the two entry points cannot drift.
+         * Snapshot only for the slot generation; asyncio_apply rescans under
+         * fd_lock for each alias's backing fd and class.
          */
         int32_t on = 0;
         if (guest_read_small(g, arg, &on, sizeof(on)) < 0) {
             host_fd_ref_close(&host_ref);
             return -LINUX_EFAULT;
         }
+        fd_entry_t snap;
+        if (!fd_snapshot(fd, &snap)) {
+            host_fd_ref_close(&host_ref);
+            return -LINUX_EBADF;
+        }
+        asyncio_apply(fd, snap.generation, on != 0);
         host_fd_ref_close(&host_ref);
         return 0;
     }

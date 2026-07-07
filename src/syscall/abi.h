@@ -690,6 +690,11 @@ typedef struct {
 #define LINUX_F_ADD_SEALS 1033
 #define LINUX_F_GET_SEALS 1034
 
+/* f_owner_ex.type values for F_SETOWN_EX / F_GETOWN_EX (Linux uapi). */
+#define LINUX_F_OWNER_TID 0
+#define LINUX_F_OWNER_PID 1
+#define LINUX_F_OWNER_PGRP 2
+
 /* Socket option cache indices. Keep in sync with SOCK_OPT_COUNT. */
 enum {
     SOCK_OPT_KEEPALIVE,
@@ -731,8 +736,9 @@ typedef struct {
 } sock_opt_cache_t;
 
 typedef struct {
-    int type;            /* FD_CLOSED, FD_STDIO, FD_REGULAR, FD_DIR */
-    int host_fd;         /* Underlying macOS file descriptor */
+    int type;        /* FD_CLOSED, FD_STDIO, FD_REGULAR, FD_DIR */
+    int host_fd;     /* Underlying macOS file descriptor */
+    uint64_t ofd_id; /* Shared by dup aliases of one open file description */
     uint64_t generation; /* Bumped each time this guest fd slot is reused. Lets
                           * long-lived references (e.g. epoll registrations)
                           * detect a close+reopen ABA where the slot now holds a
@@ -747,6 +753,8 @@ typedef struct {
                      * once at allocation via fstat so the interruptible wait
                      * path can skip fds that never block.
                      */
+    int32_t fasync_owner_type; /* FASYNC_OWNER_* recipient kind (0 = none) */
+    int32_t fasync_owner;      /* pid/pgrp/tid for SIGIO/SIGURG delivery */
     sock_opt_cache_t sock; /* Socket option cache (zeroed for non-sockets) */
     void (*cleanup)(int guest_fd); /* Type-specific teardown (NULL if none) */
 } fd_entry_t;

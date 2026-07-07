@@ -746,11 +746,11 @@ int eventfd_dup_fd(int src_fd,
      * eventfd_owner mapping is still -1, so a racing close here observes owner
      * == -1 and does nothing; we detect that below.
      */
-    int new_guest_fd = fixed_slot
-                           ? fd_alloc_at_relaxed(fixed_guest_fd, FD_EVENTFD,
-                                                 new_host_fd, eventfd_close)
-                           : fd_alloc_from_relaxed(min_guest_fd, FD_EVENTFD,
-                                                   new_host_fd, eventfd_close);
+    int new_guest_fd =
+        fixed_slot ? fd_alloc_at_relaxed(fixed_guest_fd, FD_EVENTFD,
+                                         new_host_fd, eventfd_close, NULL)
+                   : fd_alloc_from_relaxed(min_guest_fd, FD_EVENTFD,
+                                           new_host_fd, eventfd_close, NULL);
     if (new_guest_fd < 0) {
         close(new_host_fd);
         pthread_mutex_lock(&sfd_lock);

@@ -29,6 +29,7 @@
 #include "runtime/procemu.h"
 
 #include "syscall/abi.h"
+#include "syscall/asyncio.h"
 #include "syscall/chown-overlay.h"
 #include "syscall/fd.h" /* eventfd_dup_fd */
 #include "syscall/fuse.h"
@@ -217,11 +218,11 @@ static const char *proc_virtual_dir_path(const char *path,
 }
 
 /* Reference-counted wrapper around a directory stream. See the declaration in
- * syscall/internal.h for why this exists: a raw DIR* stored in
- * fd_table[fd].dir would let a sibling close()/dup2()/fork-restore free it via
- * closedir() while sys_getdents64() is still mid-loop reading it. The struct
- * itself is private to this file; every other module only ever sees the
- * opaque void* that fd_table[].dir already stores.
+ * syscall/internal.h for why this exists: a raw DIR* stored in fd_table[fd].dir
+ * would let a sibling close()/dup2()/fork-restore free it via closedir() while
+ * sys_getdents64() is still mid-loop reading it. The struct itself is private
+ * to this file; every other module only ever sees the opaque void* that
+ * fd_table[].dir already stores.
  */
 typedef struct {
     DIR *dir;
@@ -244,8 +245,10 @@ typedef struct {
 } dir_stream_t;
 
 /* Wrap an already-open DIR* for storage in fd_table[].dir. Takes ownership of
- * dir on success. Returns NULL on allocation failure, in which case the
- * caller still owns dir and must closedir() it.
+ * dir on success.
+ *
+ * Returns NULL on allocation failure, in which case the caller still owns dir
+ * and must closedir() it.
  */
 void *dir_stream_create(DIR *dir)
 {
@@ -272,9 +275,10 @@ static void dir_stream_discard(void *ds_ptr)
 }
 
 /* Pin fd's directory stream against a concurrent close()/dup2() so
- * sys_getdents64 can safely walk it. Returns the pinned wrapper, or NULL if
- * fd is not (or no longer) an open FD_DIR. Balance every non-NULL return with
- * dir_stream_release().
+ * sys_getdents64 can safely walk it.
+ *
+ * Returns the pinned wrapper, or NULL if fd is not (or no longer) an open
+ * FD_DIR. Balance every non-NULL return with dir_stream_release().
  */
 static dir_stream_t *dir_stream_acquire(int fd)
 {
@@ -293,9 +297,9 @@ static dir_stream_t *dir_stream_acquire(int fd)
 
 /* Drop a reference taken by dir_stream_acquire(), or the fd-table's own
  * reference from fd_cleanup_entry(). No-op when passed NULL. The decrement
- * happens under fd_lock; the actual closedir()/free() runs after releasing
- * it, matching fd_cleanup_entry's own "do not hold fd_lock across slow
- * syscalls" convention.
+ * happens under fd_lock; the actual closedir()/free() runs after releasing it,
+ * matching fd_cleanup_entry's own "do not hold fd_lock across slow syscalls"
+ * convention.
  */
 void dir_stream_release(void *ds_ptr)
 {
@@ -342,8 +346,8 @@ static int fd_alloc_opened_host(int host_fd,
 
     int guest_fd =
         min_guest_fd >= 0
-            ? fd_alloc_from_relaxed(min_guest_fd, type, host_fd, cleanup)
-            : fd_alloc_from_relaxed(0, type, host_fd, cleanup);
+            ? fd_alloc_from_relaxed(min_guest_fd, type, host_fd, cleanup, NULL)
+            : fd_alloc_from_relaxed(0, type, host_fd, cleanup, NULL);
     if (guest_fd < 0) {
         int saved_errno = errno;
         if (ds)
@@ -788,7 +792,8 @@ static bool install_fd_alias_metadata_atomic(int dst_fd,
                                              int expected_host_fd,
                                              const fd_entry_t *src_snap,
                                              int linux_flags,
-                                             dir_stream_t *ds)
+                                             dir_stream_t *ds,
+                                             uint64_t expected_gen)
 {
     /* LINUX_O_NONBLOCK is a file-status flag preserved by dup(2)/dup2(2).
      * Required for FD_TIMERFD (and any other type that stores NONBLOCK in
@@ -798,14 +803,23 @@ static bool install_fd_alias_metadata_atomic(int dst_fd,
     int preserved_flags =
         src_snap->linux_flags &
         (LINUX_O_ACCMODE | LINUX_O_PATH | LINUX_O_DIRECTORY | LINUX_O_NOFOLLOW |
-         LINUX_O_DIRECT | LINUX_O_LARGEFILE | LINUX_O_NONBLOCK);
+         LINUX_O_DIRECT | LINUX_O_LARGEFILE | LINUX_O_NONBLOCK | LINUX_O_ASYNC);
     int final_flags = preserved_flags | linux_flags;
 
     bool installed = false;
     pthread_mutex_lock(&fd_lock);
+    /* Generation is the unique discriminator: a close+reopen can reuse the same
+     * (type, host_fd) tuple, so only the monotonic generation stamped at alloc
+     * proves this is still the slot this dup created (matches asyncio_apply /
+     * fasync_owner_set). The tuple check stays as a cheap early-out.
+     */
     if (fd_table[dst_fd].type == expected_type &&
-        fd_table[dst_fd].host_fd == expected_host_fd) {
+        fd_table[dst_fd].host_fd == expected_host_fd &&
+        fd_table[dst_fd].generation == expected_gen) {
         fd_table[dst_fd].linux_flags = final_flags;
+        fd_table[dst_fd].ofd_id = src_snap->ofd_id;
+        fd_table[dst_fd].fasync_owner_type = src_snap->fasync_owner_type;
+        fd_table[dst_fd].fasync_owner = src_snap->fasync_owner;
         fd_table[dst_fd].seals = src_snap->seals;
         memcpy(fd_table[dst_fd].proc_path, src_snap->proc_path,
                sizeof(fd_table[dst_fd].proc_path));
@@ -899,10 +913,12 @@ static int duplicate_guest_fd(int src_fd,
 
     int new_type = (src_snap.type == FD_STDIO) ? FD_REGULAR : src_snap.type;
     void (*cleanup)(int) = fd_cleanup_for_type(new_type);
-    int guest_fd = fixed_slot ? fd_alloc_at_relaxed(fixed_guest_fd, new_type,
-                                                    new_host_fd, cleanup)
-                              : fd_alloc_from_relaxed(min_guest_fd, new_type,
-                                                      new_host_fd, cleanup);
+    uint64_t alloc_gen = 0;
+    int guest_fd =
+        fixed_slot ? fd_alloc_at_relaxed(fixed_guest_fd, new_type, new_host_fd,
+                                         cleanup, &alloc_gen)
+                   : fd_alloc_from_relaxed(min_guest_fd, new_type, new_host_fd,
+                                           cleanup, &alloc_gen);
     if (guest_fd < 0) {
         if (fixed_slot)
             errno = EBADF;
@@ -915,9 +931,9 @@ static int duplicate_guest_fd(int src_fd,
     }
 
     /* Clone the DIR stream outside fd_lock (dup + fdopendir would block other
-     * fd ops), then install everything atomically under fd_lock with a tuple
-     * verification so a sibling close + reopen on the same guest_fd cannot make
-     * this install land on an unrelated slot.
+     * fd ops), then install everything atomically under fd_lock with a
+     * generation verification so a sibling close + reopen on the same guest_fd
+     * cannot make this install land on an unrelated slot.
      */
     bool dir_clone_failed = false;
     dir_stream_t *ds =
@@ -930,7 +946,8 @@ static int duplicate_guest_fd(int src_fd,
     }
 
     if (!install_fd_alias_metadata_atomic(guest_fd, new_type, new_host_fd,
-                                          &src_snap, linux_flags, ds)) {
+                                          &src_snap, linux_flags, ds,
+                                          alloc_gen)) {
         /* Slot was reallocated by a sibling while metadata install was pending;
          * the sibling's close path already cleaned up new_host_fd via
          * fd_cleanup_entry, so the only resource this side still owns is the
@@ -938,6 +955,15 @@ static int duplicate_guest_fd(int src_fd,
          */
         if (ds)
             dir_stream_discard(ds);
+    } else if ((src_snap.linux_flags & LINUX_O_ASYNC) ||
+               (src_snap.type == FD_SOCKET &&
+                src_snap.fasync_owner_type != FASYNC_OWNER_NONE)) {
+        /* dup shares O_ASYNC (per open-file-description); register the alias
+         * with the readiness watcher. install only returns true when the slot
+         * still carries alloc_gen, so arming with it drops any stale event from
+         * a sibling close+reuse in this window.
+         */
+        asyncio_arm(guest_fd, alloc_gen, new_host_fd, new_type);
     }
 
     return guest_fd;
@@ -1078,6 +1104,10 @@ int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg)
         linux_fl |= fd_snap.linux_flags &
                     (LINUX_O_PATH | LINUX_O_DIRECTORY | LINUX_O_NOFOLLOW |
                      LINUX_O_DIRECT | LINUX_O_LARGEFILE);
+        /* O_ASYNC is tracked in the shadow (never armed on the host fd), so
+         * surface it from there. See linux_to_mac_status_flags in translate.c.
+         */
+        linux_fl |= fd_snap.linux_flags & LINUX_O_ASYNC;
         return linux_fl;
     }
     case 4: /* F_SETFL */
@@ -1109,6 +1139,7 @@ int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg)
                                            LINUX_O_NOFOLLOW | LINUX_O_DIRECT |
                                            LINUX_O_LARGEFILE));
             pthread_mutex_unlock(&fd_lock);
+            asyncio_apply(fd, fd_snap.generation, ((int) arg & LINUX_O_ASYNC));
             return 0;
         }
         /* Timerfd: kqueue host fd rejects fcntl(F_SETFL), so mirror Linux's
@@ -1145,8 +1176,19 @@ int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg)
             return -LINUX_EBADF;
         int rc =
             fcntl(host_ref.fd, F_SETFL, linux_to_mac_status_flags((int) arg));
+        if (rc < 0) {
+            int64_t err = linux_errno();
+            host_fd_ref_close(&host_ref);
+            return err;
+        }
+        /* O_ASYNC is elfuse-managed: track the armed bit and (dis)arm the SIGIO
+         * watcher. asyncio_apply rescans the slot under fd_lock and uses each
+         * alias's real backing fd, not host_ref.fd (a per-syscall dup for
+         * multi-threaded callers).
+         */
+        asyncio_apply(fd, fd_snap.generation, ((int) arg & LINUX_O_ASYNC));
         host_fd_ref_close(&host_ref);
-        return rc < 0 ? linux_errno() : 0;
+        return 0;
     }
     case 5:   /* F_GETLK */
     case 6:   /* F_SETLK */
@@ -1243,38 +1285,97 @@ int64_t sys_fcntl(guest_t *g, int fd, int cmd, uint64_t arg)
         host_fd_ref_close(&host_ref);
         return 0;
     }
-    case 8: /* F_SETOWN */
-        /* SIGIO/SIGURG delivery owner. nginx's ngx_spawn_process pairs
-         * ioctl(FIOASYNC) with fcntl(F_SETOWN) on the channel socket before
-         * fork() and aborts the worker (NGX_INVALID_PID) if either fails.
-         * elfuse does not deliver host SIGIO into the guest (see LINUX_FIOASYNC
-         * in sys_ioctl), so no owner is tracked: accept the request as a no-op.
-         * F_SETOWN's arg is the owner pid passed by value, so there is no user
-         * pointer to validate.
+    case 8: { /* F_SETOWN */
+        /* SIGIO/SIGURG delivery owner. The arg is a signed value passed by
+         * value: pid > 0 targets a process, pid < 0 targets a process group,
+         * pid == 0 clears the owner. Stored per open-file-description so the
+         * async watcher (asyncio.c) can resolve the recipient on readiness.
          */
+        int a = (int) arg;
+        int otype, owner;
+        if (a > 0) {
+            otype = FASYNC_OWNER_PID;
+            owner = a;
+        } else if (a < 0) {
+            /* Guard INT_MIN: -a would overflow (signed UB). A process group id
+             * with no representable magnitude cannot name a real pgrp.
+             */
+            if (a == INT32_MIN)
+                return -LINUX_EINVAL;
+            otype = FASYNC_OWNER_PGRP;
+            owner = -a;
+        } else {
+            otype = FASYNC_OWNER_NONE;
+            owner = 0;
+        }
+        fasync_owner_set(fd, fd_snap.generation, otype, owner);
         return 0;
+    }
     case 15: { /* F_SETOWN_EX */
-        /* Same no-op owner semantics as F_SETOWN, but the arg is a struct
-         * f_owner_ex { int type; int pid; } pointer that Linux reads before
-         * applying. Read it through so a bad guest pointer faults with EFAULT
-         * rather than silently succeeding; the value is then discarded.
+        /* Struct f_owner_ex { int type; int pid; } pointer. Read it through so
+         * a bad guest pointer faults with EFAULT, translate the Linux owner
+         * type, and store it. pid == 0 clears the owner.
          */
         int32_t owner_ex[2];
         if (guest_read_small(g, arg, owner_ex, sizeof(owner_ex)) < 0)
             return -LINUX_EFAULT;
+        int otype;
+        switch (owner_ex[0]) {
+        case LINUX_F_OWNER_TID:
+            otype = FASYNC_OWNER_TID;
+            break;
+        case LINUX_F_OWNER_PID:
+            otype = FASYNC_OWNER_PID;
+            break;
+        case LINUX_F_OWNER_PGRP:
+            otype = FASYNC_OWNER_PGRP;
+            break;
+        default:
+            return -LINUX_EINVAL;
+        }
+        /* F_SETOWN_EX carries the recipient in the type field, so the pid is a
+         * plain positive identifier: a negative pid is invalid (Linux owner
+         * semantics), and 0 clears the owner.
+         */
+        if (owner_ex[1] < 0)
+            return -LINUX_EINVAL;
+        if (owner_ex[1] == 0)
+            otype = FASYNC_OWNER_NONE;
+        fasync_owner_set(fd, fd_snap.generation, otype, owner_ex[1]);
         return 0;
     }
-    case 9: /* F_GETOWN */
-        /* No owner tracked; report none. */
-        return 0;
-    case 16: { /* F_GETOWN_EX */
-        /* glibc implements fcntl(F_GETOWN) on top of F_GETOWN_EX, so this must
-         * answer coherently with the F_SETOWN no-op above rather than EINVAL
-         * (which would make F_GETOWN fail under glibc). Report "owned by no
-         * specific process": struct f_owner_ex { int type; int pid; } with
-         * type=F_OWNER_PID(1), pid=0.
+    case 9: { /* F_GETOWN */
+        /* Derive the signed owner from the stored f_owner_ex: pid for PID/TID,
+         * negated pgrp for PGRP, 0 when unowned.
          */
-        int32_t owner_ex[2] = {1 /* F_OWNER_PID */, 0 /* pid */};
+        int otype, owner;
+        fasync_owner_get(fd, fd_snap.generation, &otype, &owner);
+        if (otype == FASYNC_OWNER_PGRP)
+            return -owner;
+        if (otype == FASYNC_OWNER_NONE)
+            return 0;
+        return owner;
+    }
+    case 16: { /* F_GETOWN_EX */
+        /* struct f_owner_ex { int type; int pid; }. Report the stored owner;
+         * unowned reads back as {F_OWNER_PID, 0} to stay coherent with the
+         * F_GETOWN path glibc layers on top of this.
+         */
+        int otype, owner;
+        fasync_owner_get(fd, fd_snap.generation, &otype, &owner);
+        int32_t owner_ex[2];
+        switch (otype) {
+        case FASYNC_OWNER_TID:
+            owner_ex[0] = LINUX_F_OWNER_TID;
+            break;
+        case FASYNC_OWNER_PGRP:
+            owner_ex[0] = LINUX_F_OWNER_PGRP;
+            break;
+        default:
+            owner_ex[0] = LINUX_F_OWNER_PID;
+            break;
+        }
+        owner_ex[1] = (otype == FASYNC_OWNER_NONE) ? 0 : owner;
         if (guest_write_small(g, arg, owner_ex, sizeof(owner_ex)) < 0)
             return -LINUX_EFAULT;
         return 0;

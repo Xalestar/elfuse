@@ -97,6 +97,8 @@ typedef struct {
 
 typedef struct {
     int32_t guest_fd, type, linux_flags, seals;
+    uint64_t ofd_id;
+    int32_t fasync_owner_type, fasync_owner;
     char proc_path[FD_VIRTUAL_PATH_MAX];
 } ipc_fd_entry_t;
 

@@ -22,6 +22,7 @@
 
 #include "debug/log.h"
 #include "syscall/abi.h"
+#include "syscall/asyncio.h"
 #include "syscall/internal.h"
 #include "syscall/io.h"
 #include "syscall/mem.h"
@@ -296,6 +297,9 @@ int fork_ipc_send_fd_table(int ipc_sock)
         fd_entries[num_fds].type = fd_table[i].type;
         fd_entries[num_fds].linux_flags = fd_table[i].linux_flags;
         fd_entries[num_fds].seals = fd_table[i].seals;
+        fd_entries[num_fds].ofd_id = fd_table[i].ofd_id;
+        fd_entries[num_fds].fasync_owner_type = fd_table[i].fasync_owner_type;
+        fd_entries[num_fds].fasync_owner = fd_table[i].fasync_owner;
         memcpy(fd_entries[num_fds].proc_path, fd_table[i].proc_path,
                sizeof(fd_entries[num_fds].proc_path));
         host_fds_to_send[num_fds] = host_fd;
@@ -397,10 +401,21 @@ int fork_ipc_recv_fd_table(int ipc_fd, guest_t *g)
         return -1;
     }
 
+    uint64_t parent_ofds[FD_TABLE_SIZE], child_ofds[FD_TABLE_SIZE];
+    uint32_t ofd_maps = 0;
+
     for (uint32_t i = 0; i < num_fds; i++) {
         int gfd = fd_entries[i].guest_fd;
         if (!RANGE_CHECK(gfd, 0, FD_TABLE_SIZE))
             continue;
+
+        uint64_t child_ofd = 0;
+        for (uint32_t j = 0; j < ofd_maps; j++) {
+            if (parent_ofds[j] == fd_entries[i].ofd_id) {
+                child_ofd = child_ofds[j];
+                break;
+            }
+        }
 
         if (fd_entries[i].type == FD_STDIO) {
             close(host_fds[i]);
@@ -426,7 +441,7 @@ int fork_ipc_recv_fd_table(int ipc_fd, guest_t *g)
             continue;
         } else {
             void (*cleanup)(int) = fd_cleanup_for_type(fd_entries[i].type);
-            fd_alloc_at(gfd, fd_entries[i].type, host_fds[i], cleanup);
+            fd_alloc_at(gfd, fd_entries[i].type, host_fds[i], cleanup, NULL);
             fd_table[gfd].linux_flags = fd_entries[i].linux_flags;
             fd_refresh_urandom_bitmap(gfd);
             memcpy(fd_table[gfd].proc_path, fd_entries[i].proc_path,
@@ -435,43 +450,58 @@ int fork_ipc_recv_fd_table(int ipc_fd, guest_t *g)
             if (fd_entries[i].type == FD_URANDOM)
                 urandom_fd_reset_cache(gfd);
 
-            if (fd_entries[i].type != FD_DIR)
-                continue;
-            /* Rebuild the directory stream. Every failure below must close
-             * the slot rather than leave it published as FD_DIR with
-             * dir=NULL: such a slot never faults, but sys_getdents64 would
-             * report ENOTDIR on it for the child's whole lifetime, masking
-             * the restore failure as a valid-but-broken fd. A closed slot
-             * yields EBADF, an honest signal that the fd did not survive
-             * the fork.
-             */
-            int dir_fd = dup(host_fds[i]);
-            if (dir_fd < 0) {
-                log_error("fork-child: dup failed for DIR gfd %d: %s", gfd,
-                          strerror(errno));
-                close(host_fds[i]);
-                fd_mark_closed(gfd);
-                continue;
+            if (fd_entries[i].type == FD_DIR) {
+                /* Rebuild the directory stream. Every failure below must close
+                 * the slot rather than leave it published as FD_DIR with
+                 * dir=NULL: such a slot never faults, but sys_getdents64 would
+                 * report ENOTDIR on it for the child's whole lifetime, masking
+                 * the restore failure as a valid-but-broken fd. A closed slot
+                 * yields EBADF, an honest signal that the fd did not survive
+                 * the fork.
+                 */
+                int dir_fd = dup(host_fds[i]);
+                if (dir_fd < 0) {
+                    log_error("fork-child: dup failed for DIR gfd %d: %s", gfd,
+                              strerror(errno));
+                    close(host_fds[i]);
+                    fd_mark_closed(gfd);
+                    continue;
+                }
+                DIR *dir = fdopendir(dir_fd);
+                if (!dir) {
+                    close(dir_fd);
+                    log_error("fork-child: fdopendir failed for gfd %d", gfd);
+                    close(host_fds[i]);
+                    fd_mark_closed(gfd);
+                    continue;
+                }
+                void *ds = dir_stream_create(dir);
+                if (!ds) {
+                    closedir(dir);
+                    log_error("fork-child: dir_stream_create failed for gfd %d",
+                              gfd);
+                    close(host_fds[i]);
+                    fd_mark_closed(gfd);
+                    continue;
+                }
+                fd_table[gfd].dir = ds;
             }
-            DIR *dir = fdopendir(dir_fd);
-            if (!dir) {
-                close(dir_fd);
-                log_error("fork-child: fdopendir failed for gfd %d", gfd);
-                close(host_fds[i]);
-                fd_mark_closed(gfd);
-                continue;
-            }
-            void *ds = dir_stream_create(dir);
-            if (!ds) {
-                closedir(dir);
-                log_error("fork-child: dir_stream_create failed for gfd %d",
-                          gfd);
-                close(host_fds[i]);
-                fd_mark_closed(gfd);
-                continue;
-            }
-            fd_table[gfd].dir = ds;
         }
+
+        if (!child_ofd && fd_entries[i].ofd_id) {
+            child_ofd = fd_table[gfd].ofd_id;
+            parent_ofds[ofd_maps] = fd_entries[i].ofd_id;
+            child_ofds[ofd_maps++] = child_ofd;
+        }
+        if (child_ofd)
+            fd_table[gfd].ofd_id = child_ofd;
+        fd_table[gfd].fasync_owner_type = fd_entries[i].fasync_owner_type;
+        fd_table[gfd].fasync_owner = fd_entries[i].fasync_owner;
+        if ((fd_table[gfd].linux_flags & LINUX_O_ASYNC) ||
+            (fd_table[gfd].type == FD_SOCKET &&
+             fd_table[gfd].fasync_owner_type != FASYNC_OWNER_NONE))
+            asyncio_arm(gfd, fd_table[gfd].generation, fd_table[gfd].host_fd,
+                        fd_table[gfd].type);
     }
 
     free(host_fds);

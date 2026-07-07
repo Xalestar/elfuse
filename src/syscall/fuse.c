@@ -23,6 +23,7 @@
 #include "runtime/procemu.h"
 
 #include "syscall/abi.h"
+#include "syscall/asyncio.h"
 #include "syscall/fuse.h"
 #include "syscall/internal.h"
 #include "syscall/path.h"
@@ -244,6 +245,7 @@ typedef struct {
     bool closed;
     bool daemon_dead;
     bool init_done;
+    int notify_wr;
     uint32_t max_write;
     uint16_t max_pages;
     uint64_t next_unique;
@@ -513,10 +515,29 @@ static void fuse_session_put_locked(fuse_session_t *session)
 {
     if (--session->refcount > 0)
         return;
+    if (session->notify_wr >= 0)
+        close(session->notify_wr);
     pthread_mutex_destroy(&session->lock);
     pthread_cond_destroy(&session->queue_cond);
     pthread_cond_destroy(&session->init_cond);
     memset(session, 0, sizeof(*session));
+}
+
+static void fuse_notify_readable_locked(fuse_session_t *session)
+{
+    if (session->notify_wr < 0)
+        return;
+    uint8_t byte = 1;
+    write(session->notify_wr, &byte, 1);
+}
+
+static void fuse_notify_drain_fd_locked(int fd)
+{
+    if (fd < 0)
+        return;
+    uint8_t byte;
+    while (read(fd, &byte, 1) > 0)
+        ;
 }
 
 static fuse_mount_t *fuse_mount_for_path_locked(const char *path,
@@ -730,11 +751,14 @@ static int fuse_queue_request_locked(fuse_session_t *session,
     if (payload_len)
         memcpy(req->frame + sizeof(*hdr), payload, payload_len);
 
+    bool was_empty = session->queue_head == NULL;
     if (session->queue_tail)
         session->queue_tail->next = req;
     else
         session->queue_head = req;
     session->queue_tail = req;
+    if (was_empty)
+        fuse_notify_readable_locked(session);
     pthread_cond_broadcast(&session->queue_cond);
     if (req_out)
         *req_out = req;
@@ -1298,6 +1322,7 @@ int fuse_proc_open(int linux_flags)
             pthread_mutex_init(&slot->lock, NULL);
             pthread_cond_init(&slot->queue_cond, NULL);
             pthread_cond_init(&slot->init_cond, NULL);
+            slot->notify_wr = -1;
             slot->max_write = 64 * 1024;
             slot->max_pages = 16;
             slot->next_unique = 1;
@@ -1310,8 +1335,22 @@ int fuse_proc_open(int linux_flags)
         return -1;
     }
 
-    int guest_fd = fd_alloc(FD_FUSE_DEV, -1, fuse_fd_cleanup);
+    int notify_pipe[2];
+    if (pipe(notify_pipe) < 0) {
+        pthread_mutex_lock(&fuse_lock);
+        fuse_session_put_locked(slot);
+        pthread_mutex_unlock(&fuse_lock);
+        return -1;
+    }
+    fcntl(notify_pipe[0], F_SETFL, O_NONBLOCK);
+    fcntl(notify_pipe[1], F_SETFL, O_NONBLOCK);
+    fcntl(notify_pipe[0], F_SETFD, FD_CLOEXEC);
+    fcntl(notify_pipe[1], F_SETFD, FD_CLOEXEC);
+    slot->notify_wr = notify_pipe[1];
+
+    int guest_fd = fd_alloc(FD_FUSE_DEV, notify_pipe[0], fuse_fd_cleanup);
     if (guest_fd < 0) {
+        close(notify_pipe[0]);
         pthread_mutex_lock(&fuse_lock);
         fuse_session_put_locked(slot);
         pthread_mutex_unlock(&fuse_lock);
@@ -2199,10 +2238,15 @@ int64_t fuse_dev_read(int guest_fd,
                       uint64_t buf_gva,
                       uint64_t count)
 {
+    host_fd_ref_t notify_ref;
+    if (host_fd_ref_open_io(guest_fd, &notify_ref) < 0)
+        return -LINUX_EBADF;
+
     pthread_mutex_lock(&fuse_lock);
     fuse_session_t *session = fuse_session_by_fd_locked(guest_fd);
     if (!session) {
         pthread_mutex_unlock(&fuse_lock);
+        host_fd_ref_close(&notify_ref);
         return -LINUX_EBADF;
     }
     fuse_session_get_locked(session);
@@ -2215,6 +2259,7 @@ int64_t fuse_dev_read(int guest_fd,
             pthread_mutex_lock(&fuse_lock);
             fuse_session_put_locked(session);
             pthread_mutex_unlock(&fuse_lock);
+            host_fd_ref_close(&notify_ref);
             return -LINUX_EAGAIN;
         }
         pthread_cond_wait(&session->queue_cond, &session->lock);
@@ -2224,6 +2269,7 @@ int64_t fuse_dev_read(int guest_fd,
         pthread_mutex_lock(&fuse_lock);
         fuse_session_put_locked(session);
         pthread_mutex_unlock(&fuse_lock);
+        host_fd_ref_close(&notify_ref);
         return -LINUX_ENOTCONN;
     }
 
@@ -2238,6 +2284,7 @@ int64_t fuse_dev_read(int guest_fd,
         pthread_mutex_lock(&fuse_lock);
         fuse_session_put_locked(session);
         pthread_mutex_unlock(&fuse_lock);
+        host_fd_ref_close(&notify_ref);
         return -LINUX_EINVAL;
     }
     if (guest_write(g, buf_gva, req->frame, frame_len) < 0) {
@@ -2245,6 +2292,7 @@ int64_t fuse_dev_read(int guest_fd,
         pthread_mutex_lock(&fuse_lock);
         fuse_session_put_locked(session);
         pthread_mutex_unlock(&fuse_lock);
+        host_fd_ref_close(&notify_ref);
         return -LINUX_EFAULT;
     }
     /* Commit: dequeue only after the copy succeeded. */
@@ -2252,12 +2300,15 @@ int64_t fuse_dev_read(int guest_fd,
     if (!session->queue_head)
         session->queue_tail = NULL;
     req->next = NULL;
+    if (!session->queue_head)
+        fuse_notify_drain_fd_locked(notify_ref.fd);
     if (req->no_reply)
         fuse_free_request_locked(req);
     pthread_mutex_unlock(&session->lock);
     pthread_mutex_lock(&fuse_lock);
     fuse_session_put_locked(session);
     pthread_mutex_unlock(&fuse_lock);
+    host_fd_ref_close(&notify_ref);
     return (int64_t) frame_len;
 }
 
@@ -2571,11 +2622,18 @@ int fuse_dup_fd(int src_fd,
      * fd_table[guest_fd].cleanup assignment would skip fuse_fd_cleanup and leak
      * the session or file ref.
      */
-    int guest_fd = fixed_slot ? fd_alloc_at_relaxed(fixed_guest_fd, snap.type,
-                                                    -1, fuse_fd_cleanup)
-                              : fd_alloc_from_relaxed(min_guest_fd, snap.type,
-                                                      -1, fuse_fd_cleanup);
+    int new_host_fd = snap.type == FD_FUSE_DEV ? dup(snap.host_fd) : -1;
+    if (snap.type == FD_FUSE_DEV && new_host_fd < 0)
+        return -1;
+    uint64_t alloc_gen = 0;
+    int guest_fd =
+        fixed_slot ? fd_alloc_at_relaxed(fixed_guest_fd, snap.type, new_host_fd,
+                                         fuse_fd_cleanup, &alloc_gen)
+                   : fd_alloc_from_relaxed(min_guest_fd, snap.type, new_host_fd,
+                                           fuse_fd_cleanup, &alloc_gen);
     if (guest_fd < 0) {
+        if (new_host_fd >= 0)
+            close(new_host_fd);
         if (fixed_slot)
             errno = EBADF;
         return -1;
@@ -2618,21 +2676,36 @@ int fuse_dup_fd(int src_fd,
 
     pthread_mutex_unlock(&fuse_lock);
 
-    /* O_NONBLOCK is a file-status flag preserved by dup(2)/dup2(2); without it
-     * a duplicated non-blocking FUSE fd would silently become blocking because
-     * nothing else carries the flag forward.
+    /* Copy the source snapshot, not the live src fd: dup aliases one coherent
+     * open-file-description state even if another thread closes/reuses src_fd
+     * while the FUSE refs are being pinned.
      *
-     * Take fd_lock once for both the source read and the destination write so
-     * the dup snapshot is consistent with any concurrent F_SETFL on the source
-     * and so the destination publish cannot be overwritten by an early racing
-     * F_SETFL on the new slot.
+     * Revalidate the destination slot under fd_lock before publishing metadata,
+     * mirroring install_fd_alias_metadata_atomic in fs.c: a sibling close +
+     * reopen on a fixed-slot dup2 target could have replaced this slot in the
+     * window since fd_alloc. The generation stamped at alloc is the unique
+     * discriminator (a close+reopen can reuse the same type and host_fd,
+     * including host_fd == -1 for FUSE file/dir); a mismatch means the slot was
+     * reused, so skip the write and the asyncio arm rather than stomp the new
+     * occupant or fire SIGIO on an unrelated fd.
      */
     pthread_mutex_lock(&fd_lock);
-    int preserved_flags =
-        fd_table[src_fd].linux_flags &
-        (LINUX_O_PATH | LINUX_O_DIRECTORY | LINUX_O_NOFOLLOW | LINUX_O_DIRECT |
-         LINUX_O_LARGEFILE | LINUX_O_NONBLOCK);
-    fd_table[guest_fd].linux_flags = preserved_flags | linux_flags;
+    if (fd_table[guest_fd].type == snap.type &&
+        fd_table[guest_fd].host_fd == new_host_fd &&
+        fd_table[guest_fd].generation == alloc_gen) {
+        int preserved_flags =
+            snap.linux_flags &
+            (LINUX_O_ACCMODE | LINUX_O_PATH | LINUX_O_DIRECTORY |
+             LINUX_O_NOFOLLOW | LINUX_O_DIRECT | LINUX_O_LARGEFILE |
+             LINUX_O_NONBLOCK | LINUX_O_ASYNC);
+        fd_table[guest_fd].linux_flags = preserved_flags | linux_flags;
+        fd_table[guest_fd].ofd_id = snap.ofd_id;
+        fd_table[guest_fd].fasync_owner_type = snap.fasync_owner_type;
+        fd_table[guest_fd].fasync_owner = snap.fasync_owner;
+        if (fd_table[guest_fd].linux_flags & LINUX_O_ASYNC)
+            asyncio_arm(guest_fd, fd_table[guest_fd].generation,
+                        fd_table[guest_fd].host_fd, fd_table[guest_fd].type);
+    }
     pthread_mutex_unlock(&fd_lock);
     return guest_fd;
 }
