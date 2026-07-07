@@ -26,6 +26,7 @@
 #include "runtime/procemu.h"
 #include "syscall/abi.h"
 #include "syscall/internal.h"
+#include "syscall/poll.h"
 
 /* Protects the FD table (fd_alloc, fd_alloc_at, fd_alloc_from, sys_close). File
  * descriptor operations from concurrent threads must be serialized.
@@ -252,6 +253,78 @@ int fd_alloc(int type, int host_fd, void (*cleanup)(int))
     return fd;
 }
 
+int fd_alloc_dir(int type,
+                 int host_fd,
+                 void (*cleanup)(int),
+                 void *dir,
+                 int linux_flags)
+{
+    pthread_mutex_lock(&fd_lock);
+    int fd = fd_alloc_locked(0, type, host_fd, cleanup);
+    if (fd >= 0) {
+        fd_table[fd].dir = dir;
+        fd_table[fd].linux_flags = linux_flags;
+    }
+    pthread_mutex_unlock(&fd_lock);
+    return fd;
+}
+
+/* Like fd_alloc_from() but publishes dir + linux_flags in the same fd_lock
+ * critical section as the slot identity, so the slot is never observable with
+ * the target type but a stale/NULL dir. Required for FD_EPOLL, where dir
+ * carries the shared eventpoll instance and the close hooks key their behavior
+ * off it.
+ */
+int fd_alloc_dir_from(int minfd,
+                      int type,
+                      int host_fd,
+                      void (*cleanup)(int),
+                      void *dir,
+                      int linux_flags)
+{
+    pthread_mutex_lock(&fd_lock);
+    int fd = fd_alloc_locked(minfd, type, host_fd, cleanup);
+    if (fd >= 0) {
+        fd_table[fd].dir = dir;
+        fd_table[fd].linux_flags = linux_flags;
+    }
+    pthread_mutex_unlock(&fd_lock);
+    return fd;
+}
+
+/* Fixed-slot counterpart of fd_alloc_dir_from(): overwrites fd with the new
+ * (type, host_fd, dir, flags) atomically, cleaning up any prior occupant
+ * outside fd_lock like fd_alloc_at().
+ */
+int fd_alloc_dir_at(int fd,
+                    int type,
+                    int host_fd,
+                    void (*cleanup)(int),
+                    void *dir,
+                    int linux_flags)
+{
+    if (!RANGE_CHECK(fd, 0, FD_TABLE_SIZE))
+        return -1;
+    if (fd >= rlimit_nofile_cur)
+        return -1;
+
+    fd_entry_t old = {.type = FD_CLOSED};
+    pthread_mutex_lock(&fd_lock);
+    if (fd_table[fd].type != FD_CLOSED) {
+        old = fd_table[fd];
+        epoll_note_fd_closed(fd);
+    }
+    fd_init_entry(fd, type, host_fd, cleanup);
+    fd_table[fd].dir = dir;
+    fd_table[fd].linux_flags = linux_flags;
+    pthread_mutex_unlock(&fd_lock);
+
+    if (old.type != FD_CLOSED)
+        fd_cleanup_entry(fd, &old);
+
+    return fd;
+}
+
 /* Allocate the lowest available FD >= minfd.
  *
  * Returns -1 if none available or RLIMIT_NOFILE would be exceeded.
@@ -327,8 +400,14 @@ int fd_alloc_at(int fd, int type, int host_fd, void (*cleanup)(int))
     fd_entry_t old = {.type = FD_CLOSED};
 
     pthread_mutex_lock(&fd_lock);
-    if (fd_table[fd].type != FD_CLOSED)
+    if (fd_table[fd].type != FD_CLOSED) {
         old = fd_table[fd];
+        /* dup2/dup3 over an open slot retires the old open file description at
+         * this fd number without routing through fd_mark_closed_unlocked, so
+         * clear its epoll registrations here too (see epoll_note_fd_closed).
+         */
+        epoll_note_fd_closed(fd);
+    }
     fd_init_entry(fd, type, host_fd, cleanup);
     pthread_mutex_unlock(&fd_lock);
 
@@ -374,6 +453,14 @@ void fd_mark_closed_unlocked(int fd)
     fd_table[fd].linux_flags = 0;
     fd_table[fd].seals = 0;
     fd_bitmap_set_free(fd);
+
+    /* Drop this fd from any epoll interest table. Matches Linux auto-removal on
+     * close and keeps sys_epoll_pwait's active-check honest rather than leaning
+     * on the epoll_ctl generation guard. Runs after the slot is FD_CLOSED so a
+     * just-closed epoll fd skips itself; caller holds fd_lock (or is
+     * single-threaded on the relaxed path).
+     */
+    epoll_note_fd_closed(fd);
 }
 
 void fd_mark_closed(int fd)
@@ -573,7 +660,7 @@ void fd_cleanup_entry(int guest_fd, const fd_entry_t *snap)
         if (snap->type == FD_DIR)
             closedir((DIR *) snap->dir);
         else if (snap->type == FD_EPOLL)
-            free(snap->dir);
+            epoll_instance_free(snap->dir);
     }
 
     /* Type-specific teardown via vtable (replaces per-type switch) */

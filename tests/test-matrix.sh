@@ -517,6 +517,10 @@ run_unit_tests()
         "$bindir/test-signalfd-hardening"
     test_check "$runner" "test-epoll" "0 failed" "$bindir/test-epoll"
     test_check "$runner" "test-epoll-edge" "0 failed" "$bindir/test-epoll-edge"
+    test_check "$runner" "test-epoll-close" "0 failed" "$bindir/test-epoll-close"
+    test_check "$runner" "test-epoll-dup" "0 failed" "$bindir/test-epoll-dup"
+    test_check "$runner" "test-epoll-refcount" "0 failed" \
+        "$bindir/test-epoll-refcount"
     test_check "$runner" "test-timerfd" "0 failed" "$bindir/test-timerfd"
 
     printf "\n/proc and /dev\n"

@@ -36,15 +36,16 @@ int64_t sys_eventfd2(unsigned int initval, int flags);
 
 /* Duplicate an eventfd into a new guest_fd slot, sharing the counter and pipe
  * state with src_fd. Mirrors the Linux contract that dup'd eventfds share the
- * same underlying kernel object. src_host_fd must be the host fd snapshotted
- * from fd_table[src_fd].host_fd by the caller; the implementation uses it to
- * verify under fd_lock + sfd_lock that the source fd still refers to the same
- * live eventfd between the caller's snapshot and the dup commit.
+ * same underlying kernel object. src_host_fd and src_generation must be
+ * snapshotted from fd_table[src_fd] by the caller; the implementation uses them
+ * to verify under fd_lock + sfd_lock that the source fd still refers to the
+ * same live eventfd between the caller's snapshot and the dup commit.
  *
  * Returns the new guest_fd or -1 with errno set.
  */
 int eventfd_dup_fd(int src_fd,
                    int src_host_fd,
+                   uint64_t src_generation,
                    int min_guest_fd,
                    int fixed_guest_fd,
                    bool fixed_slot,

@@ -727,7 +727,8 @@ typedef struct {
                           * close+reopen ABA: if the guest fd's current
                           * generation no longer matches, the registered open
                           * file is gone and this stale entry must not drive
-                          * kevent against the reused host fd. */
+                          * kevent against the reused host fd.
+                          */
     bool active;         /* Registered in this instance */
     bool oneshot_armed;  /* EPOLLONESHOT and event already fired,
                           * waiting for EPOLL_CTL_MOD re-arm.
@@ -741,8 +742,199 @@ typedef struct {
  * not overwrite each other's user data.
  */
 typedef struct {
+    /* Reference count guarded by fd_lock. Starts at 1 (the fd-table's
+     * reference, held while the epfd is open) and gains one per in-flight
+     * epoll_ctl / epoll_pwait that pinned the instance via
+     * epoll_instance_acquire(). The allocation is freed only when the count
+     * reaches zero, so a concurrent close() of the epoll fd from a sibling
+     * thread cannot free it out from under a call still walking regs[]
+     * (including across a blocking kevent()).
+     */
+    int refcount;
+    /* Serializes all regs[] reads and writes: epoll_ctl / epoll_pwait take it
+     * for their short reg bookkeeping (never across the blocking kevent()
+     * wait), and epoll_note_fd_closed takes it while holding fd_lock. Mirrors
+     * the Linux eventpoll->mtx that serializes interest-list mutation against
+     * ready-list scans. Lock order: fd_lock -> lock (see internal.h).
+     */
+    pthread_mutex_t lock;
     epoll_reg_t regs[FD_TABLE_SIZE];
 } epoll_instance_t;
+
+/* Count of live epoll instances. When zero, epoll_note_fd_closed() skips its
+ * scan entirely -- the overwhelmingly common case (a process with no epoll fd
+ * pays nothing on every close). Guarded by fd_lock, matching the fd_table scan.
+ */
+static int epoll_live_count;
+
+/* Drop one reference; free when the last one goes. Caller holds fd_lock. Safe
+ * to destroy inst->lock here: the last reference is dropped only after every
+ * epoll_ctl / epoll_pwait that held one has released both its reg lock and its
+ * reference, so nothing is parked on the mutex.
+ */
+static void epoll_instance_unref_locked(epoll_instance_t *inst)
+{
+    if (--inst->refcount == 0) {
+        pthread_mutex_destroy(&inst->lock);
+        free(inst);
+    }
+}
+
+/* Pin the epoll instance behind epfd for the duration of a call, so a
+ * concurrent close(epfd) cannot free it mid-use.
+ *
+ * Returns the instance with an extra reference, or NULL if epfd is not a live
+ * epoll fd. Balance every non-NULL return with epoll_instance_release().
+ */
+static epoll_instance_t *epoll_instance_acquire(int epfd)
+{
+    if (!RANGE_CHECK(epfd, 0, FD_TABLE_SIZE))
+        return NULL;
+    pthread_mutex_lock(&fd_lock);
+    epoll_instance_t *inst = NULL;
+    if (fd_table[epfd].type == FD_EPOLL) {
+        inst = (epoll_instance_t *) fd_table[epfd].dir;
+        if (inst)
+            inst->refcount++;
+    }
+    pthread_mutex_unlock(&fd_lock);
+    return inst;
+}
+
+/* Release a reference taken by epoll_instance_acquire(). */
+static void epoll_instance_release(epoll_instance_t *inst)
+{
+    pthread_mutex_lock(&fd_lock);
+    epoll_instance_unref_locked(inst);
+    pthread_mutex_unlock(&fd_lock);
+}
+
+/* Duplicate an epoll fd. Linux dup(2)/dup3(2)/F_DUPFD of an epoll fd yield a
+ * second descriptor onto the SAME eventpoll instance -- shared interest list
+ * and all. The generic dup path in duplicate_guest_fd() cannot express that: it
+ * clones DIR streams but leaves fd_table[dst].dir NULL for every other type, so
+ * a duped epoll fd would have no interest table and every epoll_ctl/epoll_pwait
+ * on it would fail. Handle it here by pointing the new slot's dir at the shared
+ * instance and taking a reference, mirroring eventfd_dup_fd's counter sharing.
+ */
+int epoll_dup_fd(int src_fd,
+                 int src_host_fd,
+                 uint64_t src_generation,
+                 int min_guest_fd,
+                 int fixed_guest_fd,
+                 bool fixed_slot,
+                 int linux_flags)
+{
+    /* Pin the source instance and dup its host kqueue under fd_lock so a
+     * concurrent close(src_fd) can neither free the shared instance nor
+     * invalidate the host fd between validation and dup. The reference and the
+     * live-count bump both cover the new slot; on any failure below,
+     * epoll_instance_free() undoes exactly one of each.
+     */
+    pthread_mutex_lock(&fd_lock);
+    epoll_instance_t *inst = NULL;
+    if (fd_table[src_fd].type == FD_EPOLL &&
+        fd_table[src_fd].host_fd == src_host_fd &&
+        fd_table[src_fd].generation == src_generation)
+        inst = (epoll_instance_t *) fd_table[src_fd].dir;
+    if (!inst) {
+        pthread_mutex_unlock(&fd_lock);
+        errno = EBADF;
+        return -1;
+    }
+    inst->refcount++;
+    int new_host_fd = dup(src_host_fd);
+    if (new_host_fd < 0) {
+        epoll_instance_unref_locked(inst);
+        pthread_mutex_unlock(&fd_lock);
+        return -1;
+    }
+    epoll_live_count++;
+    pthread_mutex_unlock(&fd_lock);
+
+    /* Publish type, host_fd, the shared dir, and flags in one fd_lock critical
+     * section (fd_alloc_dir_*), so the slot is never observable as FD_EPOLL
+     * with a NULL dir -- matching sys_epoll_create1.
+     */
+    int lflags = linux_flags & LINUX_O_CLOEXEC;
+    int new_guest_fd = fixed_slot
+                           ? fd_alloc_dir_at(fixed_guest_fd, FD_EPOLL,
+                                             new_host_fd, NULL, inst, lflags)
+                           : fd_alloc_dir_from(min_guest_fd, FD_EPOLL,
+                                               new_host_fd, NULL, inst, lflags);
+    if (new_guest_fd < 0) {
+        /* fd_alloc_dir_at fails only when fixed_guest_fd is out of range or
+         * over RLIMIT_NOFILE; dup2/dup3 report that as EBADF, not the EMFILE
+         * that the lowest-free path returns. Capture the intended errno before
+         * cleanup so the close()/epoll_instance_free() below (either may touch
+         * errno) cannot clobber it; restore it last. Matches eventfd_dup_fd's
+         * override.
+         */
+        int saved_errno = fixed_slot ? EBADF : errno;
+        close(new_host_fd);
+        epoll_instance_free(inst); /* drops the ref and the live-count bump */
+        errno = saved_errno;
+        return -1;
+    }
+    return new_guest_fd;
+}
+
+/* Eagerly drop a closed guest fd from every epoll instance's interest table.
+ *
+ * Linux auto-removes a fd from all epoll interest lists when its last
+ * descriptor closes; elfuse keys epoll state on the guest fd number, so a close
+ * must clear that number from every instance or regs[fd].active keeps claiming
+ * the fd is still watched. Without this, correctness leans on the cross-call
+ * generation guard in sys_epoll_ctl() to lazily notice the stale entry, and
+ * sys_epoll_pwait() (which does not re-check generation) would surface a stale
+ * registration the moment a host fd or udata value gets reused.
+ *
+ * Called from fd_mark_closed_unlocked() -- the single chokepoint every close
+ * path funnels through -- so it covers sys_close, close_range, dup2 over an
+ * open slot, and the execve CLOEXEC sweep alike. The caller holds fd_lock (or
+ * runs single-threaded on the relaxed fast path), so the fd_table scan and the
+ * cleared slot's own instance (already FD_CLOSED, hence skipped) are stable.
+ * The kqueue knote itself needs no EV_DELETE: the host fd close that follows
+ * drops it automatically, and clearing the software state is what makes the
+ * pwait active-check honest.
+ */
+void epoll_note_fd_closed(int closed_fd)
+{
+    if (epoll_live_count == 0)
+        return;
+    for (int epfd = 0; epfd < FD_TABLE_SIZE; epfd++) {
+        if (fd_table[epfd].type != FD_EPOLL)
+            continue;
+        epoll_instance_t *inst = (epoll_instance_t *) fd_table[epfd].dir;
+        if (!inst)
+            continue;
+        /* fd_lock -> inst->lock ordering; the instance is in the table so its
+         * refcount is at least the table's reference and cannot be freed here.
+         */
+        pthread_mutex_lock(&inst->lock);
+        epoll_reg_t *reg = &inst->regs[closed_fd];
+        reg->active = false;
+        reg->oneshot_armed = false;
+        reg->generation = 0;
+        pthread_mutex_unlock(&inst->lock);
+    }
+}
+
+/* Drop the fd-table's reference to an epoll instance and remove it from the
+ * live count. Called by fd_cleanup_entry() when an FD_EPOLL slot closes. The
+ * memory is freed here only if no in-flight epoll_ctl / epoll_pwait still holds
+ * a reference; the last releaser frees it otherwise.
+ */
+void epoll_instance_free(void *inst)
+{
+    if (!inst)
+        return;
+    pthread_mutex_lock(&fd_lock);
+    if (epoll_live_count > 0)
+        epoll_live_count--;
+    epoll_instance_unref_locked(inst);
+    pthread_mutex_unlock(&fd_lock);
+}
 
 static inline void epoll_merge_event(linux_epoll_event_t *out,
                                      const struct kevent *kev,
@@ -778,19 +970,42 @@ int64_t sys_epoll_create1(int flags)
         close(kq);
         return -LINUX_ENOMEM;
     }
+    if (pthread_mutex_init(&inst->lock, NULL) != 0) {
+        free(inst);
+        close(kq);
+        return -LINUX_ENOMEM;
+    }
 
-    int gfd = fd_alloc(FD_EPOLL, kq, NULL);
+    int lflags = 0;
+    if (flags & LINUX_EPOLL_CLOEXEC)
+        lflags |= LINUX_O_CLOEXEC;
+
+    /* Publish type, host_fd, dir, and flags in one fd_lock critical section
+     * (fd_alloc_dir) so the slot is never visible to a concurrent close/scan as
+     * FD_EPOLL with a NULL dir. refcount is set on the still-private instance
+     * beforehand, so the close hook sees a fully formed instance the instant
+     * the slot reads FD_EPOLL.
+     */
+    inst->refcount = 1; /* the fd-table's reference */
+    int gfd = fd_alloc_dir(FD_EPOLL, kq, NULL, inst, lflags);
     if (gfd < 0) {
+        pthread_mutex_destroy(&inst->lock);
         free(inst);
         close(kq);
         return -LINUX_EMFILE;
     }
 
-    fd_table[gfd].dir = inst;
-    int lflags = 0;
-    if (flags & LINUX_EPOLL_CLOEXEC)
-        lflags |= LINUX_O_CLOEXEC;
-    fd_table[gfd].linux_flags = lflags;
+    /* Count this instance for epoll_note_fd_closed()'s fast-path skip. A
+     * pathological close_range() racing this create can close gfd between the
+     * publish above and here; the close hook then frees the instance and this
+     * increment leaves the counter one too high. Each such race can add one, so
+     * the counter may stay positive with no live instance -- that only forces
+     * the scan to run when it need not (perf only, and the guarded decrement
+     * still never underflows), never a correctness or memory-safety issue.
+     */
+    pthread_mutex_lock(&fd_lock);
+    epoll_live_count++;
+    pthread_mutex_unlock(&fd_lock);
 
     return gfd;
 }
@@ -804,16 +1019,15 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd, uint64_t event_gva)
     host_fd_ref_t epoll_ref;
     if (host_fd_ref_open(epfd, &epoll_ref) < 0)
         return -LINUX_EBADF;
-    if (fd_table[epfd].type != FD_EPOLL) {
-        host_fd_ref_close(&epoll_ref);
-        return -LINUX_EINVAL;
-    }
 
-    epoll_instance_t *inst = (epoll_instance_t *) fd_table[epfd].dir;
+    /* Pin the instance so a concurrent close(epfd) cannot free it under us. */
+    epoll_instance_t *inst = epoll_instance_acquire(epfd);
     if (!inst) {
         host_fd_ref_close(&epoll_ref);
         return -LINUX_EINVAL;
     }
+
+    int64_t ret;
 
     /* Validate the target fd and read its persistent host fd in a single
      * fd_lock snapshot, so the kqueue knote ident is taken from the same entry
@@ -830,11 +1044,17 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd, uint64_t event_gva)
      */
     fd_entry_t target_snap;
     if (!fd_snapshot(fd, &target_snap)) {
-        host_fd_ref_close(&epoll_ref);
-        return -LINUX_EBADF;
+        ret = -LINUX_EBADF;
+        goto out;
     }
     int target_host_fd = target_snap.host_fd;
 
+    /* Serialize all regs[] access and the paired kqueue mutation against a
+     * concurrent close hook or a sibling epoll_ctl on the same instance. The
+     * kevent() calls below are change-only (non-blocking), so holding the lock
+     * across them is bounded. From here every exit goes through out_locked.
+     */
+    pthread_mutex_lock(&inst->lock);
     epoll_reg_t *reg = &inst->regs[fd];
 
     /* Cross-call ABA guard. If the guest closed this fd and reopened it (or the
@@ -854,8 +1074,8 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd, uint64_t event_gva)
     if (op == LINUX_EPOLL_CTL_DEL) {
         /* Linux returns ENOENT when removing an unregistered fd */
         if (!reg->active) {
-            host_fd_ref_close(&epoll_ref);
-            return -LINUX_ENOENT;
+            ret = -LINUX_ENOENT;
+            goto out_locked;
         }
 
         /* Remove all filters for this fd. EPOLLRDHUP alone registers
@@ -880,8 +1100,8 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd, uint64_t event_gva)
             /* Clear stale state for potential re-add */
             reg->oneshot_armed = false;
         }
-        host_fd_ref_close(&epoll_ref);
-        return 0;
+        ret = 0;
+        goto out_locked;
     }
 
     /* Linux semantics: ADD fails with EEXIST if already registered; MOD fails
@@ -889,19 +1109,19 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd, uint64_t event_gva)
      * fired, waiting for re-arm) are still valid for MOD.
      */
     if (op == LINUX_EPOLL_CTL_ADD && reg->active) {
-        host_fd_ref_close(&epoll_ref);
-        return -LINUX_EEXIST;
+        ret = -LINUX_EEXIST;
+        goto out_locked;
     }
     if (op == LINUX_EPOLL_CTL_MOD && !reg->active && !reg->oneshot_armed) {
-        host_fd_ref_close(&epoll_ref);
-        return -LINUX_ENOENT;
+        ret = -LINUX_ENOENT;
+        goto out_locked;
     }
 
     /* ADD or MOD: read the epoll_event from guest */
     linux_epoll_event_t ev;
     if (guest_read_small(g, event_gva, &ev, sizeof(ev)) < 0) {
-        host_fd_ref_close(&epoll_ref);
-        return -LINUX_EFAULT;
+        ret = -LINUX_EFAULT;
+        goto out_locked;
     }
 
     /* For MOD, remove old registrations first if they exist in kqueue.
@@ -963,8 +1183,8 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd, uint64_t event_gva)
 
     if (nchanges > 0) {
         if (kevent(epoll_ref.fd, changes, nchanges, NULL, 0, NULL) < 0) {
-            host_fd_ref_close(&epoll_ref);
-            return linux_errno();
+            ret = linux_errno();
+            goto out_locked;
         }
     }
 
@@ -979,8 +1199,14 @@ int64_t sys_epoll_ctl(guest_t *g, int epfd, int op, int fd, uint64_t event_gva)
     reg->active = true;
     reg->oneshot_armed = false;
 
+    ret = 0;
+
+out_locked:
+    pthread_mutex_unlock(&inst->lock);
+out:
     host_fd_ref_close(&epoll_ref);
-    return 0;
+    epoll_instance_release(inst);
+    return ret;
 }
 
 int64_t sys_epoll_pwait(guest_t *g,
@@ -993,20 +1219,22 @@ int64_t sys_epoll_pwait(guest_t *g,
     host_fd_ref_t epoll_ref;
     if (host_fd_ref_open(epfd, &epoll_ref) < 0)
         return -LINUX_EBADF;
-    if (fd_table[epfd].type != FD_EPOLL) {
-        host_fd_ref_close(&epoll_ref);
-        return -LINUX_EINVAL;
-    }
+
     if (maxevents <= 0) {
         host_fd_ref_close(&epoll_ref);
         return -LINUX_EINVAL;
     }
 
-    epoll_instance_t *inst = (epoll_instance_t *) fd_table[epfd].dir;
+    /* Pin the instance so a concurrent close(epfd) cannot free it under us --
+     * including across the blocking kevent() below.
+     */
+    epoll_instance_t *inst = epoll_instance_acquire(epfd);
     if (!inst) {
         host_fd_ref_close(&epoll_ref);
         return -LINUX_EINVAL;
     }
+
+    int64_t ret;
 
     /* Atomically install signal mask for the duration of the wait */
     uint64_t saved_mask = 0;
@@ -1097,8 +1325,10 @@ epoll_retry:;
 
     if (nready < 0) {
         errno = saved_errno;
+        ret = linux_errno();
         host_fd_ref_close(&epoll_ref);
-        return linux_errno();
+        epoll_instance_release(inst);
+        return ret;
     }
 
     /* Merge kevent results into epoll_event results. Multiple kevents for the
@@ -1113,6 +1343,14 @@ epoll_retry:;
     int nout = 0;
 
     memset(out_index, 0xff, sizeof(out_index));
+
+    /* Serialize the regs[] reads and the oneshot re-arm against a concurrent
+     * epoll_ctl or the close hook. Held only for this bookkeeping, never across
+     * the blocking kevent() above; out[] is a local snapshot, so the guest
+     * write happens after the unlock. Mirrors Linux dropping ep->mtx before
+     * copyout.
+     */
+    pthread_mutex_lock(&inst->lock);
 
     for (int i = 0; i < nready && nout < maxevents; i++) {
         int gfd = (int) (uintptr_t) kevents[i].udata;
@@ -1158,15 +1396,19 @@ epoll_retry:;
         }
     }
 
+    pthread_mutex_unlock(&inst->lock);
+
     /* Write results to guest */
     if (nout > 0) {
         if (guest_write_small(g, events_gva, out,
                               nout * sizeof(linux_epoll_event_t)) < 0) {
             host_fd_ref_close(&epoll_ref);
+            epoll_instance_release(inst);
             return -LINUX_EFAULT;
         }
     }
 
     host_fd_ref_close(&epoll_ref);
+    epoll_instance_release(inst);
     return nout;
 }

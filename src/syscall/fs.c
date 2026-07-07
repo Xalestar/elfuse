@@ -36,6 +36,7 @@
 #include "syscall/internal.h"
 #include "syscall/net.h" /* absock_unregister_fd */
 #include "syscall/path.h"
+#include "syscall/poll.h" /* epoll_dup_fd */
 #include "syscall/proc.h"
 #include "syscall/sidecar.h"
 
@@ -746,16 +747,29 @@ static int duplicate_guest_fd(int src_fd,
                            linux_flags);
     }
     /* eventfd dup must share the underlying counter and pipe state across the
-     * source and destination fds (Linux contract). Pass src_snap's host_fd
-     * through so eventfd_dup_fd can verify the source fd still refers to the
-     * same live eventfd between the snapshot here and the bind there.
+     * source and destination fds (Linux contract). Pass src_snap's identity
+     * through so eventfd_dup_fd can reject a close+reopen ABA between the
+     * snapshot here and the bind there.
      */
     if (src_snap.type == FD_EVENTFD) {
         proc_pty_unlock_for_dup();
         if (new_host_fd >= 0)
             close_keep_errno(new_host_fd);
-        return eventfd_dup_fd(src_fd, src_snap.host_fd, min_guest_fd,
-                              fixed_guest_fd, fixed_slot, linux_flags);
+        return eventfd_dup_fd(src_fd, src_snap.host_fd, src_snap.generation,
+                              min_guest_fd, fixed_guest_fd, fixed_slot,
+                              linux_flags);
+    }
+    /* epoll dup must share the source's eventpoll instance so the alias sees
+     * the same interest list. Pass src_snap's identity so epoll_dup_fd can
+     * reject a close+reopen ABA before pinning the shared instance.
+     */
+    if (src_snap.type == FD_EPOLL) {
+        proc_pty_unlock_for_dup();
+        if (new_host_fd >= 0)
+            close_keep_errno(new_host_fd);
+        return epoll_dup_fd(src_fd, src_snap.host_fd, src_snap.generation,
+                            min_guest_fd, fixed_guest_fd, fixed_slot,
+                            linux_flags);
     }
     if (new_host_fd < 0) {
         proc_pty_unlock_for_dup();

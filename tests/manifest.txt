@@ -66,6 +66,9 @@ test-epoll
 test-epoll-edge
 test-epoll-mt
 test-epoll-aba
+test-epoll-close
+test-epoll-dup
+test-epoll-refcount
 test-timerfd
 test-large-io-boundary
 test-ioctl-cloexec

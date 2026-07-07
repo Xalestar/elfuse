@@ -694,8 +694,8 @@ static void eventfd_close(int guest_fd)
  *   - Source identity. duplicate_guest_fd() snapshots src_fd under
  *     fd_lock, releases it, then calls us. Between those points src_fd
  *     could be closed and rebound to a different eventfd. We carry the
- *     caller's snapshot of fd_table[src_fd].host_fd as src_host_fd and verify
- *     under fd_lock + sfd_lock that the source fd still has that host fd and
+ *     caller's snapshot of fd_table[src_fd].host_fd and generation and verify
+ *     under fd_lock + sfd_lock that the source fd still has that identity and
  *     still maps to a live eventfd slot.
  *
  *   - Destination close. fd_alloc_*_relaxed publishes the new guest_fd
@@ -710,6 +710,7 @@ static void eventfd_close(int guest_fd)
  */
 int eventfd_dup_fd(int src_fd,
                    int src_host_fd,
+                   uint64_t src_generation,
                    int min_guest_fd,
                    int fixed_guest_fd,
                    bool fixed_slot,
@@ -724,6 +725,7 @@ int eventfd_dup_fd(int src_fd,
     int slot = eventfd_find(src_fd);
     if (slot < 0 || fd_table[src_fd].type != FD_EVENTFD ||
         fd_table[src_fd].host_fd != src_host_fd ||
+        fd_table[src_fd].generation != src_generation ||
         eventfd_state[slot].refcount <= 0) {
         pthread_mutex_unlock(&sfd_lock);
         pthread_mutex_unlock(&fd_lock);

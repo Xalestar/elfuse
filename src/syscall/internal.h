@@ -11,6 +11,9 @@
  *   mmap_lock    (syscall/mem.c):     mmap/brk allocators + page tables
  *   pt_lock      (core/guest.c):      page table pool allocator
  *   fd_lock      (syscall/fdtable.c): FD table (alloc/close/dup)
+ *   epoll inst   (syscall/poll.c):    per-epoll-instance regs[]; taken under
+ *                                     fd_lock by the close hook, taken alone
+ *                                     (no fd_lock held) by epoll_ctl/pwait
  *   sig_lock     (syscall/signal.c):  signal handlers/pending/blocked
  *   thread_lock  (runtime/thread.c):  thread table
  *   sfd_lock     (syscall/fd.c):      special fd (never held with thread_lock)
@@ -62,6 +65,37 @@ void fdtable_init(void);
  * NULL for plain fds).
  */
 int fd_alloc(int type, int host_fd, void (*cleanup)(int));
+
+/* Allocate the lowest available FD and publish type, host_fd, dir, and
+ * linux_flags in one fd_lock critical section, so the slot never becomes
+ * visible to a concurrent close/scan as type-set-but-dir-NULL. For fds (epoll)
+ * whose close hook and refcount rely on dir being present the instant the slot
+ * reads FD_EPOLL.
+ *
+ * Returns -1 (EMFILE) if the table is full.
+ */
+int fd_alloc_dir(int type,
+                 int host_fd,
+                 void (*cleanup)(int),
+                 void *dir,
+                 int linux_flags);
+
+/* fd_alloc_from()/fd_alloc_at() variants that publish dir + linux_flags in the
+ * same fd_lock section as the slot identity (see fd_alloc_dir). Used by
+ * epoll_dup_fd() so a duped epoll fd never appears as FD_EPOLL with a NULL dir.
+ */
+int fd_alloc_dir_from(int minfd,
+                      int type,
+                      int host_fd,
+                      void (*cleanup)(int),
+                      void *dir,
+                      int linux_flags);
+int fd_alloc_dir_at(int fd,
+                    int type,
+                    int host_fd,
+                    void (*cleanup)(int),
+                    void *dir,
+                    int linux_flags);
 
 /* Allocate the lowest available FD >= minfd.
  *
