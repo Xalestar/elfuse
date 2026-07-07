@@ -151,6 +151,9 @@ void proc_publish_pgsid_snapshot(guest_t *g);
 /* Restore session/pgid from fork IPC. */
 void proc_set_session(int64_t sid, int64_t pgid);
 
+/* Refresh pgid from the fork-family registry after a parent-side setpgid. */
+void proc_set_pgid_from_registry(guest_t *g, int64_t pgid);
+
 /* setsid: create new session and publish pgid/sid cache under session_lock.
  * Returns SID or -LINUX_EPERM.
  */
@@ -295,6 +298,9 @@ typedef struct {
     bool active;       /* Slot is in use */
     pid_t host_pid;    /* macOS process ID of child elfuse instance */
     int64_t guest_pid; /* Guest-visible PID assigned to child */
+    int64_t pgid;      /* Child's process group, inherited at fork and updated
+                        * by a parent-side setpgid(child, ...)
+                        */
     bool exited;       /* Child has exited */
     int exit_status;   /* wait status (as returned by waitpid) */
 } proc_entry_t;
@@ -302,7 +308,7 @@ typedef struct {
 /* Register a child process in the process table.
  * Returns 0 on success, -1 if the table is full.
  */
-int proc_register_child(pid_t host_pid, int64_t guest_pid);
+int proc_register_child(pid_t host_pid, int64_t guest_pid, int64_t pgid);
 
 /* Mark a child as exited by host PID (for CLONE_VFORK wait). */
 void proc_mark_child_exited(pid_t host_pid, int status);
@@ -314,15 +320,63 @@ void proc_mark_child_exited(pid_t host_pid, int status);
  */
 int proc_get_child_pids(pid_t *out, int max_pids);
 
+/* Collect host PIDs of this process's direct, active (non-exited) fork children
+ * from the process table only. Unlike proc_get_child_pids it does NOT sweep the
+ * host for same-binary processes, so it cannot reach unrelated elfuse
+ * instances. Writes up to max_pids entries into out[]; returns the count
+ * written.
+ */
+int proc_get_direct_child_pids(pid_t *out, int max_pids);
+
+/* One signalable fork-family member: host pid for delivery plus guest pid so
+ * the transport record can be tagged and a recycled host pid cannot misapply
+ * the signal to an unrelated guest.
+ */
+typedef struct {
+    pid_t host_pid;
+    int64_t guest_pid;
+} proc_signal_target_t;
+
+/* Pass as the pgid_filter to proc_get_namespace_targets to collect every
+ * fork-family member regardless of process group (kill(-1) broadcast).
+ */
+#define PROC_PGID_ANY ((int64_t) -1)
+
+/* Collect every live process in this elfuse fork family from the namespace
+ * registry, excluding the caller. When pgid_filter is PROC_PGID_ANY all members
+ * are returned; otherwise only those whose tracked process group matches.
+ * Writes up to max entries into out[]; returns the count written.
+ */
+int proc_get_namespace_targets(proc_signal_target_t *out,
+                               int max,
+                               int64_t pgid_filter);
+
+/* Publish the caller's current guest pid/pgid to the fork-family registry. */
+void proc_registry_publish_self(void);
+
+/* Pull a parent-published pgid update into this process's local identity. */
+void proc_registry_sync_self_pgid(guest_t *g);
+
+/* Record the process group of a direct child (parent-side setpgid).
+ *
+ * Returns 0 if the child was found and updated, -1 otherwise.
+ */
+int proc_set_child_pgid(int64_t guest_pid, int64_t pgid);
+
 /* Look up a guest PID in the child process table.
  * Returns the host PID if found and still active, or -1.
  */
 pid_t proc_guest_to_host_pid(int64_t gpid);
 
-/* Queue a Linux guest signal in a fork-child elfuse process.
+/* Queue a Linux guest signal in a fork-child elfuse process. target_guest_pid
+ * tags the transport record so the receiver drops it if its host pid was
+ * recycled onto a different guest.
+ *
  * Returns 0 on success or -1 with errno set.
  */
-int proc_send_guest_signal(pid_t host_pid, int signum);
+int proc_send_guest_signal(pid_t host_pid,
+                           int64_t target_guest_pid,
+                           int signum);
 
 /* Block the vCPU-preemption signals (SIGUSR2 doorbell, SIGALRM timeout) on the
  * calling thread and start the dedicated sigwait thread that consumes them.

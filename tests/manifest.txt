@@ -37,6 +37,8 @@ test-pidfd                         # diff=skip
 
 [section] Signal tests
 test-signal
+test-kill-broadcast
+test-kill-pgroup
 
 [section] Socket tests
 test-socket

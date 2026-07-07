@@ -375,8 +375,41 @@ SC_FORWARD(sc_sched_rr_get_interval,  sys_sched_rr_get_interval(g, (int) x0, x1)
 SC_FORWARD(sc_exit,    SC_EXIT_SENTINEL | ((int) x0 & 0xFF))
 SC_FORWARD(sc_getpid,  proc_get_pid())
 SC_FORWARD(sc_getppid, proc_get_ppid())
-SC_FORWARD(sc_getpgid, ((int) x0 == 0 || (int) x0 == (int) proc_get_pid()) ? proc_get_pgid() : -LINUX_ESRCH)
-SC_FORWARD(sc_setsid,  proc_sys_setsid(g))
+/* getpgid(0) is served inline by the shim's pgid cache and never reaches here,
+ * so a registry sync in this path would be dead for the common form; the group
+ * signal path in sc_kill does the sync where it can actually run. getpgid may
+ * therefore lag a parent-side setpgid(child) until the child's next group op --
+ * the documented limitation.
+ */
+SC_FORWARD(sc_getpgid,
+           (((int) x0 == 0 || (int) x0 == (int) proc_get_pid())
+                ? (proc_registry_sync_self_pgid(g), proc_get_pgid())
+                : -LINUX_ESRCH))
+static int64_t sc_setsid(guest_t *g,
+                         uint64_t x0,
+                         uint64_t x1,
+                         uint64_t x2,
+                         uint64_t x3,
+                         uint64_t x4,
+                         uint64_t x5,
+                         bool verbose)
+{
+    (void) x0;
+    (void) x1;
+    (void) x2;
+    (void) x3;
+    (void) x4;
+    (void) x5;
+    (void) verbose;
+    proc_registry_sync_self_pgid(g);
+    /* setsid moves the caller into a new group; refresh the registry so the
+     * group signal path sees the new pgid without a per-query republish.
+     */
+    int64_t ret = proc_sys_setsid(g);
+    if (ret >= 0)
+        proc_registry_publish_self();
+    return ret;
+}
 SC_FORWARD(sc_getsid,  proc_sys_getsid((int64_t) x0))
 SC_FORWARD(sc_gettid,  current_thread ? current_thread->guest_tid : proc_get_pid())
 
@@ -554,7 +587,61 @@ SC_FORWARD(sc_setresgid, CRED_BRACKETED(g, proc_sys_setresgid((uint32_t) x0, (ui
  */
 SC_FORWARD(sc_setfsuid, (int64_t) proc_get_euid())
 SC_FORWARD(sc_setfsgid, (int64_t) proc_get_egid())
-SC_FORWARD(sc_setpgid, proc_sys_setpgid(g, (int64_t) x0, (int64_t) x1))
+static int64_t sc_setpgid(guest_t *g,
+                          uint64_t x0,
+                          uint64_t x1,
+                          uint64_t x2,
+                          uint64_t x3,
+                          uint64_t x4,
+                          uint64_t x5,
+                          bool verbose)
+{
+    (void) x2;
+    (void) x3;
+    (void) x4;
+    (void) x5;
+    (void) verbose;
+    /* setpgid takes pid_t (32-bit) args; cast as int like sc_kill so a negative
+     * pid/pgid is seen as negative, not a large positive.
+     */
+    int pid = (int) x0, pgid = (int) x1;
+    /* Linux rejects a negative group id with EINVAL and a negative pid (no such
+     * process) with ESRCH before any group change.
+     */
+    if (pgid < 0)
+        return -LINUX_EINVAL;
+    if (pid < 0)
+        return -LINUX_ESRCH;
+    int64_t self = proc_get_pid();
+    int64_t rpid = (pid == 0) ? self : pid;
+    int64_t rpgid = (pgid == 0) ? rpid : pgid;
+    /* setpgid on a direct child records the group so kill(0) and kill(-pgid)
+     * reach it. Kept in the syscall layer so proc-identity stays free of the
+     * process-table dependency. Only POSIX-plausible targets are recorded: the
+     * child leading its own group (rpgid == rpid), joining the caller's group
+     * (rpgid == caller pgid), or joining a group another tracked child already
+     * leads (a shell pipeline: setpgid(c1, c1) then setpgid(c2, c1)). Linux
+     * rejects any other group as not existing in the session, so recording it
+     * would fabricate a phantom group. Anything else is a no-op success,
+     * matching proc_sys_setpgid's permissive return for a non-self target.
+     */
+    if (rpid != self) {
+        proc_signal_target_t peer;
+        /* The registry is the single source of truth for group membership:
+         * every child publishes on fork, setpgid, and setsid. The old
+         * process-table enumerator was redundant and could report a phantom
+         * group from a pgid that went stale after a child changed its own.
+         */
+        bool group_exists = proc_get_namespace_targets(&peer, 1, rpgid) > 0;
+        if (rpgid == rpid || rpgid == proc_get_pgid() || group_exists)
+            proc_set_child_pgid(rpid, rpgid);
+        return 0;
+    }
+    int64_t ret = proc_sys_setpgid(g, pid, pgid);
+    if (ret == 0)
+        proc_registry_publish_self();
+    return ret;
+}
 SC_STUB(sc_fadvise64,           0)
 SC_STUB(sc_sched_yield,         (sched_yield(), 0))
 SC_STUB(sc_mlock,               0)
@@ -753,7 +840,6 @@ static int64_t sc_membarrier(guest_t *g,
                              uint64_t x5,
                              bool verbose)
 {
-    (void) g;
     (void) x2;
     (void) x3;
     (void) x4;
@@ -870,6 +956,26 @@ static int64_t sc_mremap(guest_t *g,
     return r;
 }
 
+/* Deliver @sig to each fork-family target over the cross-process transport.
+ * Returns the count successfully queued; *first_errno gets the errno of the
+ * first failed send, or 0 if none failed.
+ */
+static int kill_deliver_targets(const proc_signal_target_t *targets,
+                                int count,
+                                int sig,
+                                int *first_errno)
+{
+    int delivered = 0;
+    *first_errno = 0;
+    for (int i = 0; i < count; i++)
+        if (proc_send_guest_signal(targets[i].host_pid, targets[i].guest_pid,
+                                   sig) == 0)
+            delivered++;
+        else if (!*first_errno)
+            *first_errno = errno;
+    return delivered;
+}
+
 static int64_t sc_kill(guest_t *g,
                        uint64_t x0,
                        uint64_t x1,
@@ -889,11 +995,34 @@ static int64_t sc_kill(guest_t *g,
     int64_t our_pid = proc_get_pid();
     if (sig < 0 || sig > LINUX_NSIG)
         return -LINUX_EINVAL;
+    if (pid == 0 || pid < -1)
+        proc_registry_sync_self_pgid(g);
     if (sig == 0) {
-        int64_t r = (pid == (int) our_pid || pid == 0 || pid == -1 ||
-                     pid == -(int) our_pid)
-                        ? 0
-                        : -LINUX_ESRCH;
+        /* Existence/permission probe. The broadcast form reports success only
+         * when the caller has at least one other signalable process; in this
+         * model that is an emulated fork child, and no peers yields ESRCH.
+         */
+        if (pid == -1) {
+            proc_signal_target_t peer;
+            return proc_get_namespace_targets(&peer, 1, PROC_PGID_ANY) > 0
+                       ? 0
+                       : -LINUX_ESRCH;
+        }
+        /* Process-group probe: the caller always exists in its own group;
+         * pid<-1 needs the caller or a tracked child in group -pid.
+         */
+        if (pid == 0)
+            return 0;
+        if (pid < -1) {
+            int64_t target_pgid = -(int64_t) pid;
+            if (proc_get_pgid() == target_pgid)
+                return 0;
+            proc_signal_target_t peer;
+            return proc_get_namespace_targets(&peer, 1, target_pgid) > 0
+                       ? 0
+                       : -LINUX_ESRCH;
+        }
+        int64_t r = (pid == (int) our_pid) ? 0 : -LINUX_ESRCH;
         if (r == -LINUX_ESRCH) {
             pid_t hpid = proc_guest_to_host_pid((int64_t) pid);
             if (hpid > 0)
@@ -901,14 +1030,69 @@ static int64_t sc_kill(guest_t *g,
         }
         return r;
     }
-    if (pid == (int) our_pid || pid == 0 || pid == -1 ||
-        pid == -(int) our_pid) {
+    if (pid == -1) {
+        /* Broadcast: Linux delivers to every process the caller may signal
+         * except init, and per kill(2) explicitly NOT to the calling process
+         * itself. Reach every member of this fork family over the cross-process
+         * transport (the caller is excluded by proc_get_namespace_targets); the
+         * namespace-scoped, same-binary registry keeps the signal from leaking
+         * into unrelated elfuse instances.
+         */
+        proc_signal_target_t targets[256];
+        int count = proc_get_namespace_targets(targets, ARRAY_SIZE(targets),
+                                               PROC_PGID_ANY);
+        if (count == (int) ARRAY_SIZE(targets))
+            log_warn(
+                "kill(-1, %d): target set hit the %zu-pid cap; broadcast may "
+                "be partial",
+                sig, ARRAY_SIZE(targets));
+        int first_errno;
+        int delivered = kill_deliver_targets(targets, count, sig, &first_errno);
+        if (delivered > 0)
+            return 0;
+        if (count == 0)
+            return -LINUX_ESRCH;
+        /* Targets existed but every send failed: report the first transport
+         * error rather than a misleading ESRCH.
+         */
+        errno = first_errno ? first_errno : ESRCH;
+        return linux_errno();
+    }
+    if (pid == 0 || pid < -1) {
+        /* Process-group signal: pid==0 targets the caller's own group, pid<-1
+         * targets group -pid. Deliver to every tracked fork-family member in
+         * that group over the cross-process transport, plus the caller when it
+         * is a member.
+         */
+        int64_t target_pgid = (pid == 0) ? proc_get_pgid() : -(int64_t) pid;
+        proc_signal_target_t targets[256];
+        int count = proc_get_namespace_targets(targets, ARRAY_SIZE(targets),
+                                               target_pgid);
+        if (count == (int) ARRAY_SIZE(targets))
+            log_warn(
+                "kill(%d, %d): group set hit the %zu-pid cap; delivery may "
+                "be partial",
+                pid, sig, ARRAY_SIZE(targets));
+        int first_errno;
+        int delivered = kill_deliver_targets(targets, count, sig, &first_errno);
+        if (proc_get_pgid() == target_pgid) {
+            signal_queue(sig);
+            delivered++;
+        }
+        if (delivered > 0)
+            return 0;
+        errno = first_errno ? first_errno : ESRCH;
+        return count > 0 ? linux_errno() : -LINUX_ESRCH;
+    }
+    if (pid == (int) our_pid) {
         signal_queue(sig);
         return 0;
     }
     pid_t hpid = proc_guest_to_host_pid((int64_t) pid);
     if (hpid > 0)
-        return (proc_send_guest_signal(hpid, sig) == 0) ? 0 : linux_errno();
+        return (proc_send_guest_signal(hpid, (int64_t) pid, sig) == 0)
+                   ? 0
+                   : linux_errno();
     return -LINUX_ESRCH;
 }
 

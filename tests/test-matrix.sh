@@ -500,6 +500,10 @@ run_unit_tests()
     test_check "$runner" "test-signal" "PASS|0 failed" "$bindir/test-signal"
     test_check "$runner" "test-signal-thread" "PASS|0 failed" "$bindir/test-signal-thread"
     test_check "$runner" "test-sigill" "0 failed" "$bindir/test-sigill"
+    test_check "$runner" "test-kill-broadcast" "0 failed" \
+        "$bindir/test-kill-broadcast"
+    test_check "$runner" "test-kill-pgroup" "0 failed" \
+        "$bindir/test-kill-pgroup"
 
     printf "\nSocket tests\n"
     test_check "$runner" "test-socket" "PASS|0 failed" "$bindir/test-socket"

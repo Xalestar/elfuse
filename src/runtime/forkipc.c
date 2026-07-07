@@ -1528,6 +1528,14 @@ int64_t sys_clone(hv_vcpu_t vcpu,
         }
     }
 
+    /* Refresh our own process group from the registry before capturing it: a
+     * parent-side setpgid(this, ...) updates the registry but not the local
+     * cached pgid, so both the child's inherited group (hdr.pgid below) and the
+     * publish that follows would otherwise carry -- and re-stamp the registry
+     * with -- the stale group, misrouting later kill(0)/kill(-pgid).
+     */
+    proc_registry_sync_self_pgid(g);
+
     /* Snapshot of the semantic region array, populated after the memory dump
      * but before sibling vCPUs resume. Declared up front so all goto paths to
      * fail_snapshot can free it unconditionally. Header
@@ -1572,6 +1580,7 @@ int64_t sys_clone(hv_vcpu_t vcpu,
         .ctid_gva = ctid_gva,
         .shm_is_clone = (snapshot_shm_fd >= 0) ? 1 : 0,
     };
+    proc_registry_publish_self();
     if (fork_ipc_write_all(ipc_sock, &hdr, sizeof(hdr)) < 0) {
         log_error("clone: failed to send header");
         goto fail_snapshot;
@@ -1683,8 +1692,11 @@ int64_t sys_clone(hv_vcpu_t vcpu,
      * its own MAP_PRIVATE view of the same file.
      */
 
-    /* Register after successful IPC so wait4/waitid can observe the child. */
-    proc_register_child(child_host_pid, child_guest_pid);
+    /* Register after successful IPC so wait4/waitid can observe the child. Seed
+     * the child's group from the same value sent in the fork header so the
+     * parent's table matches the group the child actually inherited.
+     */
+    proc_register_child(child_host_pid, child_guest_pid, hdr.pgid);
 
     /* CLONE_VFORK suspends the parent until the child exits or execs. The
      * emulator cannot observe guest exec completion across the helper process,

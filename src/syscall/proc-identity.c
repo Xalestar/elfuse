@@ -259,6 +259,14 @@ void proc_set_session(int64_t sid, int64_t pgid)
     guest_fg_pgrp = pgid;
 }
 
+void proc_set_pgid_from_registry(guest_t *g, int64_t pgid)
+{
+    pthread_mutex_lock(&session_lock);
+    guest_pgid = pgid;
+    proc_publish_pgsid_locked(g);
+    pthread_mutex_unlock(&session_lock);
+}
+
 void proc_set_fg_pgrp(int64_t pgrp)
 {
     guest_fg_pgrp = pgrp;

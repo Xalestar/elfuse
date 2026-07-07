@@ -42,6 +42,7 @@
 #include "runtime/futex.h"
 
 #include "syscall/internal.h"
+#include "syscall/net.h"
 #include "syscall/proc-identity.h"
 #include "syscall/proc.h"
 #include "syscall/proc-pidfd.h"
@@ -90,6 +91,10 @@ static _Atomic int exit_group_requested = 0;
 static _Atomic int exit_group_code = 0;
 
 /* Public API. */
+
+static void proc_registry_publish(pid_t host_pid,
+                                  int64_t guest_pid_val,
+                                  int64_t pgid);
 
 void proc_init(void)
 {
@@ -145,11 +150,18 @@ static int proc_exit_group_code(void)
 
 static void proc_init_child_entry(proc_entry_t *entry,
                                   pid_t host_pid,
-                                  int64_t guest_pid_val)
+                                  int64_t guest_pid_val,
+                                  int64_t pgid)
 {
     entry->active = true;
     entry->host_pid = host_pid;
     entry->guest_pid = guest_pid_val;
+    /* Seed with the group the child inherited at fork. The caller passes the
+     * exact value sent in the fork IPC header so the parent's view and the
+     * child's own pgid cannot disagree even if a sibling thread changes the
+     * parent's group during the fork window.
+     */
+    entry->pgid = pgid;
     entry->exited = false;
     entry->exit_status = 0;
 }
@@ -281,13 +293,15 @@ static int proc_reap_finished(void)
     return reaped;
 }
 
-int proc_register_child(pid_t host_pid, int64_t guest_pid_val)
+int proc_register_child(pid_t host_pid, int64_t guest_pid_val, int64_t pgid)
 {
     pthread_mutex_lock(&pid_lock);
     proc_entry_t *entry = proc_find_free_entry();
     if (entry) {
-        proc_init_child_entry(entry, host_pid, guest_pid_val);
+        proc_init_child_entry(entry, host_pid, guest_pid_val, pgid);
         pthread_mutex_unlock(&pid_lock);
+        proc_registry_publish(host_pid, guest_pid_val, pgid);
+        proc_registry_publish_self();
         return 0;
     }
 
@@ -295,8 +309,10 @@ int proc_register_child(pid_t host_pid, int64_t guest_pid_val)
     if (proc_reap_finished() > 0)
         entry = proc_find_free_entry();
     if (entry) {
-        proc_init_child_entry(entry, host_pid, guest_pid_val);
+        proc_init_child_entry(entry, host_pid, guest_pid_val, pgid);
         pthread_mutex_unlock(&pid_lock);
+        proc_registry_publish(host_pid, guest_pid_val, pgid);
+        proc_registry_publish_self();
         return 0;
     }
     pthread_mutex_unlock(&pid_lock);
@@ -354,8 +370,278 @@ static bool signal_transport_path(char *out, size_t out_size, pid_t host_pid)
     return len > 0 && (size_t) len < out_size;
 }
 
-int proc_send_guest_signal(pid_t host_pid, int signum)
+static bool process_registry_path(char *out, size_t out_size)
 {
+    char dir[PATH_MAX];
+    size_t n = confstr(_CS_DARWIN_USER_TEMP_DIR, dir, sizeof(dir));
+    if (n == 0 || n > sizeof(dir))
+        return false;
+    int len = snprintf(out, out_size, "%selfuse-procs-%llu", dir,
+                       (unsigned long long) absock_get_namespace_id());
+    return len > 0 && (size_t) len < out_size;
+}
+
+static void proc_registry_reset_if_owner(const char *path)
+{
+    static _Atomic bool reset_done;
+    if (absock_get_namespace_id() != (uint64_t) getpid())
+        return;
+    if (atomic_exchange(&reset_done, true))
+        return;
+    unlink(path);
+}
+
+/* One live member of a process group registry. */
+typedef struct {
+    pid_t host_pid;
+    int64_t guest_pid;
+    int64_t pgid;
+} registry_entry_t;
+
+#define REGISTRY_MAX_ENTRIES (PROC_TABLE_SIZE * 4)
+
+/* flock() retrying past EINTR. Returns 0 on success, -1 on failure. */
+static int flock_retry(int fd, int op)
+{
+    int r;
+    do {
+        r = flock(fd, op);
+    } while (r != 0 && errno == EINTR);
+    return r;
+}
+
+/* Read @fd from its current offset and invoke @cb once per newline-terminated
+ * record, passing a NUL-terminated copy. Records must fit in 63 bytes; both the
+ * registry ("hostpid guestpid pgid") and the signal transport ("ns tgpid sig")
+ * use short numeric lines. Overlong records and an unterminated trailing token
+ * are dropped -- every writer appends a whole record under an exclusive lock,
+ * so a partial line only appears after a crash mid-write.
+ */
+static void for_each_record(int fd, void (*cb)(char *rec, void *ctx), void *ctx)
+{
+    char chunk[8192];
+    char line[64];
+    size_t linelen = 0;
+    bool overlong = false;
+    ssize_t r;
+    while ((r = read(fd, chunk, sizeof(chunk))) > 0) {
+        for (ssize_t i = 0; i < r; i++) {
+            char c = chunk[i];
+            if (c != '\n') {
+                if (linelen < sizeof(line) - 1)
+                    line[linelen++] = c;
+                else
+                    overlong = true;
+                continue;
+            }
+            if (!overlong) {
+                line[linelen] = '\0';
+                cb(line, ctx);
+            }
+            linelen = 0;
+            overlong = false;
+        }
+    }
+}
+
+typedef struct {
+    registry_entry_t *entries;
+    int max;
+    int n;
+    bool truncated;
+} registry_parse_ctx_t;
+
+/* Upsert one "hostpid guestpid pgid" record, keeping the latest guest_pid/pgid
+ * per LIVE host pid. Dead, malformed, and out-of-range records are dropped.
+ */
+static void registry_parse_cb(char *rec, void *vctx)
+{
+    registry_parse_ctx_t *c = vctx;
+    long hp;
+    long long gp, pg;
+    if (sscanf(rec, "%ld %lld %lld", &hp, &gp, &pg) != 3)
+        return;
+    if (hp <= 0 || hp > INT_MAX || pg < 0 || pg > INT_MAX)
+        return;
+    if (kill((pid_t) hp, 0) != 0)
+        return;
+    int idx = -1;
+    for (int k = 0; k < c->n; k++)
+        if (c->entries[k].host_pid == (pid_t) hp) {
+            idx = k;
+            break;
+        }
+    if (idx < 0) {
+        if (c->n == c->max) {
+            c->truncated = true;
+            return;
+        }
+        idx = c->n++;
+        c->entries[idx].host_pid = (pid_t) hp;
+    }
+    c->entries[idx].guest_pid = (int64_t) gp;
+    c->entries[idx].pgid = (int64_t) pg;
+}
+
+/* Parse the whole registry from @fd (caller holds an flock) into @entries,
+ * keeping one record per live host pid.
+ *
+ * Returns the count. @truncated_out, if non-NULL, is set true when the entry
+ * array filled up.
+ */
+static int registry_read_locked(int fd,
+                                registry_entry_t *entries,
+                                int max,
+                                bool *truncated_out)
+{
+    if (truncated_out)
+        *truncated_out = false;
+    if (lseek(fd, 0, SEEK_SET) != 0)
+        return 0;
+    registry_parse_ctx_t ctx = {.entries = entries, .max = max};
+    for_each_record(fd, registry_parse_cb, &ctx);
+    if (truncated_out)
+        *truncated_out = ctx.truncated;
+    return ctx.n;
+}
+
+/* Publish (host_pid, guest_pid, pgid), compacting the registry in place: read
+ * the live set under LOCK_EX, upsert this entry, and rewrite so the file stays
+ * bounded by the number of live group members rather than growing per event.
+ */
+static void proc_registry_publish(pid_t host_pid,
+                                  int64_t guest_pid_val,
+                                  int64_t pgid)
+{
+    char path[PATH_MAX];
+    if (!process_registry_path(path, sizeof(path)))
+        return;
+    proc_registry_reset_if_owner(path);
+    int fd = open(path, O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (fd < 0)
+        return;
+    if (flock_retry(fd, LOCK_EX) != 0) {
+        close(fd);
+        return;
+    }
+
+    registry_entry_t entries[REGISTRY_MAX_ENTRIES];
+    int n = registry_read_locked(fd, entries, REGISTRY_MAX_ENTRIES, NULL);
+    int idx = -1;
+    for (int i = 0; i < n; i++)
+        if (entries[i].host_pid == host_pid) {
+            idx = i;
+            break;
+        }
+    if (idx < 0) {
+        if (n == REGISTRY_MAX_ENTRIES)
+            /* No slot for a new live member: group signals (kill(-1),
+             * kill(-pgid), kill(0)) reaching this pid via the registry will
+             * miss it. Warn rather than drop silently.
+             */
+            log_warn(
+                "process registry full (%d live members); host pid %ld not "
+                "published, group signals may miss it",
+                REGISTRY_MAX_ENTRIES, (long) host_pid);
+        else {
+            idx = n++;
+            entries[idx].host_pid = host_pid;
+        }
+    }
+    if (idx >= 0) {
+        entries[idx].guest_pid = guest_pid_val;
+        entries[idx].pgid = pgid;
+    }
+
+    if (ftruncate(fd, 0) == 0 && lseek(fd, 0, SEEK_SET) == 0) {
+        for (int i = 0; i < n; i++) {
+            char lineb[64];
+            int len = snprintf(lineb, sizeof(lineb), "%ld %lld %lld\n",
+                               (long) entries[i].host_pid,
+                               (long long) entries[i].guest_pid,
+                               (long long) entries[i].pgid);
+            if (len > 0 && (size_t) len < sizeof(lineb) &&
+                proc_write_full(fd, lineb, (size_t) len) < 0)
+                break;
+        }
+    }
+    flock_retry(fd, LOCK_UN);
+    close(fd);
+}
+
+void proc_registry_publish_self(void)
+{
+    proc_registry_publish(getpid(), proc_get_pid(), proc_get_pgid());
+}
+
+void proc_registry_sync_self_pgid(guest_t *g)
+{
+    char path[PATH_MAX];
+    if (!process_registry_path(path, sizeof(path)))
+        return;
+    proc_registry_reset_if_owner(path);
+    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0)
+        return;
+    if (flock_retry(fd, LOCK_SH) != 0) {
+        close(fd);
+        return;
+    }
+    registry_entry_t entries[REGISTRY_MAX_ENTRIES];
+    int n = registry_read_locked(fd, entries, REGISTRY_MAX_ENTRIES, NULL);
+    flock_retry(fd, LOCK_UN);
+    close(fd);
+
+    pid_t self = getpid();
+    int64_t self_guest = proc_get_pid();
+    for (int i = 0; i < n; i++)
+        /* Match host pid AND guest pid: a stale same-host-pid record left by a
+         * recycled pid must not overwrite this process's group.
+         */
+        if (entries[i].host_pid == self && entries[i].guest_pid == self_guest) {
+            if (entries[i].pgid != proc_get_pgid())
+                proc_set_pgid_from_registry(g, entries[i].pgid);
+            return;
+        }
+}
+
+/* Path of this elfuse binary, cached. All elfuse processes run the same
+ * executable, so the value is process-independent and safe to keep across fork.
+ */
+static char elfuse_self_path_buf[PROC_PIDPATHINFO_MAXSIZE];
+static int elfuse_self_path_len;
+static pthread_once_t elfuse_self_path_once = PTHREAD_ONCE_INIT;
+
+static void elfuse_self_path_init(void)
+{
+    int l = proc_pidpath(getpid(), elfuse_self_path_buf,
+                         sizeof(elfuse_self_path_buf));
+    elfuse_self_path_len = (l > 0) ? l : 0;
+}
+
+static const char *elfuse_self_path(int *len_out)
+{
+    pthread_once(&elfuse_self_path_once, elfuse_self_path_init);
+    *len_out = elfuse_self_path_len;
+    return elfuse_self_path_buf;
+}
+
+int proc_send_guest_signal(pid_t host_pid, int64_t target_guest_pid, int signum)
+{
+    /* Refuse to signal a host pid that is not (or is no longer) an elfuse
+     * process: if it was recycled onto an unrelated program, a raw SIGUSR2
+     * would terminate it. This narrows -- but a sub-microsecond exit+reuse race
+     * before kill() remains -- see the signal-transport TODO.
+     */
+    int our_len;
+    const char *our_path = elfuse_self_path(&our_len);
+    char tpath[PROC_PIDPATHINFO_MAXSIZE];
+    int tlen = proc_pidpath(host_pid, tpath, sizeof(tpath));
+    if (our_len <= 0 || tlen != our_len || memcmp(tpath, our_path, our_len)) {
+        errno = ESRCH;
+        return -1;
+    }
+
     char path[PATH_MAX];
     if (!signal_transport_path(path, sizeof(path), host_pid)) {
         errno = ENAMETOOLONG;
@@ -367,8 +653,16 @@ int proc_send_guest_signal(pid_t host_pid, int signum)
     if (fd < 0)
         return -1;
 
-    char line[16];
-    int len = snprintf(line, sizeof(line), "%d\n", signum);
+    /* Tag the delivery with our fork-family namespace and the intended guest
+     * pid. A recycled host pid in another session sees a mismatched namespace;
+     * a host pid recycled onto a different guest inside this same session sees
+     * a mismatched guest pid. Either mismatch drops the signal instead of
+     * applying it to the wrong process.
+     */
+    char line[64];
+    int len = snprintf(line, sizeof(line), "%llu %lld %d\n",
+                       (unsigned long long) absock_get_namespace_id(),
+                       (long long) target_guest_pid, signum);
     if (len < 0 || (size_t) len >= sizeof(line)) {
         close(fd);
         errno = EINVAL;
@@ -381,12 +675,12 @@ int proc_send_guest_signal(pid_t host_pid, int signum)
      * after its truncate (and the SIGUSR2 below triggers the next drain).
      * Neither side can route this write to an orphaned inode or discard it.
      */
-    if (flock(fd, LOCK_EX) < 0) {
+    if (flock_retry(fd, LOCK_EX) != 0) {
         close(fd);
         return -1;
     }
     int wrc = proc_write_full(fd, line, (size_t) len);
-    flock(fd, LOCK_UN);
+    flock_retry(fd, LOCK_UN);
     if (wrc < 0) {
         close(fd);
         return -1;
@@ -399,9 +693,8 @@ int proc_send_guest_signal(pid_t host_pid, int signum)
     return kill(host_pid, SIGUSR2);
 }
 
-int proc_get_child_pids(pid_t *out, int max_pids)
+int proc_get_direct_child_pids(pid_t *out, int max_pids)
 {
-    /* Seed with direct children from the process table */
     int count = 0;
     pthread_mutex_lock(&pid_lock);
     for (int i = 0; i < PROC_TABLE_SIZE && count < max_pids; i++) {
@@ -409,6 +702,82 @@ int proc_get_child_pids(pid_t *out, int max_pids)
             out[count++] = proc_table[i].host_pid;
     }
     pthread_mutex_unlock(&pid_lock);
+    return count;
+}
+
+int proc_set_child_pgid(int64_t guest_pid_val, int64_t pgid)
+{
+    int ret = -1;
+    pid_t host_pid = -1;
+    pthread_mutex_lock(&pid_lock);
+    proc_entry_t *entry = proc_find_guest_entry(guest_pid_val);
+    if (entry) {
+        entry->pgid = pgid;
+        host_pid = entry->host_pid;
+        ret = 0;
+    }
+    pthread_mutex_unlock(&pid_lock);
+    if (host_pid > 0)
+        proc_registry_publish(host_pid, guest_pid_val, pgid);
+    return ret;
+}
+
+int proc_get_namespace_targets(proc_signal_target_t *out,
+                               int max,
+                               int64_t pgid_filter)
+{
+    /* No republish here: every group change already publishes (fork, setpgid,
+     * setsid), and this reader excludes its own entry anyway.
+     */
+    char path[PATH_MAX];
+    if (!process_registry_path(path, sizeof(path)))
+        return 0;
+    proc_registry_reset_if_owner(path);
+    int fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0)
+        return 0;
+    if (flock_retry(fd, LOCK_SH) != 0) {
+        close(fd);
+        return 0;
+    }
+    registry_entry_t entries[REGISTRY_MAX_ENTRIES];
+    bool truncated = false;
+    int nentries =
+        registry_read_locked(fd, entries, REGISTRY_MAX_ENTRIES, &truncated);
+    flock_retry(fd, LOCK_UN);
+    close(fd);
+    if (truncated)
+        log_warn(
+            "process-group registry exceeded %d live members; group "
+            "signal delivery may be partial",
+            REGISTRY_MAX_ENTRIES);
+
+    int count = 0;
+    pid_t self = getpid();
+    char our_path[PROC_PIDPATHINFO_MAXSIZE];
+    int our_len = proc_pidpath(self, our_path, sizeof(our_path));
+    if (our_len <= 0)
+        return 0;
+    for (int i = 0; i < nentries && count < max; i++) {
+        if (entries[i].host_pid == self)
+            continue;
+        if (pgid_filter != PROC_PGID_ANY && entries[i].pgid != pgid_filter)
+            continue;
+        char ppath[PROC_PIDPATHINFO_MAXSIZE];
+        int plen = proc_pidpath(entries[i].host_pid, ppath, sizeof(ppath));
+        if (plen != our_len || memcmp(ppath, our_path, (size_t) our_len))
+            continue;
+        out[count].host_pid = entries[i].host_pid;
+        out[count].guest_pid = entries[i].guest_pid;
+        count++;
+    }
+    return count;
+}
+
+int proc_get_child_pids(pid_t *out, int max_pids)
+{
+    /* Seed with direct children from the process table */
+    int count = proc_get_direct_child_pids(out, max_pids);
 
     /* Recursively collect descendants via proc_listchildpids. Orphaned
      * grandchildren (PPID=1) are not found this way, so also check all host
@@ -1035,6 +1404,38 @@ static void unlink_own_transport(void)
     char path[PATH_MAX];
     if (signal_transport_path(path, sizeof(path), getpid()))
         unlink(path);
+
+    /* The namespace owner cleans the registry, but only once no other live
+     * member still needs it: if the owner exits while fork children survive,
+     * deleting the file would blind their kill(-1)/kill(0)/kill(-pgid). A rare
+     * orphaned family that outlives its owner leaves the file for the next
+     * same-pid run's reset (proc_registry_reset_if_owner) or the OS temp-dir
+     * purge.
+     */
+    if (absock_get_namespace_id() != (uint64_t) getpid())
+        return;
+    if (!process_registry_path(path, sizeof(path)))
+        return;
+    int fd = open(path, O_RDWR | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0)
+        return;
+    if (flock_retry(fd, LOCK_EX) != 0) {
+        close(fd);
+        return;
+    }
+    registry_entry_t entries[REGISTRY_MAX_ENTRIES];
+    int n = registry_read_locked(fd, entries, REGISTRY_MAX_ENTRIES, NULL);
+    pid_t self = getpid();
+    bool others = false;
+    for (int i = 0; i < n; i++)
+        if (entries[i].host_pid != self) {
+            others = true;
+            break;
+        }
+    if (!others)
+        unlink(path);
+    flock_retry(fd, LOCK_UN);
+    close(fd);
 }
 
 /* Call once from the main thread before any vCPU thread is created; the
@@ -1089,6 +1490,41 @@ int proc_preempt_init(void)
     return 0;
 }
 
+typedef struct {
+    uint64_t my_ns;
+    int64_t my_guest_pid;
+} sig_drain_ctx_t;
+
+/* Parse one NUL-terminated "namespace target_guest_pid signum" transport record
+ * and queue the signal only when both the fork-family namespace and the
+ * intended guest pid match this process. A namespace mismatch means the host
+ * pid was recycled from an unrelated session; a guest-pid mismatch means it was
+ * recycled onto a different guest in this session. Either way the delivery is
+ * dropped.
+ */
+static void sig_drain_cb(char *rec, void *vctx)
+{
+    sig_drain_ctx_t *c = vctx;
+    char *p = rec, *end;
+    unsigned long long ns = strtoull(p, &end, 10);
+    if (end == p)
+        return;
+    p = end;
+    long long tgpid = strtoll(p, &end, 10);
+    if (end == p)
+        return;
+    p = end;
+    long signum = strtol(p, &end, 10);
+    /* Reject any trailing garbage so a forged record like "<ns> <pid> 9junk"
+     * from a same-user temp-dir writer cannot be accepted as a bare signal.
+     */
+    if (end == p || *end != '\0')
+        return;
+    if (ns == c->my_ns && tgpid == c->my_guest_pid &&
+        RANGE_CHECK(signum, 1, LINUX_NSIG))
+        signal_queue((int) signum);
+}
+
 static void drain_external_guest_signal(void)
 {
     if (!atomic_exchange_explicit(&g_external_guest_signal, 0,
@@ -1112,53 +1548,25 @@ static void drain_external_guest_signal(void)
      * reintroducing the unlink-vs-append race; the process unlinks its own
      * empty file at exit (unlink_own_transport) so the temp dir stays clean.
      */
-    if (flock(fd, LOCK_EX) < 0) {
+    if (flock_retry(fd, LOCK_EX) != 0) {
         close(fd);
         return;
     }
 
-    /* Read the whole file in chunks, queuing each complete "signum\n" line and
-     * carrying any partial trailing token across chunk boundaries. Valid tokens
-     * are a few bytes, so the carry never fills the buffer; a lone oversized
-     * garbage token is dropped harmlessly (read returns 0 once the buffer is
-     * full with no newline).
+    sig_drain_ctx_t ctx = {.my_ns = absock_get_namespace_id(),
+                           .my_guest_pid = proc_get_pid()};
+    for_each_record(fd, sig_drain_cb, &ctx);
+
+    /* Report a failed truncate: the same records would re-drain on the next
+     * doorbell and re-queue already-delivered signals. Do not early-return --
+     * the lock still has to be released and the fd closed.
      */
-    char buf[256];
-    size_t used = 0;
-    for (;;) {
-        ssize_t n = read(fd, buf + used, sizeof(buf) - 1 - used);
-        if (n <= 0)
-            break;
-        used += (size_t) n;
-        buf[used] = '\0';
-
-        char *start = buf, *nl;
-        while ((nl = memchr(start, '\n', (size_t) (buf + used - start))) !=
-               NULL) {
-            *nl = '\0';
-            long signum = strtol(start, NULL, 10);
-            if (RANGE_CHECK(signum, 1, LINUX_NSIG))
-                signal_queue((int) signum);
-            start = nl + 1;
-        }
-        size_t rem = (size_t) (buf + used - start);
-        memmove(buf, start, rem);
-        used = rem;
-    }
-
-    /* Senders write whole "signum\n" records under the same lock, so used is
-     * normally 0 here. Parse any unterminated trailing token defensively so a
-     * record left by a crashed sender is not silently dropped by the truncate.
-     */
-    if (used > 0) {
-        buf[used] = '\0';
-        long signum = strtol(buf, NULL, 10);
-        if (RANGE_CHECK(signum, 1, LINUX_NSIG))
-            signal_queue((int) signum);
-    }
-
-    ftruncate(fd, 0);
-    flock(fd, LOCK_UN);
+    if (ftruncate(fd, 0) != 0)
+        log_warn(
+            "signal transport truncate failed (%s); queued signals may "
+            "re-deliver",
+            strerror(errno));
+    flock_retry(fd, LOCK_UN);
     close(fd);
 }
 

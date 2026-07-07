@@ -245,7 +245,7 @@ int64_t sys_pidfd_send_signal(guest_t *g,
                 return -LINUX_ESRCH;
             return 0;
         }
-        if (proc_send_guest_signal(host_pid, sig) < 0)
+        if (proc_send_guest_signal(host_pid, pid, sig) < 0)
             return linux_errno();
         return 0;
     }
