@@ -22,19 +22,28 @@
  * 11. shutdown(SHUT_WR) causes read to return 0 (EOF)
  * 12. socketpair(AF_UNIX, SOCK_SEQPACKET)
  * 13. socket(AF_UNIX, SOCK_SEQPACKET)
- * 14. zero-length recvmsg returns immediately
+ * 14. zero-length recvmsg follows receive-readiness semantics (EAGAIN when
+ *     nonblocking and empty, blocks when empty, 0 without consuming when
+ *     data is pending)
  * 15. invalid recvmsg iov returns EFAULT immediately
  */
 
+#include <signal.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/un.h>
 #include <sys/uio.h>
 #include <netinet/in.h>
+
+static void alarm_noop(int sig)
+{
+    (void) sig;
+}
 
 int main(void)
 {
@@ -388,8 +397,14 @@ int main(void)
         failures++;
     }
 
-    /* Test 14: zero-length recvmsg returns immediately */
-    printf("test-socket: 14. zero-length recvmsg returns immediately... ");
+    /* Test 14: zero-length recvmsg follows receive-readiness semantics. Linux
+     * clamps the receive low-water target to one byte (sock_rcvlowat returns
+     * v ?: 1), so a zero-length recvmsg behaves like a one-byte receive for
+     * readiness: EAGAIN on an empty nonblocking socket, blocks on an empty
+     * blocking socket (observed here as EINTR via alarm), and returns 0
+     * without consuming anything once data is pending.
+     */
+    printf("test-socket: 14. zero-length recvmsg readiness semantics... ");
     {
         int zsv[2];
         if (socketpair(AF_UNIX, SOCK_STREAM, 0, zsv) < 0) {
@@ -402,13 +417,63 @@ int main(void)
                 {.iov_base = &dummy, .iov_len = 0},
             };
             struct msghdr zmsg = {.msg_iov = ziov, .msg_iovlen = 2};
-            n = recvmsg(zsv[1], &zmsg, 0);
-            if (n == 0)
-                printf("PASS\n");
-            else {
-                printf("FAIL (recvmsg returned %zd errno=%d)\n", n, errno);
-                failures++;
+            int zfail = 0;
+
+            /* Empty socket, nonblocking: EAGAIN, not 0. */
+            errno = 0;
+            n = recvmsg(zsv[1], &zmsg, MSG_DONTWAIT);
+            if (n != -1 || errno != EAGAIN) {
+                printf("FAIL (empty dontwait: n=%zd errno=%d)\n", n, errno);
+                zfail++;
             }
+
+            /* Empty socket, blocking: parks until the timer interrupts. A
+             * repeating interval (not a one-shot alarm) closes the race where
+             * the first SIGALRM lands before recvmsg enters the kernel and
+             * the call then blocks with no interrupt left.
+             */
+            struct sigaction zsa, old_zsa;
+            memset(&zsa, 0, sizeof(zsa));
+            zsa.sa_handler = alarm_noop; /* no SA_RESTART */
+            sigaction(SIGALRM, &zsa, &old_zsa);
+            struct itimerval zit = {
+                .it_value = {.tv_sec = 1, .tv_usec = 0},
+                .it_interval = {.tv_sec = 1, .tv_usec = 0},
+            };
+            struct itimerval zit_off = {{0, 0}, {0, 0}};
+            setitimer(ITIMER_REAL, &zit, NULL);
+            errno = 0;
+            n = recvmsg(zsv[1], &zmsg, 0);
+            int zerrno = errno;
+            setitimer(ITIMER_REAL, &zit_off, NULL);
+            sigaction(SIGALRM, &old_zsa, NULL);
+            if (n != -1 || zerrno != EINTR) {
+                printf("FAIL (empty blocking: n=%zd errno=%d)\n", n, zerrno);
+                zfail++;
+            }
+
+            /* Data pending: returns 0 and leaves the byte queued. */
+            char kept = 0;
+            ssize_t klen = -1;
+            if (write(zsv[0], "X", 1) != 1) {
+                printf("FAIL (write: %m)\n");
+                zfail++;
+            } else {
+                errno = 0;
+                n = recvmsg(zsv[1], &zmsg, 0);
+                klen = read(zsv[1], &kept, 1);
+                if (n != 0 || klen != 1 || kept != 'X') {
+                    printf(
+                        "FAIL (pending: recvmsg=%zd read=%zd byte=0x%02x "
+                        "errno=%d)\n",
+                        n, klen, (unsigned char) kept, errno);
+                    zfail++;
+                }
+            }
+
+            if (zfail == 0)
+                printf("PASS\n");
+            failures += zfail;
             close(zsv[0]);
             close(zsv[1]);
         }

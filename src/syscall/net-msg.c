@@ -442,13 +442,12 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags)
                 len = (size_t) avail;
         }
 
-        if (len > 0) {
-            int64_t waited =
-                net_wait_or_interrupted(host_ref.fd, POLLIN, flags);
-            if (waited < 0) {
-                host_fd_ref_close(&host_ref);
-                return waited;
-            }
+        int64_t waited =
+            len > 0 ? net_wait_or_interrupted(host_ref.fd, POLLIN, flags)
+                    : net_recv_zero_payload_gate(host_ref.fd, flags);
+        if (waited < 0) {
+            host_fd_ref_close(&host_ref);
+            return waited;
         }
 
         struct iovec host_iov = {
@@ -494,13 +493,13 @@ int64_t sys_recvmsg(guest_t *g, int fd, uint64_t msg_gva, int flags)
         host_fd_ref_close(&host_ref);
         return iov_err;
     }
-    if (host_iov_has_payload(&host_iov, recv_iovcnt)) {
-        int64_t waited = net_wait_or_interrupted(host_ref.fd, POLLIN, flags);
-        if (waited < 0) {
-            host_iov_free(&host_iov);
-            host_fd_ref_close(&host_ref);
-            return waited;
-        }
+    int64_t waited = host_iov_has_payload(&host_iov, recv_iovcnt)
+                         ? net_wait_or_interrupted(host_ref.fd, POLLIN, flags)
+                         : net_recv_zero_payload_gate(host_ref.fd, flags);
+    if (waited < 0) {
+        host_iov_free(&host_iov);
+        host_fd_ref_close(&host_ref);
+        return waited;
     }
 
     struct sockaddr_storage mac_sa;
@@ -952,13 +951,12 @@ int64_t sys_recvmmsg(guest_t *g,
                 .msg_iov = &host_iov,
                 .msg_iovlen = 1,
             };
-            if (len > 0) {
-                int64_t waited =
-                    net_wait_or_interrupted(host_ref.fd, POLLIN, flags);
-                if (waited < 0) {
-                    host_fd_ref_close(&host_ref);
-                    return waited;
-                }
+            int64_t waited =
+                len > 0 ? net_wait_or_interrupted(host_ref.fd, POLLIN, flags)
+                        : net_recv_zero_payload_gate(host_ref.fd, flags);
+            if (waited < 0) {
+                host_fd_ref_close(&host_ref);
+                return waited;
             }
             ssize_t ret = recvmsg(host_ref.fd, &host_msg, mac_flags);
             if (ret < 0) {

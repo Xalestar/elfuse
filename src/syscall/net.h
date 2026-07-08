@@ -165,6 +165,16 @@ int64_t sys_shutdown(int fd, int how);
  */
 int64_t net_wait_or_interrupted(int host_fd, short events, int msg_flags);
 
+/* Readiness gate for a zero-payload recv/recvfrom/recvmsg: Linux clamps the
+ * receive low-water target to one byte, so an empty socket blocks (EINTR on
+ * guest signal) or fails EAGAIN when nonblocking, rather than returning 0
+ * like the macOS host call. Call before the host receive when the resolved
+ * payload length is zero.
+ *
+ * Returns 0 to proceed or a negative Linux errno (EINTR/EAGAIN).
+ */
+int64_t net_recv_zero_payload_gate(int host_fd, int msg_flags);
+
 /* True when a socket send/recv should wait interruptibly and retry on EAGAIN
  * rather than surface it (guest wants blocking semantics: no MSG_DONTWAIT, fd
  * not O_NONBLOCK). Send/recv paths pair this with a per-call MSG_DONTWAIT probe

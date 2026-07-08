@@ -43,6 +43,8 @@
 #include "syscall/io.h"
 #include "syscall/signal.h"
 
+/* Linux MSG_OOB: urgent-data receive, never gated on readiness. */
+#define LINUX_MSG_OOB 0x01
 /* Linux MSG_DONTWAIT: recv/send skip the interruptible wait when set. */
 #define LINUX_MSG_DONTWAIT 0x40
 
@@ -62,6 +64,37 @@ int64_t net_wait_or_interrupted(int host_fd, short events, int msg_flags)
     if (fl < 0 || (fl & O_NONBLOCK))
         return 0;
     return io_wait_fd_or_interrupted(host_fd, events);
+}
+
+/* Linux clamps a socket receive's low-water target to one byte (sock_rcvlowat
+ * returns v ?: 1), so a zero-payload recv/recvfrom/recvmsg on an empty socket
+ * blocks -- or fails EAGAIN when nonblocking -- instead of returning 0 the way
+ * the macOS host call does. (read() is the exception: sock_read_iter returns 0
+ * for a zero count, so sys_read stays untouched.) Gate the host call on
+ * readability: an interruptible wait for blocking callers, a zero-timeout
+ * readiness probe for nonblocking ones. EOF counts as readable in both, and
+ * the host call then returns 0 like Linux.
+ *
+ * Returns 0 to proceed or a negative Linux errno (EINTR/EAGAIN).
+ */
+int64_t net_recv_zero_payload_gate(int host_fd, int msg_flags)
+{
+    /* Linux's urgent-data receive path never waits for readiness: with no
+     * urgent data queued, recv(MSG_OOB) fails EINVAL immediately whether the
+     * socket blocks or not (tcp_recv_urg, unix_stream_recv_urg; verified on
+     * 6.12). Pass straight to the host call, which fails the same way.
+     */
+    if (msg_flags & LINUX_MSG_OOB)
+        return 0;
+    if (sock_op_should_block(host_fd, msg_flags))
+        return io_wait_fd_or_interrupted(host_fd, POLLIN);
+    struct pollfd pfd = {.fd = host_fd, .events = POLLIN};
+    int ready = poll(&pfd, 1, 0);
+    if (ready < 0)
+        return linux_errno();
+    if (ready == 0)
+        return -LINUX_EAGAIN;
+    return 0;
 }
 
 /* True when a socket send/recv should wait interruptibly and retry rather than
@@ -877,17 +910,17 @@ int64_t sys_recvfrom(guest_t *g,
 
     int mac_flags = translate_msg_flags(flags);
 
-    /* A zero-length recv returns 0 without blocking on Linux; only wait when
-     * there is a buffer to fill. A single interruptible wait (not a
-     * MSG_DONTWAIT probe loop) preserves MSG_WAITALL semantics; the tiny
-     * ready-then-stolen window can still block, matching sys_read.
+    /* A single interruptible wait (not a MSG_DONTWAIT probe loop) preserves
+     * MSG_WAITALL semantics; the tiny ready-then-stolen window can still
+     * block, matching sys_read. A zero-length recv takes the readiness gate
+     * instead: unlike read(), Linux blocks it on an empty socket.
      */
-    if (len > 0) {
-        int64_t waited = net_wait_or_interrupted(host_ref.fd, POLLIN, flags);
-        if (waited < 0) {
-            host_fd_ref_close(&host_ref);
-            return waited;
-        }
+    int64_t waited = len > 0
+                         ? net_wait_or_interrupted(host_ref.fd, POLLIN, flags)
+                         : net_recv_zero_payload_gate(host_ref.fd, flags);
+    if (waited < 0) {
+        host_fd_ref_close(&host_ref);
+        return waited;
     }
 
     struct sockaddr_storage mac_sa;
