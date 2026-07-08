@@ -243,11 +243,10 @@ unstage_sysroot_fixtures()
 
 # Generic test helpers.
 
-# The qemu reference lane skips only tests that assert an elfuse-specific stub
-# contract a real kernel does not honor: test-sysfs-cpu checks the
-# cache/topology subtree is empty, possible == online, and cpuN count == online
-# count. The listed tests still run in elfuse-aarch64 mode and in 'make check';
-# the qemu reference run skips them.
+# The qemu reference lane now runs every matrix test against the real Alpine
+# linux-virt kernel, so QEMU_SKIP is empty. Add a test's name here only if it
+# asserts elfuse-specific behavior a real kernel does not honor; it still runs
+# in elfuse-aarch64 mode and in 'make check'.
 #
 # The two oom_adj/oom_score_adj sendfile-and-copy_file_range-interception
 # subtests that used to make test-io-opt diverge here were split out into
@@ -255,9 +254,7 @@ unstage_sysroot_fixtures()
 # see that file's header comment. test-io-opt itself is now pure portable
 # sendfile/fsync/fallocate/copy_file_range coverage and runs against qemu
 # like any other test.
-QEMU_SKIP="
-test-sysfs-cpu
-"
+QEMU_SKIP=""
 
 is_qemu_skipped()
 {
