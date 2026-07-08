@@ -91,6 +91,7 @@ test-netlink
 [section] Threading tests
 test-thread                    # diff=skip
 test-pthread
+test-thread-churn
 test-simd-clone                # diff=skip
 
 [section] Stress tests

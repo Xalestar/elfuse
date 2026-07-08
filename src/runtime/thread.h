@@ -35,23 +35,42 @@
  * signal API without an include cycle.
  */
 typedef struct thread_entry {
-    int64_t guest_tid;        /* Linux TID (unique per thread) */
-    hv_vcpu_t vcpu;           /* HVF vCPU handle for this thread */
-    hv_vcpu_exit_t *vexit;    /* vCPU exit info pointer */
-    pthread_t host_thread;    /* macOS host thread running this vCPU */
-    uint64_t clear_child_tid; /* GVA for CLONE_CHILD_CLEARTID (0=none) */
-    uint64_t sp_el1;          /* Per-thread EL1 stack top (IPA) */
-    int sp_el1_slot;          /* Slot index in sp_el1_allocated (-1 = none).
-                               * Stored at alloc time so the free path does
-                               * not need to recompute (top - sp) / 4096; the
-                               * shim data block is now at high IPA and only
-                               * known via guest_t.
-                               */
-    int active;               /* Non-zero while thread is running.
-                               * Stays int (not bool) because lock-free paths in thread.c
-                               * use __atomic_load_n on this field; the 32-bit width keeps
-                               * the access pattern predictable across architectures.
-                               */
+    int64_t guest_tid;           /* Linux TID (unique per thread) */
+    hv_vcpu_t vcpu;              /* HVF vCPU handle for this thread */
+    hv_vcpu_exit_t *vexit;       /* vCPU exit info pointer */
+    pthread_t host_thread;       /* macOS host thread running this vCPU */
+    bool host_thread_needs_join; /* host_thread was created joinable and nobody
+                                  * has joined it yet. Exactly one claimer
+                                  * clears the flag under thread_lock before
+                                  * joining: slot reuse in thread_alloc,
+                                  * teardown in thread_join_workers, or the
+                                  * clone startup-failure rollback. Never set
+                                  * for the main thread or vm-clone children
+                                  * (the latter are created detached). */
+    uint64_t clear_child_tid;    /* GVA for CLONE_CHILD_CLEARTID (0=none) */
+    uint64_t sp_el1;             /* Per-thread EL1 stack top (IPA) */
+    int sp_el1_slot;             /* Slot index in sp_el1_allocated (-1 = none).
+                                  * Stored at alloc time so the free path does
+                                  * not need to recompute (top - sp) / 4096; the
+                                  * shim data block is now at high IPA and only
+                                  * known via guest_t.
+                                  */
+    int active;                  /* Non-zero while thread is running.
+                                  * Stays int (not bool) because lock-free paths in thread.c
+                                  * use __atomic_load_n on this field; the 32-bit width keeps
+                                  * the access pattern predictable across architectures.
+                                  */
+    uint64_t generation; /* Bumped by thread_alloc each time this slot is
+                          * reused. Lets a caller holding a t pointer detect
+                          * that its slot was recycled to a different logical
+                          * thread while it was not looking (e.g. a clone
+                          * parent that raced with a starting-up worker's own
+                          * failure path). Read/written under thread_lock,
+                          * except for the lock-free comparison in
+                          * thread_join_workers' teardown poll, which uses
+                          * acquire/release ordering against thread_alloc's
+                          * release-store.
+                          */
     /* Per-thread signal mask (POSIX requires each thread to have its own).
      * Initialized to the parent's mask on clone, modified via rt_sigprocmask.
      */
@@ -179,6 +198,30 @@ thread_entry_t *thread_alloc(int64_t tid,
 
 /* Mark a thread as inactive and release its table slot. */
 void thread_deactivate(thread_entry_t *t);
+
+/* Record the host pthread backing this entry, under thread_lock so concurrent
+ * table readers (thread_join_workers snapshot, thread_alloc slot reuse) see a
+ * consistent handle. joinable marks the handle as needing a pthread_join
+ * before its slot can be reused; pass false for detached pthreads (vm-clone
+ * children). generation must be the value of t->generation the caller
+ * observed when it obtained t from thread_alloc: if the slot was recycled to
+ * a different logical thread in the meantime (the calling worker failed
+ * startup and deactivated before this call ran), the current generation no
+ * longer matches and the write is rejected -- the caller then owns thr
+ * exclusively and must join or detach it itself. Returns true if recorded.
+ */
+bool thread_set_host_thread(thread_entry_t *t,
+                            pthread_t thr,
+                            bool joinable,
+                            uint64_t generation);
+
+/* Atomically claim the right to pthread_join a worker's handle. Returns true
+ * when the caller must join thr; false when someone else (slot reuse in
+ * thread_alloc) already claimed it, or the slot no longer holds thr. Used by
+ * the clone startup-failure rollback so the parent's join cannot race with a
+ * concurrent slot reuse joining the same terminated pthread.
+ */
+bool thread_claim_worker_join(thread_entry_t *t, pthread_t thr);
 
 /* Find a thread by guest TID. Returns NULL if not found. */
 thread_entry_t *thread_find(int64_t tid);

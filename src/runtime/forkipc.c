@@ -642,6 +642,13 @@ static int64_t sys_clone_thread(hv_vcpu_t parent_vcpu,
         log_error("clone_thread: thread table full");
         return -LINUX_EAGAIN;
     }
+    /* Captured now, while the slot is guaranteed still ours (thread_alloc just
+     * marked it active, so no concurrent thread_alloc reuse-scan will touch
+     * it until our own worker deactivates it). Passed to
+     * thread_set_host_thread below so it can detect whether this exact slot
+     * got recycled to a different logical thread before that call runs.
+     */
+    uint64_t t_generation = t->generation;
 
     /* Inherit parent's signal mask (POSIX: clone inherits blocked mask) */
     if (current_thread)
@@ -685,8 +692,9 @@ static int64_t sys_clone_thread(hv_vcpu_t parent_vcpu,
         return -LINUX_EFAULT;
     }
 
-    /* Create the host pthread (joinable; exit_group joins all workers via
-     * thread_join_workers_cb before process exit). Threads clean up their TID
+    /* Create the host pthread (joinable; teardown joins live workers via
+     * thread_join_workers, and a worker that exits on its own is joined when
+     * its table slot is reused by thread_alloc). Threads clean up their TID
      * address via CLONE_CHILD_CLEARTID + futex wake.
      */
     pthread_t host_thread;
@@ -710,7 +718,19 @@ static int64_t sys_clone_thread(hv_vcpu_t parent_vcpu,
         return -LINUX_EAGAIN;
     }
 
-    t->host_thread = host_thread;
+    /* If this returns false, the worker already hit its startup_failed path
+     * and thread_deactivate'd t fast enough for a concurrent clone to recycle
+     * the slot before this write -- t no longer refers to our worker, so the
+     * write is skipped rather than clobbering the new occupant (a race
+     * flagged by review: recording host_thread unconditionally could corrupt
+     * the recycled slot's real handle). A mismatch can only happen alongside
+     * a startup failure (thread_deactivate is the sole precondition for
+     * reuse, and nothing else calls it this early), so the failure branch
+     * below is guaranteed to run and is solely responsible for reaping
+     * host_thread in that case.
+     */
+    bool host_thread_recorded =
+        thread_set_host_thread(t, host_thread, true, t_generation);
 
     pthread_mutex_lock(&startup.lock);
     while (!startup.ready)
@@ -724,7 +744,24 @@ static int64_t sys_clone_thread(hv_vcpu_t parent_vcpu,
          * live-looking TID behind for a thread that never started, so restore
          * the slots before the parent sees the error.
          */
-        pthread_join(host_thread, NULL);
+        if (host_thread_recorded) {
+            /* The worker deactivated its slot before signaling the handshake,
+             * so a concurrent clone may already have reused the slot and
+             * joined the handle at reuse time; claim the join to guarantee
+             * exactly one joiner.
+             */
+            if (thread_claim_worker_join(t, host_thread))
+                pthread_join(host_thread, NULL);
+        } else {
+            /* The write above was rejected: some other clone recycled t
+             * before we could record host_thread, so no table entry
+             * references it and nobody else will ever join it. We are the
+             * only owner. The worker's startup_failed path is a short,
+             * non-blocking sequence (no guest code ever ran), so this join
+             * returns promptly.
+             */
+            pthread_join(host_thread, NULL);
+        }
         clone_rollback_tid_flags(g, &tid_rollback);
         return startup.startup_rc;
     }
@@ -963,6 +1000,7 @@ static int64_t sys_clone_vm(hv_vcpu_t parent_vcpu,
         log_error("clone_vm: thread table full");
         return -LINUX_EAGAIN;
     }
+    uint64_t t_generation = t->generation;
 
     /* Mark as VM-clone child (waitable via wait4, not CLONE_THREAD) */
     t->is_vm_clone = true;
@@ -1027,7 +1065,14 @@ static int64_t sys_clone_vm(hv_vcpu_t parent_vcpu,
         return -LINUX_EAGAIN;
     }
 
-    t->host_thread = host_thread;
+    /* Detached: the pthread runtime reclaims the thread on exit, so the handle
+     * must never be joined (host_thread_needs_join stays false). The
+     * generation check always succeeds here: unlike sys_clone_thread's
+     * worker, a vm-clone worker that fails HVF bring-up
+     * (vm_clone_report_bringup_failure) keeps the slot active for wait4
+     * rather than deactivating it, so t cannot be recycled before this call.
+     */
+    (void) thread_set_host_thread(t, host_thread, false, t_generation);
 
     log_debug(
         "clone_vm: child tid=%lld created "

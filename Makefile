@@ -196,6 +196,11 @@ $(BUILD_DIR)/test-pthread: tests/test-pthread.c | $(BUILD_DIR)
 	@echo "  CROSS   $< (with -lpthread)"
 	$(Q)$(CROSS_COMPILE)gcc -D_GNU_SOURCE -static -O2 -o $@ $< -lpthread
 
+# test-thread-churn creates >64 threads to force thread-table slot reuse.
+$(BUILD_DIR)/test-thread-churn: tests/test-thread-churn.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc -D_GNU_SOURCE -static -O2 -o $@ $< -lpthread
+
 # test-poll uses pthread_kill to verify blocked read signal delivery.
 $(BUILD_DIR)/test-poll: tests/test-poll.c | $(BUILD_DIR)
 	@echo "  CROSS   $< (with -lpthread)"
