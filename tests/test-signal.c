@@ -6,14 +6,16 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * Verifies:
- * 1. rt_sigaction installs a handler for SIGUSR1
- * 2. kill(getpid(), SIGUSR1) delivers the signal
- * 3. Handler fires with correct signum
- * 4. rt_sigreturn restores all callee-saved registers
+ * 1. Basic delivery: rt_sigaction installs a handler for SIGUSR1,
+ *    kill(getpid(), SIGUSR1) fires it with the correct signum
+ * 2. rt_sigreturn restores all callee-saved registers
  *    (aarch64: X19-X28, x86_64: rbx/r12-r15)
- * 5. sigprocmask blocks/unblocks signals correctly
+ * 3. sigprocmask blocks/unblocks signals correctly
+ * 4. SA_RESETHAND resets the handler to SIG_DFL after delivery
+ * 5. alarm() interrupts a blocking read with EINTR
  */
 
+#include <errno.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -184,6 +186,41 @@ int main(void)
         } else {
             printf("FAIL (handler not reset to SIG_DFL)\n");
             failures++;
+        }
+    }
+
+    /* Test 5: alarm() interrupts a blocking read. The guest ITIMER_REAL is
+     * virtual, so the expiry must be materialized while the thread is parked
+     * inside the interruptible wait, not only in the syscall epilogue.
+     */
+    printf("test-signal: 5. alarm interrupts blocking read (EINTR)... ");
+    {
+        int p[2];
+        if (pipe(p) != 0) {
+            printf("FAIL (pipe: %m)\n");
+            failures++;
+        } else {
+            memset(&sa, 0, sizeof(sa));
+            sa.sa_handler = sigusr1_handler; /* no SA_RESTART */
+            sigemptyset(&sa.sa_mask);
+            sigaction(SIGALRM, &sa, NULL);
+            handler_called = 0;
+            char c;
+            alarm(1);
+            errno = 0;
+            ssize_t n = read(p[0], &c, 1);
+            int read_errno = errno;
+            alarm(0);
+            if (n == -1 && read_errno == EINTR && handler_called &&
+                handler_signum == SIGALRM) {
+                printf("PASS\n");
+            } else {
+                printf("FAIL (n=%zd errno=%d handler=%d signum=%d)\n", n,
+                       read_errno, (int) handler_called, handler_signum);
+                failures++;
+            }
+            close(p[0]);
+            close(p[1]);
         }
     }
 

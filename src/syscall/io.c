@@ -164,6 +164,13 @@ int64_t io_wait_fd_or_interrupted(int host_fd, short events)
     };
 
     for (;;) {
+        /* Materialize expired guest interval timers first: ITIMER_REAL is
+         * virtual and only converted to a pending SIGALRM by the syscall
+         * epilogue, which cannot run while this thread is parked here. The
+         * futex wait loops do the same.
+         */
+        signal_check_timer();
+
         /* Ignored/default-ignore signals do not interrupt; restartable handlers
          * still need to run promptly through the syscall epilogue.
          */
