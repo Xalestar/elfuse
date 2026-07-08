@@ -607,16 +607,16 @@ static int64_t sc_setpgid(guest_t *g,
      * pid/pgid is seen as negative, not a large positive.
      */
     int pid = (int) x0, pgid = (int) x1;
-    /* Linux rejects a negative group id with EINVAL and a negative pid (no such
-     * process) with ESRCH before any group change.
+    /* Kernel order: default pid/pgid before validation, so setpgid(-9, 0)
+     * turns the pgid negative and fails EINVAL, not ESRCH.
      */
-    if (pgid < 0)
-        return -LINUX_EINVAL;
-    if (pid < 0)
-        return -LINUX_ESRCH;
     int64_t self = proc_get_pid();
     int64_t rpid = (pid == 0) ? self : pid;
     int64_t rpgid = (pgid == 0) ? rpid : pgid;
+    if (rpgid < 0)
+        return -LINUX_EINVAL;
+    if (rpid < 0)
+        return -LINUX_ESRCH;
     /* setpgid on a direct child records the group so kill(0) and kill(-pgid)
      * reach it. Kept in the syscall layer so proc-identity stays free of the
      * process-table dependency. Only POSIX-plausible targets are recorded: the
