@@ -251,7 +251,6 @@ unstage_sysroot_fixtures()
 # which a real kernel does not honor. All listed tests still run in
 # elfuse-aarch64 mode and in 'make check'; the qemu reference run skips them.
 QEMU_SKIP="
-test-osync-requeue
 test-io-opt
 test-sysfs-cpu
 "
