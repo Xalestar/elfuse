@@ -10,6 +10,21 @@
 #
 # BINARY is resolved relative to TESTDIR (default: build/).
 # Lines starting with # are comments. Blank lines are ignored.
+#
+# Scope: this file only lists tests that make check needs directly --
+# elfuse-internal implementation tests with no meaningful counterpart on a
+# real kernel (they can only ever be exercised against elfuse itself), plus
+# whatever mk/tests.mk's SANITIZER_SECTIONS regex selects for the
+# check-{asan,ubsan,tsan} lanes (those need a *sanitizer-instrumented elfuse
+# binary*, which only driver.sh -e can point at; qemu-aarch64 runs an
+# uninstrumented real kernel and cannot substitute for them). Every other
+# aarch64 test -- anything that is meaningful to cross-check against a real
+# Linux kernel -- lives exclusively in tests/test-matrix.sh's run_unit_tests,
+# which is a superset: it runs every one of these binaries too (via
+# elfuse-aarch64 mode), plus everything that used to be duplicated here.
+# Don't add a portable/cross-checkable test here; add it to test-matrix.sh
+# instead. Only add a test here if it is genuinely elfuse-internal, or if a
+# SANITIZER_SECTIONS section needs it.
 
 [section] Assembly tests
 test-hello
@@ -28,31 +43,12 @@ test-ls tests/
 test-roundtrip
 test-comprehensive
 
-[section] Process tests
-test-exec $TESTDIR/echo-test exec-works
-test-exec-limits
-test-fork
-test-session
-test-pidfd                         # diff=skip
-
-[section] Signal tests
-test-signal
-test-kill-broadcast
-test-kill-pgroup
-test-sigio                         # diff=skip
-
-[section] Socket tests
-test-socket
-
-[section] Syscall coverage tests
-test-file-ops
-test-flock
-test-sysinfo
-test-times
-test-io-opt
+[section] elfuse-internal implementation tests
+# These probe elfuse's own EL1 shim fast paths (identity cache, urandom
+# ring, shim_data privilege) and procfs sendfile/copy_file_range
+# interception -- plumbing with no Linux-kernel counterpart, so they are
+# never part of test-matrix.sh (see each file's own header comment).
 test-oom-proc
-test-syscall-smoke
-test-vdso
 test-shim-identity
 test-shim-identity-attention
 test-shim-verbose-trace
@@ -60,7 +56,6 @@ test-shim-data-el1
 test-shim-urandom-smp
 test-shim-urandom-toctou
 test-shim-urandom-wrap
-test-poll                      # diff=skip
 
 [section] I/O subsystem tests
 test-eventfd
@@ -81,15 +76,6 @@ test-pty
 test-ioctl-fioasync
 test-getdents-refcount
 
-[section] /proc and /dev emulation tests
-test-proc
-test-sysfs-cpu
-
-[section] Network tests
-test-net
-test-netstat
-test-netlink
-
 [section] Threading tests
 test-thread                    # diff=skip
 test-pthread
@@ -99,9 +85,6 @@ test-simd-clone                # diff=skip
 [section] Stress tests
 test-stress                    # diff=skip
 test-mprotect-mt               # diff=skip
-
-[section] Negative / error-path tests
-test-negative                  # diff=skip
 
 [section] Signal + thread tests
 test-signal-thread
@@ -118,22 +101,9 @@ test-fork-lowbase
 test-cow-fork
 test-fork-synthetic-fd
 
-[section] O_CLOEXEC tests
-test-cloexec
-
-[section] O_PATH semantics tests
-test-opath
-
-[section] xattr semantics tests
-test-xattr
-
 [section] Guard page / mmap edge cases
 test-guard-page
 test-mmap-hint
-
-[section] Low-base ET_EXEC memory regression tests
-test-lowbase-mem-200000
-test-lowbase-mem-300000
 
 [section] mremap tests
 test-mremap
@@ -152,81 +122,23 @@ test-cross-fork-mapshared          # diff=skip
 [section] madvise MADV_DONTNEED tests
 test-madvise
 
-[section] Scatter-gather I/O tests
-test-readv-writev
-
-[section] inotify emulation tests
-test-inotify
-
 [section] PI futex + EINTR regression tests
 test-futex-pi                  # diff=skip
 
 [section] futex_waitv (SYS 449) tests
 test-futex-waitv               # diff=skip
 
-[section] SIGILL / null guard tests
-test-sigill
-
-[section] X11 raw protocol tests
-test-x11
-
 [section] Robust futex tests
 test-robust-futex
-
-[section] /proc completeness tests
-test-procfs
-test-procfs-exec
-test-proc-limits
 
 [section] FD table race tests
 test-fd-race
 
-[section] FD lifecycle tests
-test-fd-lifecycle
-
 [section] Multithreaded fork tests
 test-mt-fork
-
-[section] Exit-group teardown reachability tests
-test-exit-group-teardown wait     # expected_rc=42
-test-exit-group-teardown stop     # expected_rc=42
-test-exit-group-teardown fork     # expected_rc=42
 
 [section] SysV shared memory tests
 test-sysv-shm
 
-[section] Credential/identity emulation tests
-test-credentials                   # diff=skip
-
-[section] Scheduler policy stub tests
-test-sched-policy
-
 [section] membarrier tests
 test-membarrier
-
-[section] rseq registration tests
-test-rseq                          # diff=skip
-
-[section] Abstract Unix socket tests
-test-abstract-socket
-
-[section] Ancillary data (SCM_RIGHTS/MSG_CTRUNC) tests
-test-ancillary
-
-[section] Tier A compatibility tests
-test-tier-a                        # diff=skip
-
-[section] /proc fidelity tests
-test-proc-fidelity                 # diff=skip
-
-[section] Linux syscall fidelity tests
-test-syscall-fidelity              # diff=skip
-
-[section] fd-family tests
-test-fd-family                     # diff=skip
-
-[section] SCM_CREDENTIALS tests
-test-scm-creds                     # diff=skip
-
-[section] Virtual chown overlay tests
-test-chown-overlay                 # diff=skip
