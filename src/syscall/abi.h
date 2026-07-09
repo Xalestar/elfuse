@@ -377,6 +377,11 @@ typedef struct {
 #define LINUX_TIOCGPTN 0x80045430   /* _IOR('T', 0x30, unsigned int) */
 #define LINUX_TIOCSPTLCK 0x40045431 /* _IOW('T', 0x31, int) */
 #define LINUX_TIOCGPTPEER 0x5441    /* _IO('T', 0x41); arg is open flags */
+/* Linux network interface ioctls. */
+#define LINUX_SIOCGIFHWADDR 0x8927 /* get hardware address (struct ifreq) */
+#define LINUX_IFNAMSIZ 16
+#define LINUX_ARPHRD_ETHER 1
+#define LINUX_ARPHRD_LOOPBACK 772
 
 /* Linux open flags. */
 #define LINUX_O_RDONLY 0x0000

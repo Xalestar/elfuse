@@ -21,6 +21,21 @@
 #include <errno.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <sys/ioctl.h>
+#include <net/if.h>
+#include <net/if_arp.h>
+
+#ifndef SIOCGIFHWADDR
+#define SIOCGIFHWADDR 0x8927
+#endif
+
+#ifndef ARPHRD_ETHER
+#define ARPHRD_ETHER 1
+#endif
+
+#ifndef ARPHRD_LOOPBACK
+#define ARPHRD_LOOPBACK 772
+#endif
 
 static int read_proc_file(const char *path, char *buf, size_t bufsz)
 {
@@ -39,26 +54,63 @@ static int read_proc_file(const char *path, char *buf, size_t bufsz)
     return 0;
 }
 
+static int hwaddr_all_zero(const unsigned char *addr)
+{
+    for (int i = 0; i < 6; i++) {
+        if (addr[i] != 0)
+            return 0;
+    }
+    return 1;
+}
+
+static int check_hwaddr(int sock_fd,
+                        const char *ifname,
+                        int expected_family,
+                        int require_nonzero)
+{
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof(ifr));
+    strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
+
+    if (ioctl(sock_fd, SIOCGIFHWADDR, &ifr) < 0) {
+        printf("FAIL: ioctl(SIOCGIFHWADDR, %s): %s\n", ifname, strerror(errno));
+        return 0;
+    }
+    if (ifr.ifr_hwaddr.sa_family != expected_family) {
+        printf("FAIL: %s hwaddr family got %d expected %d\n", ifname,
+               ifr.ifr_hwaddr.sa_family, expected_family);
+        return 0;
+    }
+    if (require_nonzero &&
+        hwaddr_all_zero((const unsigned char *) ifr.ifr_hwaddr.sa_data)) {
+        printf("FAIL: %s hwaddr is all zero\n", ifname);
+        return 0;
+    }
+    return 1;
+}
+
 int main(void)
 {
     int pass = 0, fail = 0;
     char buf[8192];
+    int found_eth0 = 0;
 
     /* 0. Verify /proc/net exists as a directory with expected children. */
     struct stat st;
     if (stat("/proc/net", &st) == 0 && S_ISDIR(st.st_mode)) {
         DIR *dir = opendir("/proc/net");
         if (dir) {
-            int found_tcp = 0, found_udp = 0, found_unix = 0;
+            int found_dev = 0, found_tcp = 0, found_udp = 0, found_unix = 0;
             struct dirent *de;
             while ((de = readdir(dir))) {
+                found_dev |= !strcmp(de->d_name, "dev");
                 found_tcp |= !strcmp(de->d_name, "tcp");
                 found_udp |= !strcmp(de->d_name, "udp");
                 found_unix |= !strcmp(de->d_name, "unix");
             }
             closedir(dir);
-            if (found_tcp && found_udp && found_unix) {
-                printf("PASS: /proc/net enumerates synthetic socket tables\n");
+            if (found_dev && found_tcp && found_udp && found_unix) {
+                printf("PASS: /proc/net enumerates synthetic network files\n");
                 pass++;
             } else {
                 printf("FAIL: /proc/net missing expected entries\n");
@@ -73,7 +125,42 @@ int main(void)
         fail++;
     }
 
-    /* 1. TCP listener on 127.0.0.1:7777 */
+    /* 1. Verify /proc/net/dev exposes Linux-style interface rows. */
+    if (read_proc_file("/proc/net/dev", buf, sizeof(buf)) == 0) {
+        found_eth0 = strstr(buf, "eth0:") != NULL;
+        if (strstr(buf, "Inter-|") && strstr(buf, "lo:") && found_eth0) {
+            printf("PASS: /proc/net/dev shows interface rows\n");
+            pass++;
+        } else {
+            printf("FAIL: /proc/net/dev missing expected rows\n  got: %s", buf);
+            fail++;
+        }
+    } else {
+        fail++;
+    }
+
+    int ioctl_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (ioctl_fd < 0) {
+        perror("socket(ioctl)");
+        return 1;
+    }
+    if (check_hwaddr(ioctl_fd, "lo", ARPHRD_LOOPBACK, 0)) {
+        printf("PASS: SIOCGIFHWADDR returns loopback identity for lo\n");
+        pass++;
+    } else {
+        fail++;
+    }
+    if (found_eth0) {
+        if (check_hwaddr(ioctl_fd, "eth0", ARPHRD_ETHER, 1)) {
+            printf("PASS: SIOCGIFHWADDR returns Ethernet identity for eth0\n");
+            pass++;
+        } else {
+            fail++;
+        }
+    }
+    close(ioctl_fd);
+
+    /* 2. Synthesize live TCP/UDP sockets for socket table checks. */
     int tcp_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (tcp_fd < 0) {
         perror("socket(TCP)");
@@ -92,7 +179,7 @@ int main(void)
         return 1;
     }
 
-    /* 2. UDP socket on 0.0.0.0:8888 */
+    /* UDP socket on 0.0.0.0:8888 */
     int udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (udp_fd < 0) {
         perror("socket(UDP)");

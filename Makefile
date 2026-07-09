@@ -60,6 +60,7 @@ SRCS := \
     syscall/net.c \
     syscall/net-msg.c \
     syscall/net-abi.c \
+    syscall/net-identity.c \
     syscall/net-absock.c \
     syscall/net-sockopt.c \
     syscall/netlink.c \

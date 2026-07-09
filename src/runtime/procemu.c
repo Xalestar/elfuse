@@ -57,6 +57,7 @@
 #include "syscall/fd.h"
 #include "syscall/fuse.h"
 #include "syscall/internal.h"
+#include "syscall/net-identity.h"
 #include "syscall/proc.h"
 #include "syscall/sys.h"
 
@@ -594,6 +595,47 @@ __attribute__((format(printf, 1, 2))) static int proc_emit_fmt(const char *fmt,
 static int proc_emit_literal(const char *s)
 {
     return proc_synthetic_fd(s, strlen(s));
+}
+
+static int proc_open_net_dev(void)
+{
+    linux_net_identity_t ident;
+    net_identity_snapshot(&ident);
+    linux_netdev_stats_t *lo = &ident.lo_stats;
+    linux_netdev_stats_t *eth0 = &ident.eth0_stats;
+
+    return proc_emit_fmt(
+        "Inter-|   Receive                                                |  "
+        "Transmit\n"
+        " face |bytes    packets errs drop fifo frame compressed "
+        "multicast|bytes    packets errs drop fifo colls carrier "
+        "compressed\n"
+        "    lo: %llu %llu %llu %llu %llu %llu %llu %llu "
+        "%llu %llu %llu %llu %llu %llu %llu %llu\n"
+        "  eth0: %llu %llu %llu %llu %llu %llu %llu %llu "
+        "%llu %llu %llu %llu %llu %llu %llu %llu\n",
+        (unsigned long long) lo->rx_bytes, (unsigned long long) lo->rx_packets,
+        (unsigned long long) lo->rx_errs, (unsigned long long) lo->rx_drop,
+        (unsigned long long) lo->rx_fifo, (unsigned long long) lo->rx_frame,
+        (unsigned long long) lo->rx_compressed,
+        (unsigned long long) lo->rx_multicast,
+        (unsigned long long) lo->tx_bytes, (unsigned long long) lo->tx_packets,
+        (unsigned long long) lo->tx_errs, (unsigned long long) lo->tx_drop,
+        (unsigned long long) lo->tx_fifo, (unsigned long long) lo->tx_colls,
+        (unsigned long long) lo->tx_carrier,
+        (unsigned long long) lo->tx_compressed,
+        (unsigned long long) eth0->rx_bytes,
+        (unsigned long long) eth0->rx_packets,
+        (unsigned long long) eth0->rx_errs, (unsigned long long) eth0->rx_drop,
+        (unsigned long long) eth0->rx_fifo, (unsigned long long) eth0->rx_frame,
+        (unsigned long long) eth0->rx_compressed,
+        (unsigned long long) eth0->rx_multicast,
+        (unsigned long long) eth0->tx_bytes,
+        (unsigned long long) eth0->tx_packets,
+        (unsigned long long) eth0->tx_errs, (unsigned long long) eth0->tx_drop,
+        (unsigned long long) eth0->tx_fifo, (unsigned long long) eth0->tx_colls,
+        (unsigned long long) eth0->tx_carrier,
+        (unsigned long long) eth0->tx_compressed);
 }
 
 /* Return the basename of the loaded ELF binary, falling back to "elfuse" when
@@ -1173,7 +1215,7 @@ static const char *ensure_proc_tmpdir(const guest_t *g)
     snprintf(netdir, sizeof(netdir), "%s/net", proc_tmpdir);
     if (mkdir(netdir, 0755) == 0 || errno == EEXIST) {
         static const char *net_files[] = {
-            "tcp", "tcp6", "udp", "udp6", "raw", "raw6", "unix", NULL,
+            "dev", "tcp", "tcp6", "udp", "udp6", "raw", "raw6", "unix", NULL,
         };
         for (const char **name = net_files; *name; name++)
             populate_proc_placeholder(netdir, *name);
@@ -3101,6 +3143,9 @@ int proc_intercept_open(const guest_t *g,
         free(buf);
         return fd;
     }
+    if (!strcmp(path, "/proc/net/dev")) {
+        return proc_open_net_dev();
+    }
 
     /* /proc/sys/vm/mmap_min_addr -> synthetic mmap minimum address. */
     if (!strcmp(path, "/proc/sys/vm/mmap_min_addr"))
@@ -3610,6 +3655,7 @@ int proc_intercept_stat(const char *path, struct stat *st)
         "/proc/net/raw",
         "/proc/net/raw6",
         "/proc/net/unix",
+        "/proc/net/dev",
         NULL,
     };
 

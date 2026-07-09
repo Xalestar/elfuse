@@ -45,6 +45,7 @@
 #include "syscall/inotify.h"
 #include "syscall/io.h"
 #include "syscall/net.h"
+#include "syscall/net-identity.h"
 #include "syscall/poll.h"
 #include "syscall/proc.h"
 #include "syscall/signal.h"
@@ -66,6 +67,16 @@ typedef struct {
     uint8_t c_line;
     uint8_t c_cc[19];
 } linux_termios_t;
+
+typedef struct {
+    uint16_t sa_family;
+    char sa_data[14];
+} linux_sockaddr_t;
+
+typedef struct {
+    char ifr_name[LINUX_IFNAMSIZ];
+    linux_sockaddr_t ifr_hwaddr;
+} linux_ifreq_hwaddr_t;
 
 /* Per-fd lock embedded in the cache so a urandom read on fd A does not
  * serialize behind a concurrent urandom read on fd B. The previous design used
@@ -148,6 +159,32 @@ static int termios_action_for(unsigned long request)
 static int64_t io_return_zero(host_fd_ref_t *host_ref)
 {
     host_fd_ref_close(host_ref);
+    return 0;
+}
+
+static int64_t linux_siocgifhwaddr(guest_t *g, uint64_t arg)
+{
+    char raw_name[LINUX_IFNAMSIZ];
+    if (guest_read_small(g, arg, raw_name, sizeof(raw_name)) < 0)
+        return -LINUX_EFAULT;
+
+    char name[LINUX_IFNAMSIZ + 1];
+    memcpy(name, raw_name, LINUX_IFNAMSIZ);
+    name[LINUX_IFNAMSIZ] = '\0';
+
+    linux_ifreq_hwaddr_t ifr = {0};
+    memcpy(ifr.ifr_name, raw_name, sizeof(ifr.ifr_name));
+
+    uint16_t family = 0;
+    uint8_t mac[NET_IDENTITY_MAC_LEN];
+    if (net_identity_hwaddr(name, &family, mac) < 0)
+        return -LINUX_ENODEV;
+
+    ifr.ifr_hwaddr.sa_family = family;
+    memcpy(ifr.ifr_hwaddr.sa_data, mac, sizeof(mac));
+
+    if (guest_write_small(g, arg, &ifr, sizeof(ifr)) < 0)
+        return -LINUX_EFAULT;
     return 0;
 }
 
@@ -1723,6 +1760,17 @@ int64_t sys_ioctl(guest_t *g, int fd, uint64_t request, uint64_t arg)
             fd_table[fd].linux_flags &= ~LINUX_O_CLOEXEC;
         pthread_mutex_unlock(&fd_lock);
         return 0;
+    }
+
+    if (request == LINUX_SIOCGIFHWADDR) {
+        fd_entry_t snap;
+        if (!fd_snapshot(fd, &snap))
+            return -LINUX_EBADF;
+        if (snap.type == FD_PATH)
+            return -LINUX_EBADF;
+        if (snap.type != FD_SOCKET)
+            return -LINUX_ENOTTY;
+        return linux_siocgifhwaddr(g, arg);
     }
 
     host_fd_ref_t host_ref;
