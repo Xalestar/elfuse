@@ -86,10 +86,17 @@ make clean
 What they do:
 
 - `make elfuse`: build and sign `build/elfuse`
-- `make check`: the recommended pre-commit gate. Runs, in order:
+- `make check`: fast elfuse-internal gate. Runs, in order:
   - `scripts/check-syscall-coverage.py` so any new `dispatch.tbl`
     entry without a direct or aliased test reference fails the build
-  - the unit suite from `tests/manifest.txt`
+  - the unit suite from `tests/manifest.txt` -- deliberately narrow: only
+    tests that assert elfuse-internal implementation details with no real
+    Linux counterpart (the EL1 shim fast-path suite, `test-mremap-infra`,
+    `test-oom-proc`), plus whatever `mk/tests.mk`'s `SANITIZER_SECTIONS`
+    needs for the `check-{asan,ubsan,tsan}` lanes. Everything that is
+    meaningful to cross-check against a real Linux kernel lives exclusively
+    in `tests/test-matrix.sh`'s `run_unit_tests` instead (see Test Matrix
+    below) -- `make check` alone is *not* a substitute for it
   - the TLBI RVAE1IS encoder unit test
   - the proctitle argv-tail and low-stack regressions
   - the BusyBox applet smoke suite (auto-resolved from
@@ -115,19 +122,27 @@ What they do:
 
 ## Quick Iteration
 
-For normal code changes:
+For normal code changes touching syscall or runtime logic:
 
 ```sh
 make elfuse
 make check
+make test-matrix-elfuse-aarch64
 ```
 
-For changes that touch procfs, path handling, `/dev`, FUSE, networking, dynamic
-linking, or guest process semantics, run the matrix as well:
+`make check` alone only covers elfuse-internal plumbing and the sanitizer
+subset now; `test-matrix-elfuse-aarch64` is what actually exercises the full
+unit-test surface against `build/elfuse` (no qemu boot needed, so it is about
+as fast to iterate with as `make check` was before the split). For changes
+that touch procfs, path handling, `/dev`, FUSE, networking, dynamic linking,
+or guest process semantics, also cross-check against the qemu reference
+kernel:
 
 ```sh
-make test-matrix
+make test-matrix-qemu-aarch64
 ```
+
+or run all matrix modes back-to-back with `make test-matrix`.
 
 `make check` already runs the BusyBox applet suite as a second stage, so a
 green `make check` covers BusyBox validation. Use `make test-busybox` to
@@ -147,6 +162,22 @@ execution modes:
 The goal is not to compare performance. The goal is to compare guest-observable
 behavior against a ground-truth Linux AArch64 environment so that any divergence
 in syscall translation, procfs emulation, or process semantics is caught early.
+
+`run_unit_tests` in `tests/test-matrix.sh` is the full aarch64 unit-test
+surface -- every binary that is meaningful to run against a real kernel, which
+is almost everything. It deliberately excludes only the handful of tests that
+assert elfuse-internal implementation details with no meaningful counterpart
+on a real kernel (the EL1 shim fast-path suite, `test-mremap-infra`,
+`test-oom-proc` -- these live solely in `tests/manifest.txt` / `make check`,
+see that file's header for the full split rationale). There is no separate
+"core" vs "extended" test set inside the matrix; a test that has a real,
+understood divergence from the qemu reference kernel is listed in
+`QEMU_SKIP` with a comment explaining why instead -- see that variable in
+`tests/test-matrix.sh` for the current list and rationale. `run_unit_tests`
+runs in both `elfuse-aarch64` and `qemu-aarch64` modes, so most tests are
+exercised twice per matrix run: once against `build/elfuse`, once against the
+real kernel.
+
 The x86_64 mode is narrower: it aggregates the Rosetta-specific acceptance
 scripts and their per-binary summaries into the same matrix runner, including
 the Rosetta thread/signal audit smoke, the LuaJIT guest-JIT probe, and the
@@ -327,8 +358,8 @@ Suggested minimum validation:
 | Change area | Recommended validation |
 |-------------|------------------------|
 | CLI, logging, docs-only build rules | `make elfuse` |
-| General syscall or runtime logic | `make elfuse && make check` |
-| `/proc`, `/dev`, path, or BusyBox-sensitive behavior | `make elfuse && make check` |
+| General syscall or runtime logic | `make elfuse && make check && make test-matrix-elfuse-aarch64` |
+| `/proc`, `/dev`, path, or BusyBox-sensitive behavior | `make elfuse && make check && make test-matrix-elfuse-aarch64` |
 | Rosetta hosting, x86_64 dispatch, VZ ioctls, AOT cache | `make elfuse && make test-rosetta-all` |
 | Broad behavioral changes | `make elfuse && make check && make test-matrix` |
 | Debugger or ptrace flow | `make elfuse && make test-gdbstub` |
