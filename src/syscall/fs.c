@@ -2458,15 +2458,31 @@ static int64_t chown_result(int host_rc,
 {
     if (host_rc < 0 && errno != EPERM)
         return linux_errno();
-    if (host_st && chown_overlay_set((uint64_t) host_st->st_dev,
-                                     (uint64_t) host_st->st_ino, owner, group,
-                                     host_st->st_uid, host_st->st_gid) < 0) {
-        /* Override allocation failed; reporting success would lie about the
-         * post-call stat round-trip. Linux's chown(2) lists ENOMEM among its
-         * possible errors for related allocation paths, so surface that to the
-         * guest instead.
+    if (host_st) {
+        /* cur_uid/cur_gid must be the owner the guest *currently sees*, not
+         * the raw host stat values.  The two differ on macOS where the host
+         * user UID (e.g. 501) does not match GUEST_UID (1000), and whenever
+         * the file already has an overlay entry that virtualises its owner.
+         * chown_overlay_set uses cur_uid/cur_gid for both the early-exit
+         * no-op guard and the stale-entry removal guard; passing the physical
+         * UID evaluates those guards in the wrong ID namespace.
+         *
+         * Apply the existing overlay to a temporary copy of the host stat to
+         * obtain the guest-visible owner before forwarding to
+         * chown_overlay_set.
          */
-        return -LINUX_ENOMEM;
+        struct stat guest_st = *host_st;
+        chown_overlay_apply(&guest_st);
+        if (chown_overlay_set((uint64_t) host_st->st_dev,
+                              (uint64_t) host_st->st_ino, owner, group,
+                              guest_st.st_uid, guest_st.st_gid) < 0) {
+            /* Override allocation failed; reporting success would lie about
+             * the post-call stat round-trip. Linux's chown(2) lists ENOMEM
+             * among its possible errors for related allocation paths, so
+             * surface that to the guest instead.
+             */
+            return -LINUX_ENOMEM;
+        }
     }
     return 0;
 }
