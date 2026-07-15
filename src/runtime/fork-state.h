@@ -19,7 +19,7 @@
 /* Fork IPC protocol identity. Bump this whenever the header layout or ordered
  * fork payload changes incompatibly.
  */
-#define FORK_IPC_PROTOCOL_MAGIC 0x454C464CU /* "ELFL" */
+#define FORK_IPC_PROTOCOL_MAGIC 0x454C464DU /* "ELFM" */
 
 #define IPC_MAGIC_HEADER FORK_IPC_PROTOCOL_MAGIC
 #define IPC_MAGIC_SENTINEL 0x454C4F4BU /* "ELOK" */
@@ -72,6 +72,12 @@ typedef struct {
      */
     uint32_t shm_is_clone;
     uint32_t _pad2;
+    /* Guest-visible NOFILE state is separate from the host capacity reserved
+     * by elfuse. The child restores this after installing inherited FDs so
+     * descriptors above a subsequently lowered soft limit survive fork.
+     */
+    uint64_t nofile_cur;
+    uint64_t nofile_max;
 } ipc_header_t;
 
 typedef struct {

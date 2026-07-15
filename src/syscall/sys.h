@@ -50,6 +50,13 @@ int64_t sys_prlimit64(guest_t *g,
                       uint64_t new_gva,
                       uint64_t old_gva);
 
+/* Snapshot/restore the guest-visible RLIMIT_NOFILE across the posix_spawn
+ * fork boundary. The host limit is internal capacity and is deliberately not
+ * exposed through these helpers.
+ */
+void sys_nofile_snapshot(uint64_t *cur, uint64_t *max);
+int sys_nofile_restore(uint64_t cur, uint64_t max);
+
 /* Format /proc/self/limits content into buf.
  *
  * Returns bytes written (excluding NUL) or -1 on error.

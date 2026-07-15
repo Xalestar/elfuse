@@ -68,6 +68,10 @@ static linux_sysinfo_t cached_sysinfo;
 static pthread_mutex_t rlimit_lock = PTHREAD_MUTEX_INITIALIZER;
 static linux_rlimit64_t cached_linux_rlimits[10];
 static uint8_t cached_linux_rlimit_valid[10];
+static linux_rlimit64_t guest_nofile_limit = {
+    .rlim_cur = FD_TABLE_SIZE,
+    .rlim_max = FD_TABLE_SIZE,
+};
 #define RLIMIT_CACHE_SIZE ((int) (ARRAY_SIZE(cached_linux_rlimits)))
 
 _Static_assert(sizeof(struct rusage) == sizeof(linux_rusage_t),
@@ -659,6 +663,63 @@ static void rlimit_cache_set(int resource, linux_rlimit64_t lim)
     pthread_mutex_unlock(&rlimit_lock);
 }
 
+void sys_nofile_snapshot(uint64_t *cur, uint64_t *max)
+{
+    pthread_mutex_lock(&rlimit_lock);
+    if (cur)
+        *cur = guest_nofile_limit.rlim_cur;
+    if (max)
+        *max = guest_nofile_limit.rlim_max;
+    pthread_mutex_unlock(&rlimit_lock);
+}
+
+int sys_nofile_restore(uint64_t cur, uint64_t max)
+{
+    if (cur > max || max > FD_TABLE_SIZE)
+        return -1;
+
+    pthread_mutex_lock(&rlimit_lock);
+    guest_nofile_limit.rlim_cur = cur;
+    guest_nofile_limit.rlim_max = max;
+    fd_set_rlimit_nofile((int) cur);
+    pthread_mutex_unlock(&rlimit_lock);
+    return 0;
+}
+
+static int64_t sys_prlimit64_nofile(guest_t *g,
+                                    uint64_t new_gva,
+                                    uint64_t old_gva)
+{
+    linux_rlimit64_t new_lim = {0};
+    if (new_gva != 0 &&
+        guest_read_small(g, new_gva, &new_lim, sizeof(new_lim)) < 0)
+        return -LINUX_EFAULT;
+
+    pthread_mutex_lock(&rlimit_lock);
+    linux_rlimit64_t old_lim = guest_nofile_limit;
+
+    int error = 0;
+    if (new_gva != 0) {
+        if (new_lim.rlim_cur > new_lim.rlim_max) {
+            error = LINUX_EINVAL;
+        } else if (new_lim.rlim_max > guest_nofile_limit.rlim_max) {
+            /* The guest has no capability path for raising its hard limit. */
+            error = LINUX_EPERM;
+        } else {
+            guest_nofile_limit = new_lim;
+            fd_set_rlimit_nofile((int) new_lim.rlim_cur);
+        }
+    }
+    pthread_mutex_unlock(&rlimit_lock);
+
+    if (error)
+        return -error;
+    if (old_gva != 0 &&
+        guest_write_small(g, old_gva, &old_lim, sizeof(old_lim)) < 0)
+        return -LINUX_EFAULT;
+    return 0;
+}
+
 int64_t sys_prlimit64(guest_t *g,
                       int pid,
                       int resource,
@@ -670,6 +731,8 @@ int64_t sys_prlimit64(guest_t *g,
     int mac_res = translate_rlimit_resource(resource);
     if (mac_res < 0)
         return -LINUX_EINVAL;
+    if (resource == 7 /* RLIMIT_NOFILE */)
+        return sys_prlimit64_nofile(g, new_gva, old_gva);
 
     /* Get old limits BEFORE setting new ones (Linux prlimit64 atomically
      * returns old values and sets new ones; approximate by get-then-set).
@@ -704,15 +767,6 @@ int64_t sys_prlimit64(guest_t *g,
             return linux_errno();
 
         rlimit_cache_set(resource, new_lim);
-
-        /* Track RLIMIT_NOFILE in the guest FD table so fd_alloc enforces the
-         * limit and returns -EMFILE.
-         */
-        if (resource == 7 /* RLIMIT_NOFILE */) {
-            int cur = (new_lim.rlim_cur == UINT64_MAX) ? FD_TABLE_SIZE
-                                                       : (int) new_lim.rlim_cur;
-            fd_set_rlimit_nofile(cur);
-        }
     }
 
     /* Write old limits to guest after set (so guest sees pre-set values) */
@@ -763,30 +817,29 @@ int sys_format_limits(char *buf, size_t bufsz)
         char soft[24], hard[24];
         int res = rows[i].linux_res;
 
-        if (RANGE_CHECK(res, 0, RLIMIT_CACHE_SIZE)) {
+        if (res == 7 /* RLIMIT_NOFILE */) {
+            uint64_t cur, max;
+            sys_nofile_snapshot(&cur, &max);
+            linux_rlimit64_t lim = {.rlim_cur = cur, .rlim_max = max};
+            snprintf(soft, sizeof(soft), "%llu",
+                     (unsigned long long) lim.rlim_cur);
+            snprintf(hard, sizeof(hard), "%llu",
+                     (unsigned long long) lim.rlim_max);
+        } else if (RANGE_CHECK(res, 0, RLIMIT_CACHE_SIZE)) {
             linux_rlimit64_t lim;
             if (!rlimit_cache_get(res, &lim)) {
-                /* RLIMIT_NOFILE (Linux 7): use the guest FD table limit rather
-                 * than host getrlimit, which may return RLIM_INFINITY on macOS.
-                 */
-                if (res == 7) {
-                    int cur = fd_get_rlimit_nofile();
-                    lim.rlim_cur = (uint64_t) cur;
-                    lim.rlim_max = (uint64_t) FD_TABLE_SIZE;
-                } else {
-                    int mac_res = translate_rlimit_resource(res);
-                    if (mac_res >= 0) {
-                        struct rlimit rl;
-                        if (getrlimit(mac_res, &rl) == 0) {
-                            lim = translate_host_rlimit(res, rl);
-                        } else {
-                            lim.rlim_cur = UINT64_MAX;
-                            lim.rlim_max = UINT64_MAX;
-                        }
+                int mac_res = translate_rlimit_resource(res);
+                if (mac_res >= 0) {
+                    struct rlimit rl;
+                    if (getrlimit(mac_res, &rl) == 0) {
+                        lim = translate_host_rlimit(res, rl);
                     } else {
                         lim.rlim_cur = UINT64_MAX;
                         lim.rlim_max = UINT64_MAX;
                     }
+                } else {
+                    lim.rlim_cur = UINT64_MAX;
+                    lim.rlim_max = UINT64_MAX;
                 }
             }
             if (lim.rlim_cur == UINT64_MAX)

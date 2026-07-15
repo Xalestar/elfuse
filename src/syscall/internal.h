@@ -328,9 +328,6 @@ int64_t sys_mmap_anon(guest_t *g, uint64_t addr, uint64_t length, int prot);
  */
 void fd_set_rlimit_nofile(int cur);
 
-/* Get the current guest RLIMIT_NOFILE soft limit. */
-int fd_get_rlimit_nofile(void);
-
 /* Borrowed-or-owned host fd reference.
  *
  * Single-threaded guests borrow the raw host fd directly (no dup, no close).

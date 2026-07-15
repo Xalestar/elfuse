@@ -54,11 +54,6 @@ void fd_set_rlimit_nofile(int cur)
     rlimit_nofile_cur = cur;
 }
 
-int fd_get_rlimit_nofile(void)
-{
-    return rlimit_nofile_cur;
-}
-
 /* Bitmap for O(1) lowest-free-FD allocation. A set bit means the FD is free
  * (FD_CLOSED). bit_ctz64 on each word finds the lowest free FD in O(1) per
  * word, vs O(FD_TABLE_SIZE) linear scan.

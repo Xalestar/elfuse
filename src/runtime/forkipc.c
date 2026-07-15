@@ -46,6 +46,7 @@
 #include "syscall/proc.h"
 #include "syscall/proc-pidfd.h"
 #include "syscall/signal.h"
+#include "syscall/sys.h"
 
 #include "debug/log.h"
 #include "debug/syscall-hist.h"
@@ -113,6 +114,12 @@ int fork_child_main(int ipc_fd,
     }
     if (hdr.magic != IPC_MAGIC_HEADER) {
         log_error("fork-child: bad magic 0x%x", hdr.magic);
+        return 1;
+    }
+    if (hdr.nofile_cur > hdr.nofile_max || hdr.nofile_max > FD_TABLE_SIZE) {
+        log_error("fork-child: invalid RLIMIT_NOFILE %llu/%llu",
+                  (unsigned long long) hdr.nofile_cur,
+                  (unsigned long long) hdr.nofile_max);
         return 1;
     }
     log_debug("fork-child: pid=%lld ppid=%lld", (long long) hdr.child_pid,
@@ -262,6 +269,16 @@ int fork_child_main(int ipc_fd,
 
     if (fork_ipc_recv_fd_table(ipc_fd, &g) < 0) {
         log_error("fork-child: failed to receive fd table");
+        guest_destroy(&g);
+        return 1;
+    }
+
+    /* Linux preserves already-open descriptors above a newly lowered soft
+     * limit across fork. Install the inherited table under the default table
+     * limit first, then restore the parent's guest-visible limit.
+     */
+    if (sys_nofile_restore(hdr.nofile_cur, hdr.nofile_max) < 0) {
+        log_error("fork-child: failed to restore RLIMIT_NOFILE");
         guest_destroy(&g);
         return 1;
     }
@@ -1646,6 +1663,9 @@ int64_t sys_clone(hv_vcpu_t vcpu,
      * but before sibling vCPUs resume. Declared up front so all goto paths to
      * fail_snapshot can free it unconditionally. Header
      */
+    uint64_t nofile_cur, nofile_max;
+    sys_nofile_snapshot(&nofile_cur, &nofile_max);
+
     ipc_header_t hdr = {
         .magic = IPC_MAGIC_HEADER,
         .ipa_bits = g->ipa_bits,
@@ -1685,6 +1705,8 @@ int64_t sys_clone(hv_vcpu_t vcpu,
             flags & (LINUX_CLONE_CHILD_SETTID | LINUX_CLONE_CHILD_CLEARTID),
         .ctid_gva = ctid_gva,
         .shm_is_clone = (snapshot_shm_fd >= 0) ? 1 : 0,
+        .nofile_cur = nofile_cur,
+        .nofile_max = nofile_max,
     };
     proc_registry_publish_self();
     if (fork_ipc_write_all(ipc_sock, &hdr, sizeof(hdr)) < 0) {

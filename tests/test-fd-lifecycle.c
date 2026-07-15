@@ -11,8 +11,11 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/resource.h>
 #include <sys/syscall.h>
+#include <sys/utsname.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "test-harness.h"
@@ -229,6 +232,69 @@ static void test_dup3_above_rlimit_fails(void)
     close(pipefd[1]);
 }
 
+static void test_nofile_hides_host_reserve(void)
+{
+    TEST("RLIMIT_NOFILE hides host reserve");
+
+    struct rlimit limit;
+    struct utsname uts;
+    if (getrlimit(RLIMIT_NOFILE, &limit) != 0 || uname(&uts) != 0) {
+        FAIL("getrlimit or uname failed");
+        return;
+    }
+
+    if (strcmp(uts.nodename, "elfuse") == 0) {
+        EXPECT_TRUE(limit.rlim_cur == 1024 && limit.rlim_max == 1024,
+                    "elfuse exposed its host FD reserve");
+    } else {
+        EXPECT_TRUE(limit.rlim_cur > 0 && limit.rlim_cur <= limit.rlim_max,
+                    "native RLIMIT_NOFILE is invalid");
+    }
+}
+
+static void test_nofile_lowered_before_fork(void)
+{
+    TEST("fork preserves FDs above lowered RLIMIT_NOFILE");
+
+    int pipefd[2];
+    if (pipe(pipefd) != 0) {
+        FAIL("pipe setup failed");
+        return;
+    }
+
+    struct rlimit low_limit = {.rlim_cur = 3, .rlim_max = 3};
+    if (setrlimit(RLIMIT_NOFILE, &low_limit) != 0) {
+        FAIL("setrlimit failed");
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return;
+    }
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        char byte = 'x';
+        ssize_t n = write(pipefd[1], &byte, 1);
+        _exit(n == 1 ? 0 : 1);
+    }
+    if (pid < 0) {
+        FAIL("fork failed after lowering RLIMIT_NOFILE");
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return;
+    }
+
+    close(pipefd[1]);
+    char byte = 0;
+    ssize_t n = read(pipefd[0], &byte, 1);
+    close(pipefd[0]);
+
+    int status = 0;
+    pid_t waited = waitpid(pid, &status, 0);
+    EXPECT_TRUE(n == 1 && byte == 'x' && waited == pid && WIFEXITED(status) &&
+                    WEXITSTATUS(status) == 0,
+                "fork child did not preserve the inherited pipe");
+}
+
 int main(void)
 {
     printf("test-fd-lifecycle: fd metadata lifecycle tests\n\n");
@@ -239,6 +305,9 @@ int main(void)
     test_memfd_accepts_valid_linux_flags();
     test_rlimit_nofile_reports_emfile();
     test_dup3_above_rlimit_fails();
+    test_nofile_hides_host_reserve();
+    /* This permanently lowers the hard limit, so it must remain last. */
+    test_nofile_lowered_before_fork();
 
     SUMMARY("test-fd-lifecycle");
     return fails > 0 ? 1 : 0;
