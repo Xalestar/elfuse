@@ -469,22 +469,17 @@ int main(int argc, char **argv)
     char elf_host_path[LINUX_PATH_MAX];
     bool elf_host_temp = false;
     bool have_host_cwd = (getcwd(host_cwd, sizeof(host_cwd)) != NULL);
+    int exit_code;
     memset(&sysroot_mount, 0, sizeof(sysroot_mount));
     if (!elf_path || (have_sysroot && !sysroot_path) || !guest_argv) {
         log_error("out of memory");
-        cleanup_main_resources(&g, guest_initialized, &sysroot_mount,
-                               have_host_cwd ? host_cwd : NULL, guest_argv,
-                               guest_argc, elf_path, sysroot_path);
-        return 1;
+        goto fail;
     }
     for (int i = 0; i < guest_argc; i++) {
         guest_argv[i] = strdup(argv[arg_start + i]);
         if (!guest_argv[i]) {
             log_error("out of memory");
-            cleanup_main_resources(&g, guest_initialized, &sysroot_mount,
-                                   have_host_cwd ? host_cwd : NULL, guest_argv,
-                                   guest_argc, elf_path, sysroot_path);
-            return 1;
+            goto fail;
         }
     }
 
@@ -492,30 +487,20 @@ int main(int argc, char **argv)
         if (sysroot_create_mount(sysroot_path, &sysroot_mount) < 0) {
             log_error("failed to provision case-sensitive sysroot at %s: %s",
                       sysroot_path, strerror(errno));
-            cleanup_main_resources(&g, guest_initialized, &sysroot_mount,
-                                   have_host_cwd ? host_cwd : NULL, guest_argv,
-                                   guest_argc, elf_path, sysroot_path);
-            return 1;
+            goto fail;
         }
         size_t mounted_len = str_copy_trunc(
             sysroot_path, sysroot_mount.mount_path, LINUX_PATH_MAX);
         if (mounted_len >= LINUX_PATH_MAX) {
             log_error("mounted sysroot path too long: %s",
                       sysroot_mount.mount_path);
-            cleanup_main_resources(&g, guest_initialized, &sysroot_mount,
-                                   have_host_cwd ? host_cwd : NULL, guest_argv,
-                                   guest_argc, elf_path, sysroot_path);
-            return 1;
+            goto fail;
         }
         sysroot = sysroot_path;
     }
 
-    if (have_sysroot && sysroot_validate_case_sensitivity(sysroot) < 0) {
-        cleanup_main_resources(&g, guest_initialized, &sysroot_mount,
-                               have_host_cwd ? host_cwd : NULL, guest_argv,
-                               guest_argc, elf_path, sysroot_path);
-        return 1;
-    }
+    if (have_sysroot && sysroot_validate_case_sensitivity(sysroot) < 0)
+        goto fail;
 
     proc_set_sysroot(sysroot);
 
@@ -527,12 +512,7 @@ int main(int argc, char **argv)
                                         &elf_host_temp) < 0) {
             log_error("failed to resolve ELF path %s: %s", elf_path,
                       strerror(errno));
-            cleanup_main_resources(&g, guest_initialized, &sysroot_mount,
-                                   have_host_cwd ? host_cwd : NULL, guest_argv,
-                                   guest_argc, elf_path, sysroot_path);
-            if (elf_host_temp)
-                unlink(elf_host_path);
-            return 1;
+            goto fail;
         }
 
         /* Check if the file starts with "#!" */
@@ -547,12 +527,7 @@ int main(int argc, char **argv)
 
         if (rc < 0) {
             log_error("empty or invalid shebang interpreter in %s", elf_path);
-            cleanup_main_resources(&g, guest_initialized, &sysroot_mount,
-                                   have_host_cwd ? host_cwd : NULL, guest_argv,
-                                   guest_argc, elf_path, sysroot_path);
-            if (elf_host_temp)
-                unlink(elf_host_path);
-            return 1;
+            goto fail;
         }
 
         /* The current path is a script. Bound the resolution chain only once a
@@ -564,12 +539,7 @@ int main(int argc, char **argv)
                 "too many levels of shebang recursion (max %d) "
                 "resolving %s",
                 ELF_SHEBANG_MAX_DEPTH, argv[arg_start]);
-            cleanup_main_resources(&g, guest_initialized, &sysroot_mount,
-                                   have_host_cwd ? host_cwd : NULL, guest_argv,
-                                   guest_argc, elf_path, sysroot_path);
-            if (elf_host_temp)
-                unlink(elf_host_path);
-            return 1;
+            goto fail;
         }
         shebang_depth++;
 
@@ -581,24 +551,14 @@ int main(int argc, char **argv)
             (const char **) calloc((size_t) new_argc, sizeof(char *));
         if (!new_argv) {
             log_error("out of memory");
-            cleanup_main_resources(&g, guest_initialized, &sysroot_mount,
-                                   have_host_cwd ? host_cwd : NULL, guest_argv,
-                                   guest_argc, elf_path, sysroot_path);
-            if (elf_host_temp)
-                unlink(elf_host_path);
-            return 1;
+            goto fail;
         }
 
         new_argv[0] = strdup(interp);
         if (!new_argv[0]) {
             log_error("out of memory");
             free((void *) new_argv);
-            cleanup_main_resources(&g, guest_initialized, &sysroot_mount,
-                                   have_host_cwd ? host_cwd : NULL, guest_argv,
-                                   guest_argc, elf_path, sysroot_path);
-            if (elf_host_temp)
-                unlink(elf_host_path);
-            return 1;
+            goto fail;
         }
         if (has_arg) {
             new_argv[1] = strdup(arg);
@@ -606,13 +566,7 @@ int main(int argc, char **argv)
                 log_error("out of memory");
                 free((void *) new_argv[0]);
                 free((void *) new_argv);
-                cleanup_main_resources(&g, guest_initialized, &sysroot_mount,
-                                       have_host_cwd ? host_cwd : NULL,
-                                       guest_argv, guest_argc, elf_path,
-                                       sysroot_path);
-                if (elf_host_temp)
-                    unlink(elf_host_path);
-                return 1;
+                goto fail;
             }
         }
 
@@ -629,12 +583,7 @@ int main(int argc, char **argv)
         char *new_elf_path = strdup(interp);
         if (!new_elf_path) {
             log_error("out of memory");
-            cleanup_main_resources(&g, guest_initialized, &sysroot_mount,
-                                   have_host_cwd ? host_cwd : NULL, guest_argv,
-                                   guest_argc, elf_path, sysroot_path);
-            if (elf_host_temp)
-                unlink(elf_host_path);
-            return 1;
+            goto fail;
         }
         free(elf_path);
         elf_path = new_elf_path;
@@ -653,12 +602,7 @@ int main(int argc, char **argv)
             log_error(
                 "--gdb is not supported for x86_64 guests; the current stub "
                 "only exposes the translated aarch64 view");
-            cleanup_main_resources(&g, guest_initialized, &sysroot_mount,
-                                   have_host_cwd ? host_cwd : NULL, guest_argv,
-                                   guest_argc, elf_path, sysroot_path);
-            if (elf_host_temp)
-                unlink(elf_host_path);
-            return 1;
+            goto fail;
         }
     }
 
@@ -668,14 +612,8 @@ int main(int argc, char **argv)
     if (guest_bootstrap_prepare(&g, elf_host_path, elf_host_temp, elf_path,
                                 sysroot, guest_argc, guest_argv, environ,
                                 shim_bin, shim_bin_len, verbose,
-                                &guest_initialized, &boot) < 0) {
-        cleanup_main_resources(&g, guest_initialized, &sysroot_mount,
-                               have_host_cwd ? host_cwd : NULL, guest_argv,
-                               guest_argc, elf_path, sysroot_path);
-        if (elf_host_temp)
-            unlink(elf_host_path);
-        return 1;
-    }
+                                &guest_initialized, &boot) < 0)
+        goto fail;
     if (elf_host_temp && !g.is_rosetta) {
         unlink(elf_host_path);
         elf_host_temp = false;
@@ -698,12 +636,8 @@ int main(int argc, char **argv)
 
     hv_vcpu_t vcpu;
     hv_vcpu_exit_t *vexit;
-    if (guest_bootstrap_create_vcpu(&g, &boot, verbose, &vcpu, &vexit) < 0) {
-        cleanup_main_resources(&g, guest_initialized, &sysroot_mount,
-                               have_host_cwd ? host_cwd : NULL, guest_argv,
-                               guest_argc, elf_path, sysroot_path);
-        return 1;
-    }
+    if (guest_bootstrap_create_vcpu(&g, &boot, verbose, &vcpu, &vexit) < 0)
+        goto fail;
 
     /* GDB setup must happen before the first run so entry-stop and hardware
      * breakpoints can affect the initial vCPU.
@@ -711,10 +645,7 @@ int main(int argc, char **argv)
     if (gdb_port > 0) {
         if (gdb_stub_init(gdb_port, &g) < 0) {
             log_error("failed to initialize GDB stub");
-            cleanup_main_resources(&g, guest_initialized, &sysroot_mount,
-                                   have_host_cwd ? host_cwd : NULL, guest_argv,
-                                   guest_argc, elf_path, sysroot_path);
-            return 1;
+            goto fail;
         }
         /* Mirror any preconfigured breakpoints/watchpoints into this vCPU. */
         gdb_stub_sync_debug_regs(vcpu);
@@ -725,7 +656,7 @@ int main(int argc, char **argv)
 
     /* vcpu_run_loop owns guest execution until exit, fatal signal, or timeout.
      */
-    int exit_code = vcpu_run_loop(vcpu, vexit, &g, verbose, timeout_sec);
+    exit_code = vcpu_run_loop(vcpu, vexit, &g, verbose, timeout_sec);
 
     /* Tear down debugger state before joining workers: a worker parked in
      * gdb_stub_handle_stop() stays active (not deactivated) until this
@@ -777,9 +708,23 @@ int main(int argc, char **argv)
      * not requested.
      */
     syscall_hist_dump();
+    goto cleanup;
+
+fail:
+    exit_code = 1;
+cleanup:
+    /* Single unwind for every exit past the heap-copy allocations: frees the
+     * caller-owned heap copies (guest_destroy included, via
+     * cleanup_main_resources, once the guest came up), detaches the sysroot
+     * mount, restores the host cwd, and drops a still-owned FUSE-materialized
+     * temp ELF, which the post-prepare error paths and a Rosetta guest's
+     * teardown previously leaked.
+     */
     cleanup_main_resources(&g, guest_initialized, &sysroot_mount,
                            have_host_cwd ? host_cwd : NULL, guest_argv,
                            guest_argc, elf_path, sysroot_path);
+    if (elf_host_temp)
+        unlink(elf_host_path);
 
     return exit_code;
 }
