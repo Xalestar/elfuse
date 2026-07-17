@@ -684,6 +684,31 @@ const signal_state_t *signal_get_state(void)
     return &sig_state;
 }
 
+static bool sigaction_autoreaps_sigchld(const linux_sigaction_t *act)
+{
+    return act->sa_handler == LINUX_SIG_IGN ||
+           (act->sa_flags & LINUX_SA_NOCLDWAIT) != 0;
+}
+
+bool signal_sigchld_autoreap(void)
+{
+    bool result;
+    pthread_mutex_lock(&sig_lock);
+    const linux_sigaction_t *act = &sig_state.actions[LINUX_SIGCHLD - 1];
+    result = sigaction_autoreaps_sigchld(act);
+    pthread_mutex_unlock(&sig_lock);
+    return result;
+}
+
+bool signal_refresh_identity_cache(void)
+{
+    guest_t *g = atomic_load_explicit(&attention_guest, memory_order_acquire);
+    if (!g)
+        return false;
+    shim_globals_publish_pid(g, proc_get_pid(), proc_get_ppid());
+    return true;
+}
+
 void signal_set_state(const signal_state_t *state)
 {
     if (!state)
@@ -1144,6 +1169,7 @@ int64_t signal_rt_sigaction(guest_t *g,
 
     int idx = signum - 1;
 
+    bool reap_exited_sigchld = false;
     pthread_mutex_lock(&sig_lock);
 
     /* Return old action if requested */
@@ -1175,10 +1201,21 @@ int64_t signal_rt_sigaction(guest_t *g,
             (act.sa_flags & LINUX_SA_RESETHAND) ? " SA_RESETHAND" : "",
             (act.sa_flags & LINUX_SA_NODEFER) ? " SA_NODEFER" : "");
 
+        /* If SIGCHLD was in an automatic-reap disposition, consume children
+         * that reached a terminal lifecycle state before replacing it. This
+         * closes the exit-notification race where the guest restores SIG_DFL
+         * after observing child teardown but before the transport doorbell is
+         * drained.
+         */
+        reap_exited_sigchld =
+            signum == LINUX_SIGCHLD &&
+            sigaction_autoreaps_sigchld(&sig_state.actions[idx]);
         sig_state.actions[idx] = act;
     }
 
     pthread_mutex_unlock(&sig_lock);
+    if (reap_exited_sigchld)
+        proc_autoreap_exited_children();
     return 0;
 }
 

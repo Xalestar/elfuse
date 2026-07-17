@@ -442,6 +442,12 @@ int fork_child_main(int ipc_fd,
      * know which guest to update.
      */
     signal_set_shim_globals_guest(&g);
+    /* The parent may exit after publishing this child but before bootstrap
+     * reaches the guest loop. Pull any reparent transaction that arrived in
+     * that window after the shim cache is live, so the fork header's original
+     * PPID cannot overwrite the adopter selected by the lifecycle registry.
+     */
+    proc_lifecycle_sync_self(&g);
     /* Same for the fd-table hooks. Must precede any fd_alloc the child performs
      * (the fd-table-restore step has already run above, but those slots are
      * populated via direct memcpy of the parent's entries; subsequent
@@ -466,6 +472,7 @@ int fork_child_main(int ipc_fd,
     /* The child resumes from the captured fork frame and returns 0 to EL0. */
     int exit_code = vcpu_run_loop(vcpu, vexit, &g, verbose, timeout_sec);
 
+    proc_process_exit(exit_code);
     guest_destroy(&g);
     return exit_code;
 }

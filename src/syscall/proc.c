@@ -78,6 +78,7 @@ static _Atomic bool rosetta_active = false;
 static proc_entry_t proc_table[PROC_TABLE_SIZE];
 static int64_t next_guest_pid = 2;
 static pthread_mutex_t pid_lock = PTHREAD_MUTEX_INITIALIZER; /* Lock order: 6 */
+static pthread_mutex_t autoreap_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t pid_cond =
     PTHREAD_COND_INITIALIZER; /* Signaled on child exit */
 
@@ -124,6 +125,28 @@ static _Atomic int exit_group_code = 0;
 static void proc_registry_publish(pid_t host_pid,
                                   int64_t guest_pid_val,
                                   int64_t pgid);
+static int flock_retry(int fd, int op);
+static void lifecycle_publish_self(void);
+static void lifecycle_publish_child(pid_t host_pid,
+                                    int64_t guest_pid,
+                                    int64_t ppid,
+                                    int64_t pgid);
+static void lifecycle_update_pgid(int64_t guest_pid, int64_t pgid);
+static void lifecycle_import_children(void);
+static bool lifecycle_query_exit(int64_t guest_pid,
+                                 int *status,
+                                 pid_t *host_pid,
+                                 int64_t *pgid);
+static void lifecycle_consume(int64_t guest_pid);
+static void lifecycle_ack_reparent(int64_t guest_pid, int64_t ppid);
+static bool lifecycle_reparent_complete(int64_t guest_pid, int64_t ppid);
+static int proc_send_reparent(pid_t host_pid,
+                              int64_t target_guest_pid,
+                              int64_t new_ppid);
+static void proc_notify_reparent(pid_t host_pid,
+                                 int64_t target_guest_pid,
+                                 int64_t new_ppid);
+static int64_t proc_wait_autoreap_children(int pid, int options);
 
 void proc_init(void)
 {
@@ -193,6 +216,10 @@ static void proc_init_child_entry(proc_entry_t *entry,
     entry->pgid = pgid;
     entry->exited = false;
     entry->exit_status = 0;
+    entry->rusage_valid = false;
+    entry->rusage_accounted = false;
+    entry->host_waitable = true;
+    memset(&entry->rusage, 0, sizeof(entry->rusage));
 }
 
 static proc_entry_t *proc_find_free_entry(void)
@@ -285,67 +312,81 @@ int rseq_try_abort(guest_t *g,
     return result;
 }
 
+static bool process_pid_sequence_path(char *out, size_t out_size)
+{
+    char dir[PATH_MAX];
+    size_t n = confstr(_CS_DARWIN_USER_TEMP_DIR, dir, sizeof(dir));
+    if (n == 0 || n > sizeof(dir))
+        return false;
+    int len = snprintf(out, out_size, "%selfuse-pidseq-%llu", dir,
+                       (unsigned long long) absock_get_namespace_id());
+    return len > 0 && (size_t) len < out_size;
+}
+
 int64_t proc_alloc_pid(void)
 {
+    static _Atomic bool owner_sequence_reset;
+    char path[PATH_MAX];
+    if (process_pid_sequence_path(path, sizeof(path))) {
+        if (absock_get_namespace_id() == (uint64_t) getpid() &&
+            !atomic_exchange(&owner_sequence_reset, true))
+            unlink(path);
+        int fd = open(path, O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600);
+        if (fd >= 0 && flock_retry(fd, LOCK_EX) == 0) {
+            int64_t next = 2;
+            if (lseek(fd, 0, SEEK_SET) == 0) {
+                ssize_t n;
+                do {
+                    n = read(fd, &next, sizeof(next));
+                } while (n < 0 && errno == EINTR);
+                if (n != (ssize_t) sizeof(next) || next < 2)
+                    next = 2;
+            }
+            int64_t pid = next++;
+            if (ftruncate(fd, 0) == 0 && lseek(fd, 0, SEEK_SET) == 0 &&
+                proc_write_full(fd, &next, sizeof(next)) == 0) {
+                flock_retry(fd, LOCK_UN);
+                close(fd);
+                return pid;
+            }
+            flock_retry(fd, LOCK_UN);
+            close(fd);
+        } else if (fd >= 0) {
+            close(fd);
+        }
+    }
+
+    /* Fail soft if the shared allocator cannot be opened. This preserves
+     * single-process progress, while the normal path above provides namespace-
+     * wide uniqueness for nested/concurrent forks.
+     */
     pthread_mutex_lock(&pid_lock);
     int64_t pid = next_guest_pid++;
     pthread_mutex_unlock(&pid_lock);
     return pid;
 }
 
-/* Try to reap exited children from the process table. Calls waitpid with
- * WNOHANG on each active entry; entries whose host process has exited are
- * freed.
- *
- * Returns the number of slots reclaimed.
- */
-static int proc_reap_finished(void)
-{
-    int reaped = 0;
-    for (int i = 0; i < PROC_TABLE_SIZE; i++) {
-        if (!proc_table[i].active)
-            continue;
-        if (proc_table[i].exited) {
-            /* Already marked exited but never waited; free the slot */
-            proc_table[i].active = false;
-            reaped++;
-            continue;
-        }
-        int status;
-        struct rusage ru;
-        pid_t ret = wait4(proc_table[i].host_pid, &status, WNOHANG, &ru);
-        if (ret > 0) {
-            /* Child exited; free the slot */
-            proc_children_cpu_add(&ru);
-            proc_table[i].active = false;
-            reaped++;
-        }
-    }
-    return reaped;
-}
-
 int proc_register_child(pid_t host_pid, int64_t guest_pid_val, int64_t pgid)
 {
+    /* Explicit SIG_IGN/SA_NOCLDWAIT children are not guest-waitable. Reclaim
+     * any that have already terminated before consuming another table slot,
+     * so a workload that intentionally never calls wait cannot exhaust the
+     * fixed bookkeeping table with stale children.
+     */
+    if (signal_sigchld_autoreap())
+        (void) proc_wait_autoreap_children(-1, WNOHANG);
+
     pthread_mutex_lock(&pid_lock);
     proc_entry_t *entry = proc_find_free_entry();
     if (entry) {
         proc_init_child_entry(entry, host_pid, guest_pid_val, pgid);
         pthread_mutex_unlock(&pid_lock);
         proc_registry_publish(host_pid, guest_pid_val, pgid);
+        lifecycle_publish_child(host_pid, guest_pid_val, proc_get_pid(), pgid);
         proc_registry_publish_self();
         return 0;
     }
 
-    /* Table full. Try reaping exited children, then retry. */
-    if (proc_reap_finished() > 0)
-        entry = proc_find_free_entry();
-    if (entry) {
-        proc_init_child_entry(entry, host_pid, guest_pid_val, pgid);
-        pthread_mutex_unlock(&pid_lock);
-        proc_registry_publish(host_pid, guest_pid_val, pgid);
-        proc_registry_publish_self();
-        return 0;
-    }
     pthread_mutex_unlock(&pid_lock);
 
     log_error("process table full (%d slots), child PID %lld dropped",
@@ -360,6 +401,7 @@ void proc_mark_child_exited(pid_t host_pid, int status)
     if (entry) {
         entry->exited = true;
         entry->exit_status = status;
+        entry->rusage_accounted = true;
         int64_t gpid = entry->guest_pid;
         pthread_cond_broadcast(&pid_cond);
         pthread_mutex_unlock(&pid_lock);
@@ -412,6 +454,381 @@ static bool process_registry_path(char *out, size_t out_size)
     return len > 0 && (size_t) len < out_size;
 }
 
+/* The process-group registry above intentionally contains only live host
+ * members. Linux lifecycle state has different retention rules: an exited
+ * child must remain discoverable until a guest wait consumes it, including
+ * after its original host parent exits. Keep that state in a separate binary
+ * registry protected by flock so unrelated signal/group readers stay simple.
+ */
+#define LIFECYCLE_MAGIC 0x454C464CU /* "ELFL" */
+#define LIFECYCLE_VERSION 2
+#define LIFECYCLE_MAX_ENTRIES (PROC_TABLE_SIZE * 4)
+
+typedef struct {
+    pid_t host_pid;
+    int64_t guest_pid;
+    int64_t ppid;
+    int64_t pgid;
+    bool subreaper;
+    bool exited;
+    bool reparent_pending;
+    int exit_status;
+} lifecycle_entry_t;
+
+typedef struct {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t count;
+    uint32_t _pad;
+    lifecycle_entry_t entries[LIFECYCLE_MAX_ENTRIES];
+} lifecycle_registry_t;
+
+static bool lifecycle_registry_path(char *out, size_t out_size)
+{
+    char dir[PATH_MAX];
+    size_t n = confstr(_CS_DARWIN_USER_TEMP_DIR, dir, sizeof(dir));
+    if (n == 0 || n > sizeof(dir))
+        return false;
+    int len = snprintf(out, out_size, "%selfuse-life-%llu", dir,
+                       (unsigned long long) absock_get_namespace_id());
+    return len > 0 && (size_t) len < out_size;
+}
+
+static int lifecycle_read_full(int fd, void *buf, size_t len)
+{
+    uint8_t *p = buf;
+    while (len > 0) {
+        ssize_t n = read(fd, p, len);
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0)
+            return -1;
+        p += (size_t) n;
+        len -= (size_t) n;
+    }
+    return 0;
+}
+
+static lifecycle_registry_t *lifecycle_load_locked(int fd)
+{
+    lifecycle_registry_t *registry = calloc(1, sizeof(*registry));
+    if (!registry)
+        return NULL;
+    if (lseek(fd, 0, SEEK_SET) != 0 ||
+        lifecycle_read_full(fd, registry, sizeof(*registry)) < 0 ||
+        registry->magic != LIFECYCLE_MAGIC ||
+        registry->version != LIFECYCLE_VERSION ||
+        registry->count > LIFECYCLE_MAX_ENTRIES) {
+        memset(registry, 0, sizeof(*registry));
+        registry->magic = LIFECYCLE_MAGIC;
+        registry->version = LIFECYCLE_VERSION;
+    }
+    return registry;
+}
+
+static int lifecycle_save_locked(int fd, const lifecycle_registry_t *registry)
+{
+    if (ftruncate(fd, 0) != 0 || lseek(fd, 0, SEEK_SET) != 0)
+        return -1;
+    return proc_write_full(fd, registry, sizeof(*registry));
+}
+
+static int lifecycle_open_locked(char *path, size_t path_size)
+{
+    static _Atomic bool owner_reset_done;
+    if (!lifecycle_registry_path(path, path_size))
+        return -1;
+    if (absock_get_namespace_id() == (uint64_t) getpid() &&
+        !atomic_exchange(&owner_reset_done, true))
+        unlink(path);
+    int fd = open(path, O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (fd < 0)
+        return -1;
+    if (flock_retry(fd, LOCK_EX) != 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static lifecycle_entry_t *lifecycle_find_guest(lifecycle_registry_t *registry,
+                                               int64_t guest_pid)
+{
+    for (uint32_t i = 0; i < registry->count; i++)
+        if (registry->entries[i].guest_pid == guest_pid)
+            return &registry->entries[i];
+    return NULL;
+}
+
+static lifecycle_entry_t *lifecycle_upsert(lifecycle_registry_t *registry,
+                                           int64_t guest_pid)
+{
+    lifecycle_entry_t *entry = lifecycle_find_guest(registry, guest_pid);
+    if (entry)
+        return entry;
+    if (registry->count == LIFECYCLE_MAX_ENTRIES)
+        return NULL;
+    entry = &registry->entries[registry->count++];
+    memset(entry, 0, sizeof(*entry));
+    entry->guest_pid = guest_pid;
+    return entry;
+}
+
+static void lifecycle_unlock_close(int fd)
+{
+    flock_retry(fd, LOCK_UN);
+    close(fd);
+}
+
+static void lifecycle_publish_child(pid_t host_pid,
+                                    int64_t guest_pid,
+                                    int64_t ppid,
+                                    int64_t pgid)
+{
+    char path[PATH_MAX];
+    int fd = lifecycle_open_locked(path, sizeof(path));
+    if (fd < 0)
+        return;
+    lifecycle_registry_t *registry = lifecycle_load_locked(fd);
+    if (registry) {
+        lifecycle_entry_t *entry = lifecycle_find_guest(registry, guest_pid);
+        bool existing = entry != NULL;
+        if (!entry)
+            entry = lifecycle_upsert(registry, guest_pid);
+        if (entry) {
+            entry->host_pid = host_pid;
+            /* Guest PIDs are not reused within an invocation. An existing
+             * entry was therefore published by the child itself or by a
+             * reparent transaction that won the race with this parent-side
+             * registration. Preserve that authoritative lifecycle state --
+             * especially a terminal status -- instead of resurrecting an
+             * already-exited child as live.
+             */
+            if (!existing) {
+                entry->ppid = ppid;
+                entry->pgid = pgid;
+                entry->subreaper = false;
+                entry->exited = false;
+                entry->reparent_pending = false;
+                entry->exit_status = 0;
+            }
+            (void) lifecycle_save_locked(fd, registry);
+        }
+        free(registry);
+    }
+    lifecycle_unlock_close(fd);
+}
+
+static void lifecycle_publish_self(void)
+{
+    char path[PATH_MAX];
+    int fd = lifecycle_open_locked(path, sizeof(path));
+    if (fd < 0)
+        return;
+    lifecycle_registry_t *registry = lifecycle_load_locked(fd);
+    if (registry) {
+        lifecycle_entry_t *entry = lifecycle_upsert(registry, proc_get_pid());
+        if (entry) {
+            entry->host_pid = getpid();
+            /* A parent-exit transaction writes the authoritative adopter
+             * before notifying this process. Do not let an unrelated publish
+             * from the child overwrite that value with its stale local PPID
+             * while the reparent control record is still pending.
+             */
+            if (!entry->reparent_pending)
+                entry->ppid = proc_get_ppid();
+            entry->pgid = proc_get_pgid();
+            entry->subreaper = proc_get_child_subreaper();
+            if (!entry->exited)
+                entry->exit_status = 0;
+            (void) lifecycle_save_locked(fd, registry);
+        }
+        free(registry);
+    }
+    lifecycle_unlock_close(fd);
+}
+
+static void lifecycle_update_pgid(int64_t guest_pid, int64_t pgid)
+{
+    char path[PATH_MAX];
+    int fd = lifecycle_open_locked(path, sizeof(path));
+    if (fd < 0)
+        return;
+    lifecycle_registry_t *registry = lifecycle_load_locked(fd);
+    if (registry) {
+        lifecycle_entry_t *entry = lifecycle_find_guest(registry, guest_pid);
+        if (entry) {
+            entry->pgid = pgid;
+            (void) lifecycle_save_locked(fd, registry);
+        }
+        free(registry);
+    }
+    lifecycle_unlock_close(fd);
+}
+
+static bool lifecycle_query_exit(int64_t guest_pid,
+                                 int *status,
+                                 pid_t *host_pid,
+                                 int64_t *pgid)
+{
+    bool exited = false;
+    char path[PATH_MAX];
+    int fd = lifecycle_open_locked(path, sizeof(path));
+    if (fd < 0)
+        return false;
+    lifecycle_registry_t *registry = lifecycle_load_locked(fd);
+    if (registry) {
+        lifecycle_entry_t *entry = lifecycle_find_guest(registry, guest_pid);
+        if (entry) {
+            if (status)
+                *status = entry->exit_status;
+            if (host_pid)
+                *host_pid = entry->host_pid;
+            if (pgid)
+                *pgid = entry->pgid;
+            exited = entry->exited;
+        }
+        free(registry);
+    }
+    lifecycle_unlock_close(fd);
+    return exited;
+}
+
+static void lifecycle_consume(int64_t guest_pid)
+{
+    char path[PATH_MAX];
+    int fd = lifecycle_open_locked(path, sizeof(path));
+    if (fd < 0)
+        return;
+    lifecycle_registry_t *registry = lifecycle_load_locked(fd);
+    if (registry) {
+        for (uint32_t i = 0; i < registry->count; i++) {
+            if (registry->entries[i].guest_pid != guest_pid)
+                continue;
+            registry->entries[i] = registry->entries[registry->count - 1];
+            registry->count--;
+            (void) lifecycle_save_locked(fd, registry);
+            break;
+        }
+        free(registry);
+    }
+    lifecycle_unlock_close(fd);
+}
+
+static void lifecycle_ack_reparent(int64_t guest_pid, int64_t ppid)
+{
+    char path[PATH_MAX];
+    int fd = lifecycle_open_locked(path, sizeof(path));
+    if (fd < 0)
+        return;
+    lifecycle_registry_t *registry = lifecycle_load_locked(fd);
+    if (registry) {
+        lifecycle_entry_t *entry = lifecycle_find_guest(registry, guest_pid);
+        if (entry && entry->ppid == ppid && entry->reparent_pending) {
+            entry->reparent_pending = false;
+            (void) lifecycle_save_locked(fd, registry);
+        }
+        free(registry);
+    }
+    lifecycle_unlock_close(fd);
+}
+
+static bool lifecycle_reparent_complete(int64_t guest_pid, int64_t ppid)
+{
+    bool complete = false;
+    char path[PATH_MAX];
+    int fd = lifecycle_open_locked(path, sizeof(path));
+    if (fd < 0)
+        return false;
+    lifecycle_registry_t *registry = lifecycle_load_locked(fd);
+    if (registry) {
+        lifecycle_entry_t *entry = lifecycle_find_guest(registry, guest_pid);
+        /* A missing/consumed child or one that has already exited no longer
+         * needs its live shim PPID cache updated.
+         */
+        complete = !entry || entry->exited ||
+                   (entry->ppid == ppid && !entry->reparent_pending);
+        free(registry);
+    }
+    lifecycle_unlock_close(fd);
+    return complete;
+}
+
+void proc_lifecycle_sync_self(guest_t *g)
+{
+    int64_t ppid = -1;
+    bool pending = false;
+    char path[PATH_MAX];
+    int fd = lifecycle_open_locked(path, sizeof(path));
+    if (fd < 0)
+        return;
+    lifecycle_registry_t *registry = lifecycle_load_locked(fd);
+    if (registry) {
+        lifecycle_entry_t *entry =
+            lifecycle_find_guest(registry, proc_get_pid());
+        if (entry) {
+            ppid = entry->ppid;
+            pending = entry->reparent_pending;
+        }
+        free(registry);
+    }
+    lifecycle_unlock_close(fd);
+
+    if (ppid <= 0)
+        return;
+    proc_set_ppid(ppid);
+    shim_globals_publish_pid(g, proc_get_pid(), ppid);
+    if (pending)
+        lifecycle_ack_reparent(proc_get_pid(), ppid);
+}
+
+static void proc_register_adopted_local(const lifecycle_entry_t *source)
+{
+    pthread_mutex_lock(&pid_lock);
+    proc_entry_t *entry = proc_find_guest_entry(source->guest_pid);
+    if (entry && entry->host_waitable) {
+        pthread_mutex_unlock(&pid_lock);
+        return;
+    }
+    if (!entry)
+        entry = proc_find_free_entry();
+    if (entry) {
+        if (!entry->active)
+            proc_init_child_entry(entry, source->host_pid, source->guest_pid,
+                                  source->pgid);
+        entry->host_pid = source->host_pid;
+        entry->pgid = source->pgid;
+        entry->host_waitable = false;
+        if (source->exited) {
+            entry->exited = true;
+            entry->exit_status = source->exit_status;
+            pthread_cond_broadcast(&pid_cond);
+        }
+    }
+    pthread_mutex_unlock(&pid_lock);
+    if (source->exited)
+        proc_pidfd_notify_exit(source->guest_pid);
+}
+
+static void lifecycle_import_children(void)
+{
+    char path[PATH_MAX];
+    int fd = lifecycle_open_locked(path, sizeof(path));
+    if (fd < 0)
+        return;
+    lifecycle_registry_t *registry = lifecycle_load_locked(fd);
+    if (registry) {
+        int64_t self = proc_get_pid();
+        for (uint32_t i = 0; i < registry->count; i++) {
+            lifecycle_entry_t *entry = &registry->entries[i];
+            if (entry->guest_pid != self && entry->ppid == self)
+                proc_register_adopted_local(entry);
+        }
+        free(registry);
+    }
+    lifecycle_unlock_close(fd);
+}
+
 static void proc_registry_reset_if_owner(const char *path)
 {
     static _Atomic bool reset_done;
@@ -442,16 +859,16 @@ static int flock_retry(int fd, int op)
 }
 
 /* Read @fd from its current offset and invoke @cb once per newline-terminated
- * record, passing a NUL-terminated copy. Records must fit in 63 bytes; both the
- * registry ("hostpid guestpid pgid") and the signal transport ("ns tgpid sig")
- * use short numeric lines. Overlong records and an unterminated trailing token
- * are dropped -- every writer appends a whole record under an exclusive lock,
- * so a partial line only appears after a crash mid-write.
+ * record, passing a NUL-terminated copy. Records must fit in 159 bytes; both
+ * the registry ("hostpid guestpid pgid") and signal/control transport records
+ * use bounded numeric lines. Overlong records and an unterminated trailing
+ * token are dropped -- every writer appends a whole record under an exclusive
+ * lock, so a partial line only appears after a crash mid-write.
  */
 static void for_each_record(int fd, void (*cb)(char *rec, void *ctx), void *ctx)
 {
     char chunk[8192];
-    char line[64];
+    char line[160];
     size_t linelen = 0;
     bool overlong = false;
     ssize_t r;
@@ -632,6 +1049,7 @@ static void proc_registry_publish(pid_t host_pid,
 void proc_registry_publish_self(void)
 {
     proc_registry_publish(getpid(), proc_get_pid(), proc_get_pgid());
+    lifecycle_publish_self();
 }
 
 void proc_registry_sync_self_pgid(guest_t *g)
@@ -697,7 +1115,8 @@ int proc_send_guest_signal(pid_t host_pid, int64_t target_guest_pid, int signum)
     const char *our_path = elfuse_self_path(&our_len);
     char tpath[PROC_PIDPATHINFO_MAXSIZE];
     int tlen = proc_pidpath(host_pid, tpath, sizeof(tpath));
-    if (our_len <= 0 || tlen != our_len || memcmp(tpath, our_path, our_len)) {
+    if (our_len <= 0 || tlen != our_len ||
+        memcmp(tpath, our_path, our_len) != 0) {
         errno = ESRCH;
         return -1;
     }
@@ -753,6 +1172,180 @@ int proc_send_guest_signal(pid_t host_pid, int64_t target_guest_pid, int signum)
     return kill(host_pid, SIGUSR2);
 }
 
+void proc_process_exit(int exit_code)
+{
+    char path[PATH_MAX];
+    int fd = lifecycle_open_locked(path, sizeof(path));
+    if (fd < 0) {
+        /* The direct-parent notification still improves SIGCHLD timing if the
+         * lifecycle registry is unavailable.
+         */
+        int64_t parent_guest_pid = proc_get_ppid();
+        pid_t parent_host_pid = getppid();
+        if (parent_guest_pid > 0 && parent_host_pid > 1)
+            (void) proc_send_guest_signal(parent_host_pid, parent_guest_pid,
+                                          LINUX_SIGCHLD);
+        return;
+    }
+
+    lifecycle_registry_t *registry = lifecycle_load_locked(fd);
+    if (!registry) {
+        lifecycle_unlock_close(fd);
+        return;
+    }
+
+    int64_t self_pid = proc_get_pid();
+    lifecycle_entry_t *self = lifecycle_upsert(registry, self_pid);
+    if (!self) {
+        free(registry);
+        lifecycle_unlock_close(fd);
+        return;
+    }
+    self->host_pid = getpid();
+    if (self->ppid <= 0)
+        self->ppid = proc_get_ppid();
+    self->pgid = proc_get_pgid();
+    self->subreaper = proc_get_child_subreaper();
+    self->exited = true;
+    self->exit_status = (exit_code & 0xff) << 8;
+
+    /* Linux adopts descendants at the nearest living subreaper, otherwise at
+     * namespace PID 1. Walk the registry's guest-parent chain while holding the
+     * namespace lock so concurrent exits cannot produce a split decision.
+     */
+    int64_t adopter_pid = -1;
+    int64_t ancestor = self->ppid;
+    for (uint32_t depth = 0; depth < registry->count && ancestor > 0; depth++) {
+        lifecycle_entry_t *candidate = lifecycle_find_guest(registry, ancestor);
+        if (!candidate)
+            break;
+        if (!candidate->exited && candidate->subreaper) {
+            adopter_pid = candidate->guest_pid;
+            break;
+        }
+        if (candidate->guest_pid == 1)
+            break;
+        ancestor = candidate->ppid;
+    }
+    if (adopter_pid < 0) {
+        lifecycle_entry_t *init = lifecycle_find_guest(registry, 1);
+        if (init && !init->exited)
+            adopter_pid = 1;
+    }
+
+    lifecycle_entry_t *reparented =
+        calloc(registry->count ? registry->count : 1, sizeof(*reparented));
+    uint32_t nreparented = 0;
+    if (adopter_pid > 0 && reparented) {
+        for (uint32_t i = 0; i < registry->count; i++) {
+            lifecycle_entry_t *child = &registry->entries[i];
+            if (child->guest_pid == self_pid || child->ppid != self_pid)
+                continue;
+            child->ppid = adopter_pid;
+            child->reparent_pending = !child->exited;
+            reparented[nreparented++] = *child;
+        }
+    }
+
+    pid_t parent_host_pid = -1;
+    int64_t parent_guest_pid = self->ppid;
+    lifecycle_entry_t *parent =
+        lifecycle_find_guest(registry, parent_guest_pid);
+    if (parent && !parent->exited)
+        parent_host_pid = parent->host_pid;
+
+    (void) lifecycle_save_locked(fd, registry);
+    free(registry);
+    lifecycle_unlock_close(fd);
+
+    for (uint32_t i = 0; i < nreparented; i++) {
+        if (reparented[i].exited)
+            continue;
+        proc_notify_reparent(reparented[i].host_pid, reparented[i].guest_pid,
+                             adopter_pid);
+    }
+    free(reparented);
+
+    if (parent_host_pid > 0)
+        (void) proc_send_guest_signal(parent_host_pid, parent_guest_pid,
+                                      LINUX_SIGCHLD);
+}
+
+static int proc_send_reparent(pid_t host_pid,
+                              int64_t target_guest_pid,
+                              int64_t new_ppid)
+{
+    int our_len;
+    const char *our_path = elfuse_self_path(&our_len);
+    char tpath[PROC_PIDPATHINFO_MAXSIZE];
+    int tlen = proc_pidpath(host_pid, tpath, sizeof(tpath));
+    if (our_len <= 0 || tlen != our_len ||
+        memcmp(tpath, our_path, our_len) != 0) {
+        errno = ESRCH;
+        return -1;
+    }
+
+    char path[PATH_MAX];
+    if (!signal_transport_path(path, sizeof(path), host_pid)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    int fd = open(path, O_CREAT | O_APPEND | O_WRONLY | O_CLOEXEC | O_NOFOLLOW,
+                  0600);
+    if (fd < 0)
+        return -1;
+
+    char line[128];
+    int len = snprintf(line, sizeof(line), "R %llu %lld %lld\n",
+                       (unsigned long long) absock_get_namespace_id(),
+                       (long long) target_guest_pid, (long long) new_ppid);
+    if (len < 0 || (size_t) len >= sizeof(line)) {
+        close(fd);
+        errno = EINVAL;
+        return -1;
+    }
+    if (flock_retry(fd, LOCK_EX) != 0) {
+        close(fd);
+        return -1;
+    }
+    int wrc = proc_write_full(fd, line, (size_t) len);
+    flock_retry(fd, LOCK_UN);
+    close(fd);
+    if (wrc < 0)
+        return -1;
+    return kill(host_pid, SIGUSR2);
+}
+
+static void proc_notify_reparent(pid_t host_pid,
+                                 int64_t target_guest_pid,
+                                 int64_t new_ppid)
+{
+    int last_error = 0;
+
+    /* SIGUSR2 is a standard signal, so multiple doorbells can coalesce. The
+     * file record remains durable, but a process exiting immediately after one
+     * successful kill must not assume the receiver already updated its shim
+     * identity cache. Retry until the child acknowledges the registry's
+     * pending transaction, with a bounded 50ms exit-path delay.
+     */
+    for (int attempt = 0; attempt < 20; attempt++) {
+        if (lifecycle_reparent_complete(target_guest_pid, new_ppid))
+            return;
+        if (proc_send_reparent(host_pid, target_guest_pid, new_ppid) < 0)
+            last_error = errno;
+        usleep(2500);
+    }
+
+    if (!lifecycle_reparent_complete(target_guest_pid, new_ppid)) {
+        if (last_error)
+            log_warn("reparent notification to guest pid %lld failed: %s",
+                     (long long) target_guest_pid, strerror(last_error));
+        else
+            log_warn("guest pid %lld did not acknowledge reparent to %lld",
+                     (long long) target_guest_pid, (long long) new_ppid);
+    }
+}
+
 int proc_get_direct_child_pids(pid_t *out, int max_pids)
 {
     int count = 0;
@@ -779,6 +1372,8 @@ int proc_set_child_pgid(int64_t guest_pid_val, int64_t pgid)
     pthread_mutex_unlock(&pid_lock);
     if (host_pid > 0)
         proc_registry_publish(host_pid, guest_pid_val, pgid);
+    if (host_pid > 0)
+        lifecycle_update_pgid(guest_pid_val, pgid);
     return ret;
 }
 
@@ -1092,10 +1687,198 @@ static int write_rusage_to_guest(guest_t *g,
  */
 static void proc_deactivate_slot_if_matches(int slot, pid_t host_pid)
 {
+    int64_t guest_pid = -1;
     pthread_mutex_lock(&pid_lock);
-    if (proc_table[slot].active && proc_table[slot].host_pid == host_pid)
+    if (proc_table[slot].active && proc_table[slot].host_pid == host_pid) {
+        guest_pid = proc_table[slot].guest_pid;
         proc_table[slot].active = false;
+    }
     pthread_mutex_unlock(&pid_lock);
+    if (guest_pid > 0)
+        lifecycle_consume(guest_pid);
+}
+
+static bool proc_refresh_external_child(int64_t guest_pid)
+{
+    int status = 0;
+    pid_t host_pid = -1;
+    int64_t pgid = 0;
+    bool exited = lifecycle_query_exit(guest_pid, &status, &host_pid, &pgid);
+    if (!exited)
+        return false;
+
+    pthread_mutex_lock(&pid_lock);
+    proc_entry_t *entry = proc_find_guest_entry(guest_pid);
+    if (entry && !entry->host_waitable) {
+        entry->host_pid = host_pid;
+        entry->pgid = pgid;
+        entry->exited = true;
+        entry->exit_status = status;
+        pthread_cond_broadcast(&pid_cond);
+    }
+    pthread_mutex_unlock(&pid_lock);
+    proc_pidfd_notify_exit(guest_pid);
+    return true;
+}
+
+static void proc_account_entry_locked(proc_entry_t *entry)
+{
+    if (entry->rusage_valid && !entry->rusage_accounted) {
+        proc_children_cpu_add(&entry->rusage);
+        entry->rusage_accounted = true;
+    }
+}
+
+void proc_autoreap_exited_children(void)
+{
+    /* The signal-drain thread and a guest rt_sigaction thread can both enter
+     * here while SIGCHLD is transitioning away from an auto-reap disposition.
+     * Serialize the whole host-reap/local-deactivate/registry-consume sequence
+     * so rt_sigaction cannot return while another reaper has consumed the
+     * shared lifecycle entry but still exposes the local wait slot.
+     */
+    pthread_mutex_lock(&autoreap_lock);
+
+    /* Adopted descendants may not have a local table slot until their new
+     * parent performs a wait. Import them first so an explicit no-zombie
+     * disposition applies equally to direct and adopted children.
+     */
+    lifecycle_import_children();
+
+    for (int i = 0; i < PROC_TABLE_SIZE; i++) {
+        pthread_mutex_lock(&pid_lock);
+        if (!proc_table[i].active) {
+            pthread_mutex_unlock(&pid_lock);
+            continue;
+        }
+        int64_t guest_pid = proc_table[i].guest_pid;
+        pid_t host_pid = proc_table[i].host_pid;
+        bool host_waitable = proc_table[i].host_waitable;
+        pthread_mutex_unlock(&pid_lock);
+
+        if (!lifecycle_query_exit(guest_pid, NULL, NULL, NULL))
+            continue;
+
+        if (!host_waitable) {
+            pthread_mutex_lock(&pid_lock);
+            proc_entry_t *entry = proc_find_guest_entry(guest_pid);
+            if (entry && !entry->host_waitable)
+                entry->active = false;
+            pthread_mutex_unlock(&pid_lock);
+            lifecycle_consume(guest_pid);
+            proc_pidfd_notify_exit(guest_pid);
+            continue;
+        }
+
+        int status = 0;
+        struct rusage ru;
+        pid_t ret;
+        do {
+            ret = wait4(host_pid, &status, 0, &ru);
+        } while (ret < 0 && errno == EINTR);
+        if (ret == host_pid) {
+            proc_children_cpu_add(&ru);
+            proc_pidfd_notify_exit(guest_pid);
+            proc_deactivate_slot_if_matches(i, host_pid);
+        } else if (ret < 0 && errno == ECHILD) {
+            /* A concurrent consuming wait won the host reap. The disposition
+             * still makes this child non-waitable to subsequent guest waits.
+             */
+            proc_deactivate_slot_if_matches(i, host_pid);
+        }
+    }
+
+    pthread_mutex_unlock(&autoreap_lock);
+}
+
+static bool proc_wait_selector_matches(const proc_entry_t *entry,
+                                       int pid,
+                                       int64_t caller_pgid)
+{
+    if (!entry->active)
+        return false;
+    if (pid == -1)
+        return true;
+    if (pid > 0)
+        return entry->guest_pid == pid;
+
+    int64_t target_pgid = pid == 0 ? caller_pgid : -(int64_t) pid;
+    return entry->pgid == target_pgid;
+}
+
+static int64_t proc_wait_autoreap_children(int pid, int options)
+{
+    int64_t caller_pgid = proc_get_pgid();
+    for (;;) {
+        bool found = false;
+        bool still_active = false;
+
+        pthread_mutex_lock(&pid_lock);
+        for (int i = 0; i < PROC_TABLE_SIZE; i++) {
+            if (!proc_wait_selector_matches(&proc_table[i], pid, caller_pgid))
+                continue;
+            found = true;
+            if (proc_table[i].exited) {
+                int64_t guest_pid = proc_table[i].guest_pid;
+                proc_account_entry_locked(&proc_table[i]);
+                proc_table[i].active = false;
+                pthread_mutex_unlock(&pid_lock);
+                lifecycle_consume(guest_pid);
+                pthread_mutex_lock(&pid_lock);
+                continue;
+            }
+
+            if (!proc_table[i].host_waitable) {
+                int64_t guest_pid = proc_table[i].guest_pid;
+                pthread_mutex_unlock(&pid_lock);
+                bool exited = proc_refresh_external_child(guest_pid);
+                pthread_mutex_lock(&pid_lock);
+                proc_entry_t *entry = proc_find_guest_entry(guest_pid);
+                if (exited && entry && entry->exited) {
+                    proc_account_entry_locked(entry);
+                    entry->active = false;
+                    pthread_mutex_unlock(&pid_lock);
+                    lifecycle_consume(guest_pid);
+                    pthread_mutex_lock(&pid_lock);
+                } else if (entry) {
+                    still_active = true;
+                }
+                continue;
+            }
+
+            pid_t host_pid = proc_table[i].host_pid;
+            int64_t guest_pid = proc_table[i].guest_pid;
+            pthread_mutex_unlock(&pid_lock);
+            int status = 0;
+            struct rusage ru;
+            pid_t ret = wait4(host_pid, &status, WNOHANG, &ru);
+            pthread_mutex_lock(&pid_lock);
+            if (ret == host_pid) {
+                proc_children_cpu_add(&ru);
+                proc_entry_t *entry = proc_find_host_entry(host_pid);
+                if (entry)
+                    entry->active = false;
+                pthread_mutex_unlock(&pid_lock);
+                lifecycle_consume(guest_pid);
+                pthread_mutex_lock(&pid_lock);
+            } else if (ret == 0) {
+                still_active = true;
+            } else {
+                proc_entry_t *entry = proc_find_host_entry(host_pid);
+                if (entry)
+                    entry->active = false;
+            }
+        }
+        pthread_mutex_unlock(&pid_lock);
+
+        if (!found || !still_active)
+            return -LINUX_ECHILD;
+        if (options & 1) /* WNOHANG */
+            return 0;
+        if (proc_exit_group_requested())
+            return -LINUX_EINTR;
+        usleep(1000);
+    }
 }
 
 /* sys_wait4. */
@@ -1106,6 +1889,10 @@ int64_t sys_wait4(guest_t *g,
                   int options,
                   uint64_t rusage_gva)
 {
+    lifecycle_import_children();
+    if (signal_sigchld_autoreap())
+        return proc_wait_autoreap_children(pid, options);
+
     /* First check for ptraced or vm-clone children in the thread table.
      * thread_ptrace_wait handles both ptrace-stopped and vm-exited states.
      */
@@ -1153,17 +1940,37 @@ int64_t sys_wait4(guest_t *g,
                     /* Already reaped (from CLONE_VFORK wait) */
                     int64_t gpid = proc_table[i].guest_pid;
                     int32_t linux_status = proc_table[i].exit_status;
+                    struct rusage ru = proc_table[i].rusage;
+                    bool ru_valid = proc_table[i].rusage_valid;
+                    proc_account_entry_locked(&proc_table[i]);
                     proc_table[i].active = false;
                     pthread_mutex_unlock(&pid_lock);
+                    lifecycle_consume(gpid);
                     if (status_gva &&
                         guest_write_small(g, status_gva, &linux_status,
                                           sizeof(linux_status)) < 0)
                         return -LINUX_EFAULT;
-                    /* Pre-exited entries have no rusage; zero-fill. */
                     if (rusage_gva)
-                        write_rusage_to_guest(g, rusage_gva,
-                                              &(struct rusage) {0});
+                        write_rusage_to_guest(
+                            g, rusage_gva,
+                            ru_valid ? &ru : &(struct rusage) {0});
                     return gpid;
+                }
+
+                if (!proc_table[i].host_waitable) {
+                    int64_t external_gpid = proc_table[i].guest_pid;
+                    pthread_mutex_unlock(&pid_lock);
+                    bool ready = proc_refresh_external_child(external_gpid);
+                    pthread_mutex_lock(&pid_lock);
+                    if (ready) {
+                        /* Restart the scan so the newly marked exited entry is
+                         * returned immediately instead of falling through to
+                         * the blocking sleep below.
+                         */
+                        i = -1;
+                        continue;
+                    }
+                    continue;
                 }
 
                 pid_t host_pid = proc_table[i].host_pid;
@@ -1243,16 +2050,33 @@ int64_t sys_wait4(guest_t *g,
             if (proc_table[i].exited) {
                 int64_t gpid = proc_table[i].guest_pid;
                 int32_t linux_status = proc_table[i].exit_status;
+                struct rusage ru = proc_table[i].rusage;
+                bool ru_valid = proc_table[i].rusage_valid;
+                proc_account_entry_locked(&proc_table[i]);
                 proc_table[i].active = false;
                 pthread_mutex_unlock(&pid_lock);
+                lifecycle_consume(gpid);
                 if (status_gva &&
                     guest_write_small(g, status_gva, &linux_status,
                                       sizeof(linux_status)) < 0)
                     return -LINUX_EFAULT;
-                /* Pre-exited entries have no rusage; zero-fill. */
                 if (rusage_gva)
-                    write_rusage_to_guest(g, rusage_gva, &(struct rusage) {0});
+                    write_rusage_to_guest(
+                        g, rusage_gva, ru_valid ? &ru : &(struct rusage) {0});
                 return gpid;
+            }
+
+            if (!proc_table[i].host_waitable) {
+                int64_t external_gpid = proc_table[i].guest_pid;
+                pthread_mutex_unlock(&pid_lock);
+                if (proc_refresh_external_child(external_gpid))
+                    return sys_wait4(g, pid, status_gva, options, rusage_gva);
+                if (mac_options & WNOHANG)
+                    return 0;
+                if (proc_exit_group_requested())
+                    return -LINUX_EINTR;
+                usleep(1000);
+                return sys_wait4(g, pid, status_gva, options, rusage_gva);
             }
 
             pid_t host_pid = proc_table[i].host_pid;
@@ -1307,8 +2131,6 @@ int64_t sys_wait4(guest_t *g,
                 }
                 /* Re-validate slot: another thread may have reaped it */
                 proc_deactivate_slot_if_matches(slot, host_pid);
-                /* Queue SIGCHLD for parent process */
-                signal_queue(LINUX_SIGCHLD);
                 return gpid;
             } else if (ret == 0) {
                 return 0; /* WNOHANG */
@@ -1364,6 +2186,7 @@ int64_t sys_waitid(guest_t *g,
 
     /* Convert idtype+id to a waitpid-compatible pid argument */
     pid_t wait_pid;
+    int64_t wait_pgid = -1;
     switch (idtype) {
     case P_ALL:
         wait_pid = -1;
@@ -1372,7 +2195,10 @@ int64_t sys_waitid(guest_t *g,
         wait_pid = (pid_t) id;
         break;
     case P_PGID:
-        wait_pid = -(pid_t) id;
+        if (id < 0 || id > INT_MAX)
+            return -LINUX_EINVAL;
+        wait_pgid = id == 0 ? proc_get_pgid() : id;
+        wait_pid = id == 0 ? 0 : -(pid_t) id;
         break;
     case 3: { /* P_PIDFD */
         int64_t resolved = proc_pidfd_lookup_pid((int) id);
@@ -1384,6 +2210,10 @@ int64_t sys_waitid(guest_t *g,
     default:
         return -LINUX_EINVAL;
     }
+
+    lifecycle_import_children();
+    if (signal_sigchld_autoreap())
+        return proc_wait_autoreap_children((int) wait_pid, options);
 
     /* Search process table for matching entry. P_ALL must scan all children
      * (not block on the first non-exited one), so the wait loop always use
@@ -1398,9 +2228,11 @@ int64_t sys_waitid(guest_t *g,
             if (!proc_table[i].active)
                 continue;
 
-            /* Match: P_ALL matches any, P_PID/P_PIDFD match guest_pid */
+            /* Match exactly the requested guest PID or process group. */
             if ((idtype == P_PID || idtype == 3 /* P_PIDFD */) &&
                 proc_table[i].guest_pid != wait_pid)
+                continue;
+            if (idtype == P_PGID && proc_table[i].pgid != wait_pgid)
                 continue;
 
             found_any = true;
@@ -1412,21 +2244,23 @@ int64_t sys_waitid(guest_t *g,
                 /* Already reaped (from CLONE_VFORK wait) */
                 status = proc_table[i].exit_status;
                 ret = proc_table[i].host_pid;
+            } else if (!proc_table[i].host_waitable) {
+                int64_t external_gpid = proc_table[i].guest_pid;
+                pthread_mutex_unlock(&pid_lock);
+                bool ready = proc_refresh_external_child(external_gpid);
+                pthread_mutex_lock(&pid_lock);
+                if (ready) {
+                    /* The table now contains the lifecycle-registry status;
+                     * rescan to use the common exited/WNOWAIT path.
+                     */
+                    i = -1;
+                }
+                continue;
             } else {
                 pid_t host_pid = proc_table[i].host_pid;
                 pthread_mutex_unlock(&pid_lock);
                 struct rusage ru;
                 ret = wait4(host_pid, &status, WNOHANG, &ru);
-                /* Credit only a terminal report, and only when this call
-                 * actually consumes the reap: WNOWAIT must leave the child
-                 * waitable with its CPU uncounted until the later consuming
-                 * wait, but this inner wait4() has no WNOWAIT of its own, so
-                 * it consumes the host zombie regardless of the guest's
-                 * WNOWAIT request.
-                 */
-                if (ret > 0 && !(options & LINUX_WNOWAIT) &&
-                    (WIFEXITED(status) || WIFSIGNALED(status)))
-                    proc_children_cpu_add(&ru);
                 if (ret == 0) {
                     /* This child hasn't exited yet; continue checking others
                      * (P_ALL must scan all children).
@@ -1439,6 +2273,18 @@ int64_t sys_waitid(guest_t *g,
                     continue; /* Child may have been reaped concurrently */
                 }
                 pthread_mutex_lock(&pid_lock);
+                /* Host wait4 necessarily consumes the host zombie. Preserve
+                 * the status/rusage in the guest process table so Linux
+                 * WNOWAIT remains repeatable and a later consuming wait can
+                 * account and remove it exactly once.
+                 */
+                if (proc_table[i].active &&
+                    proc_table[i].host_pid == host_pid) {
+                    proc_table[i].exited = true;
+                    proc_table[i].exit_status = status;
+                    proc_table[i].rusage = ru;
+                    proc_table[i].rusage_valid = true;
+                }
             }
 
             /* Fill siginfo_t in guest memory */
@@ -1477,11 +2323,17 @@ int64_t sys_waitid(guest_t *g,
              * re-locking (another thread may have reused it while the wait loop
              * released the lock for waitpid).
              */
+            int64_t consumed_gpid = -1;
             if (!(options & LINUX_WNOWAIT) && proc_table[i].active &&
-                proc_table[i].host_pid == ret)
+                proc_table[i].host_pid == ret) {
+                consumed_gpid = proc_table[i].guest_pid;
+                proc_account_entry_locked(&proc_table[i]);
                 proc_table[i].active = false;
+            }
 
             pthread_mutex_unlock(&pid_lock);
+            if (consumed_gpid > 0)
+                lifecycle_consume(consumed_gpid);
             return 0; /* waitid returns 0 on success */
         }
 
@@ -1612,8 +2464,18 @@ static void unlink_own_transport(void)
             others = true;
             break;
         }
-    if (!others)
+    if (!others) {
         unlink(path);
+
+        /* These files share the process-family namespace and have no readers
+         * once the owner is the last live host member. Avoid leaving one
+         * fixed-size lifecycle registry and PID counter behind per run.
+         */
+        if (lifecycle_registry_path(path, sizeof(path)))
+            unlink(path);
+        if (process_pid_sequence_path(path, sizeof(path)))
+            unlink(path);
+    }
     flock_retry(fd, LOCK_UN);
     close(fd);
 }
@@ -1675,16 +2537,39 @@ typedef struct {
     int64_t my_guest_pid;
 } sig_drain_ctx_t;
 
-/* Parse one NUL-terminated "namespace target_guest_pid signum" transport record
- * and queue the signal only when both the fork-family namespace and the
- * intended guest pid match this process. A namespace mismatch means the host
- * pid was recycled from an unrelated session; a guest-pid mismatch means it was
- * recycled onto a different guest in this session. Either way the delivery is
- * dropped.
+/* Parse a signal record ("namespace target_guest_pid signum") or a reparent
+ * control record ("R namespace target_guest_pid new_ppid"). Both are accepted
+ * only when namespace and target identity match this process.
  */
 static void sig_drain_cb(char *rec, void *vctx)
 {
     sig_drain_ctx_t *c = vctx;
+    if (rec[0] == 'R') {
+        char *p = rec + 1, *end;
+        errno = 0;
+        unsigned long long ns = strtoull(p, &end, 10);
+        if (end == p || errno == ERANGE)
+            return;
+        p = end;
+        errno = 0;
+        long long tgpid = strtoll(p, &end, 10);
+        if (end == p || errno == ERANGE)
+            return;
+        p = end;
+        errno = 0;
+        long long new_ppid = strtoll(p, &end, 10);
+        if (end == p || errno == ERANGE || *end != '\0')
+            return;
+        if (ns == c->my_ns && tgpid == c->my_guest_pid && new_ppid > 0) {
+            proc_set_ppid((int64_t) new_ppid);
+            if (signal_refresh_identity_cache()) {
+                lifecycle_publish_self();
+                lifecycle_ack_reparent((int64_t) tgpid, (int64_t) new_ppid);
+            }
+        }
+        return;
+    }
+
     char *p = rec, *end;
     unsigned long long ns = strtoull(p, &end, 10);
     if (end == p)
@@ -1701,8 +2586,11 @@ static void sig_drain_cb(char *rec, void *vctx)
     if (end == p || *end != '\0')
         return;
     if (ns == c->my_ns && tgpid == c->my_guest_pid &&
-        RANGE_CHECK(signum, 1, LINUX_NSIG))
+        RANGE_CHECK(signum, 1, LINUX_NSIG)) {
+        if (signum == LINUX_SIGCHLD && signal_sigchld_autoreap())
+            proc_autoreap_exited_children();
         signal_queue((int) signum);
+    }
 }
 
 static void drain_external_guest_signal(void)

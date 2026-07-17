@@ -1376,15 +1376,11 @@ static int64_t sc_prctl(guest_t *g,
     case LINUX_PR_GET_DUMPABLE:
         return 1;
     case LINUX_PR_SET_CHILD_SUBREAPER:
-        /* Accept silently. elfuse's process model already reaps all children
-         * within the VM; the flag has no additional effect.
-         */
+        proc_set_child_subreaper(x1 != 0);
+        proc_registry_publish_self();
         return 0;
     case LINUX_PR_GET_CHILD_SUBREAPER: {
-        /* Always report "subreaper is set," consistent with the
-         * accept-and-ignore behavior of PR_SET_CHILD_SUBREAPER.
-         */
-        int32_t val = 1;
+        int32_t val = proc_get_child_subreaper() ? 1 : 0;
         if (x1 && guest_write_small(g, x1, &val, sizeof(val)) < 0)
             return -LINUX_EFAULT;
         return 0;

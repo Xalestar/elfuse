@@ -33,6 +33,10 @@ void proc_init(void);
 int64_t proc_get_pid(void);
 int64_t proc_get_ppid(void);
 
+/* Linux child-subreaper state, published through the fork-family registry. */
+void proc_set_child_subreaper(bool enabled);
+bool proc_get_child_subreaper(void);
+
 typedef struct {
     const char *path;
     size_t len;
@@ -293,7 +297,7 @@ const char *proc_resolve_sysroot_create_path(const char *path,
 
 /* Process table (for fork/clone children). */
 
-#define PROC_TABLE_SIZE 64
+#define PROC_TABLE_SIZE 1024
 
 typedef struct {
     bool active;       /* Slot is in use */
@@ -304,6 +308,10 @@ typedef struct {
                         */
     bool exited;       /* Child has exited */
     int exit_status;   /* wait status (as returned by waitpid) */
+    bool rusage_valid;
+    bool rusage_accounted;
+    bool host_waitable; /* false for a child adopted from another host parent */
+    struct rusage rusage;
 } proc_entry_t;
 
 /* Register a child process in the process table.
@@ -363,6 +371,17 @@ int proc_get_namespace_targets(proc_signal_target_t *out,
 
 /* Publish the caller's current guest pid/pgid to the fork-family registry. */
 void proc_registry_publish_self(void);
+
+/* Reap only children whose shared lifecycle entry is already terminal. */
+void proc_autoreap_exited_children(void);
+
+/* Pull authoritative PPID state into a newly bootstrapped fork child. */
+void proc_lifecycle_sync_self(guest_t *g);
+
+/* Notify the guest parent that this process reached a terminal state. Called
+ * by fork-child teardown before the host process exits.
+ */
+void proc_process_exit(int exit_code);
 
 /* Pull a parent-published pgid update into this process's local identity. */
 void proc_registry_sync_self_pgid(guest_t *g);

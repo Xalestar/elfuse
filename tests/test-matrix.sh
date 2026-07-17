@@ -602,6 +602,8 @@ run_unit_tests()
     test_check "$runner" "test-clone-childtid" "PASS" "$bindir/test-clone-childtid"
     test_check "$runner" "test-exec" "exec-works" "$bindir/test-exec" "$bindir/echo-test" exec-works
     test_check "$runner" "test-fork-exec" "PASS" "$bindir/test-fork-exec" "$bindir/echo-test"
+    test_rc "$runner" "test-process-lifecycle" 0 \
+        "$bindir/test-process-lifecycle"
     test_check "$runner" "test-cloexec" "PASS" "$bindir/test-cloexec"
     test_rc "$runner" "test-exec-limits" 0 "$bindir/test-exec-limits"
     test_rc "$runner" "test-session" 0 "$bindir/test-session"

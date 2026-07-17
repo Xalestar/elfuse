@@ -17,6 +17,7 @@
 #include "syscall/proc.h"
 
 static _Atomic int64_t guest_pid = 1, parent_pid = 0;
+static _Atomic bool child_subreaper;
 static _Atomic uint32_t emu_uid = GUEST_UID, emu_euid = GUEST_UID;
 static _Atomic uint32_t emu_suid = GUEST_UID, emu_gid = GUEST_GID;
 static _Atomic uint32_t emu_egid = GUEST_GID, emu_sgid = GUEST_GID;
@@ -43,6 +44,7 @@ void proc_identity_init(void)
 {
     guest_pid = 1;
     parent_pid = 0;
+    child_subreaper = false;
 
     uint32_t uid = GUEST_UID;
     uint32_t gid = GUEST_GID;
@@ -338,4 +340,19 @@ void proc_set_identity(int64_t pid, int64_t ppid)
 {
     guest_pid = pid;
     parent_pid = ppid;
+}
+
+void proc_set_ppid(int64_t ppid)
+{
+    parent_pid = ppid;
+}
+
+void proc_set_child_subreaper(bool enabled)
+{
+    child_subreaper = enabled;
+}
+
+bool proc_get_child_subreaper(void)
+{
+    return child_subreaper;
 }
