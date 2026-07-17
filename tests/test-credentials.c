@@ -4,7 +4,7 @@
  * Copyright 2026 elfuse contributors
  * SPDX-License-Identifier: Apache-2.0
  *
- * Tests: setuid, setgid, setresuid, setresgid, setreuid, setregid,
+ * Tests: setuid, setgid, setgroups, setresuid, setresgid, setreuid, setregid,
  *        getresuid, getresgid, capset, setpriority, getpriority,
  *        sched_setaffinity
  */
@@ -32,6 +32,7 @@
 #define __NR_getuid 174
 #define __NR_geteuid 175
 #define __NR_getgid 176
+#define __NR_setgroups 159
 
 int main(void)
 {
@@ -133,6 +134,40 @@ int main(void)
     TEST("setgid(other) returns -EPERM");
     EXPECT_TRUE(raw_syscall1(__NR_setgid, expected_id == 0 ? 1000 : 0) == -1,
                 "expected -EPERM");
+
+    TEST("setgroups model");
+    {
+        unsigned int group = (unsigned int) expected_id;
+        long rc = raw_syscall2(__NR_setgroups, 1, (long) &group);
+        if (expected_id == 0)
+            EXPECT_TRUE(rc == 0, "setgroups root no-op failed");
+        else
+            EXPECT_TRUE(rc == -1, "setgroups non-root expected EPERM");
+    }
+
+    TEST("setgroups zero count");
+    {
+        long rc = raw_syscall2(__NR_setgroups, 0, 0);
+        if (expected_id == 0)
+            EXPECT_TRUE(rc == 0, "setgroups(0,NULL) root failed");
+        else
+            EXPECT_TRUE(rc == -1, "setgroups(0,NULL) non-root expected EPERM");
+    }
+
+    if (expected_id == 0) {
+        TEST("setgroups bad pointer");
+        EXPECT_TRUE(raw_syscall2(__NR_setgroups, 1, 1) == -14,
+                    "expected -EFAULT");
+    }
+
+    TEST("setgroups invalid size");
+    {
+        long rc = raw_syscall2(__NR_setgroups, (long) (unsigned) -1, 0);
+        if (expected_id == 0)
+            EXPECT_TRUE(rc == -22, "expected -EINVAL");
+        else
+            EXPECT_TRUE(rc == -1, "expected -EPERM");
+    }
 
     /* setfsuid / setfsgid: Linux contract is to return the previous fsuid /
      * fsgid.

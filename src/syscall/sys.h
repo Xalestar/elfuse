@@ -42,6 +42,7 @@ int64_t sys_sched_get_priority_min(int policy);
 int64_t sys_sched_get_priority_max(int policy);
 int64_t sys_sched_rr_get_interval(guest_t *g, int pid, uint64_t ts_gva);
 int64_t sys_getgroups(guest_t *g, int size, uint64_t list_gva);
+int64_t sys_setgroups(guest_t *g, int size, uint64_t list_gva);
 int64_t sys_getrusage(guest_t *g, int who, uint64_t usage_gva);
 int64_t sys_sysinfo(guest_t *g, uint64_t info_gva);
 int64_t sys_prlimit64(guest_t *g,

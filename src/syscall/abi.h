@@ -128,6 +128,7 @@
 #define SYS_getsid 156
 #define SYS_setsid 157
 #define SYS_getgroups 158
+#define SYS_setgroups 159
 #define SYS_uname 160
 #define SYS_getrlimit 163
 #define SYS_setrlimit 164

@@ -171,6 +171,7 @@ SYS_getpgid sc_getpgid 1
 SYS_getsid sc_getsid 1
 SYS_setsid sc_setsid 0
 SYS_getgroups sc_getgroups 1
+SYS_setgroups sc_setgroups 1
 SYS_setpriority sc_setpriority 0
 SYS_getpriority sc_getpriority 0
 SYS_sched_setparam sc_sched_setparam 0

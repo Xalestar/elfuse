@@ -517,6 +517,27 @@ int64_t sys_getgroups(guest_t *g, int size, uint64_t list_gva)
     return ngroups;
 }
 
+#define LINUX_NGROUPS_MAX 65536
+
+int64_t sys_setgroups(guest_t *g, int size, uint64_t list_gva)
+{
+    if (proc_get_euid() != 0 && !proc_fakeroot_enabled())
+        return -LINUX_EPERM;
+    if (size < 0 || size > LINUX_NGROUPS_MAX)
+        return -LINUX_EINVAL;
+    if (size > 0) {
+        size_t bytes = (size_t) size * sizeof(uint32_t);
+        uint32_t *groups = malloc(bytes);
+        if (!groups)
+            return -LINUX_ENOMEM;
+        int ret = guest_read(g, list_gva, groups, bytes);
+        free(groups);
+        if (ret < 0)
+            return -LINUX_EFAULT;
+    }
+    return 0;
+}
+
 int64_t sys_getrusage(guest_t *g, int who, uint64_t usage_gva)
 {
     /* Linux RUSAGE_SELF=0, RUSAGE_CHILDREN=-1, RUSAGE_THREAD=1. macOS has the
