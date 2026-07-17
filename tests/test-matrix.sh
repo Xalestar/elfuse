@@ -263,6 +263,7 @@ unstage_sysroot_fixtures()
 QEMU_SKIP="
     test-session
     test-pidfd
+    test-userfaultfd
     test-sigio
     test-syscall-smoke
     test-vdso
@@ -288,6 +289,8 @@ QEMU_SKIP="
 #   syscall bug.
 # test-pidfd: pins pidfd_getfd(2) at elfuse's not-yet-implemented ENOSYS stub;
 #   a real kernel implements it and returns success.
+# test-userfaultfd: pins userfaultfd(2) at elfuse's not-yet-implemented ENOSYS
+#   stub; a real kernel may implement it and return a usable fd.
 # test-sigio: the F_SETOWN pgrp round-trip inherits test-session's launcher
 #   artifact (own pgid assumption); F_SETOWN_EX with a negative pid also hits
 #   a real kernel ESRCH-after-lookup path where elfuse rejects up front --
@@ -630,6 +633,7 @@ run_unit_tests()
     test_rc "$runner" "test-times" 0 "$bindir/test-times"
     test_rc "$runner" "test-syscall-smoke" 0 "$bindir/test-syscall-smoke"
     test_rc "$runner" "test-process-vm" 0 "$bindir/test-process-vm"
+    test_rc "$runner" "test-userfaultfd" 0 "$bindir/test-userfaultfd"
     test_rc "$runner" "test-vdso" 0 "$bindir/test-vdso"
 
     printf "\nI/O subsystem\n"

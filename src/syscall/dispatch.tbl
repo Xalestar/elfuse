@@ -104,6 +104,7 @@ SYS_sync_file_range sc_sync_file_range 1
 SYS_syncfs sc_syncfs 0
 SYS_msync sc_msync 0
 SYS_membarrier sc_membarrier 0
+SYS_userfaultfd sc_userfaultfd 0
 
 # Signals
 SYS_kill sc_kill 0

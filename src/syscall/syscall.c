@@ -1825,6 +1825,26 @@ static int64_t sc_memfd_create(guest_t *g,
     return gfd;
 }
 
+static int64_t sc_userfaultfd(guest_t *g,
+                              uint64_t x0,
+                              uint64_t x1,
+                              uint64_t x2,
+                              uint64_t x3,
+                              uint64_t x4,
+                              uint64_t x5,
+                              bool verbose)
+{
+    (void) g;
+    (void) x0;
+    (void) x1;
+    (void) x2;
+    (void) x3;
+    (void) x4;
+    (void) x5;
+    (void) verbose;
+    return -LINUX_ENOSYS;
+}
+
 /* openat2 RESOLVE_* flags (from Linux include/uapi/linux/openat2.h). */
 #define RESOLVE_NO_XDEV 0x01
 #define RESOLVE_NO_MAGICLINKS 0x02
