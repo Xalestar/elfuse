@@ -60,14 +60,14 @@ _Static_assert(sizeof(struct timespec) == sizeof(linux_timespec_t),
 _Static_assert(sizeof(struct timeval) == sizeof(linux_timeval_t),
                "host and guest timeval must match on LP64");
 
-static bool linux_timespec_valid(const linux_timespec_t *ts)
+bool linux_timespec_valid(const linux_timespec_t *ts)
 {
     if (ts->tv_sec < 0)
         return false;
     return ts->tv_nsec >= 0 && ts->tv_nsec < NSEC_PER_SEC;
 }
 
-static int64_t linux_timespec_to_ns_sat(const linux_timespec_t *ts)
+int64_t linux_timespec_to_ns_sat(const linux_timespec_t *ts)
 {
     if (ts->tv_sec < 0)
         return 0;

@@ -39,6 +39,7 @@
 #include "syscall/poll.h" /* wakeup_pipe_signal */
 #include "syscall/proc.h" /* proc_get_pid, proc_get_uid, SYSCALL_EXEC_HAPPENED */
 #include "syscall/signal.h"
+#include "syscall/time.h" /* linux_timespec_valid, linux_timespec_to_ns_sat */
 
 /* Signal state (module-level, process-wide). */
 static signal_state_t sig_state;
@@ -1409,17 +1410,9 @@ int64_t signal_rt_sigtimedwait(guest_t *g,
         linux_timespec_t lts;
         if (guest_read_small(g, timeout_gva, &lts, sizeof(lts)) < 0)
             return -LINUX_EFAULT;
-        /* Negative tv_sec is invalid (matches kernel hrtimer validation). */
-        if (lts.tv_sec < 0 || lts.tv_nsec < 0 || lts.tv_nsec >= 1000000000LL)
+        if (!linux_timespec_valid(&lts))
             return -LINUX_EINVAL;
-        /* Saturate to INT64_MAX to avoid overflow. */
-        if (lts.tv_sec > (INT64_MAX / 1000000000LL) ||
-            (lts.tv_sec == (INT64_MAX / 1000000000LL) &&
-             lts.tv_nsec > (INT64_MAX % 1000000000LL))) {
-            remaining_ns = INT64_MAX;
-        } else {
-            remaining_ns = lts.tv_sec * 1000000000LL + lts.tv_nsec;
-        }
+        remaining_ns = linux_timespec_to_ns_sat(&lts);
     }
 
     /* Poll/wait loop. */
