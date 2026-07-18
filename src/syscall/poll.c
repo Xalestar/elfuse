@@ -31,6 +31,7 @@
 #include "syscall/poll.h"
 #include "syscall/proc.h" /* proc_exit_group_requested */
 #include "syscall/signal.h"
+#include "syscall/time.h" /* linux_timespec_valid */
 
 /* Global wakeup pipe: write end signals exit_group/futex_interrupt/guest
  * signals to threads blocked in host poll/select/kevent. The read end is added
@@ -178,7 +179,7 @@ int64_t sys_ppoll(guest_t *g,
             return -LINUX_EFAULT;
         }
         /* Linux returns EINVAL for negative timeout values */
-        if (lts.tv_sec < 0 || !RANGE_CHECK(lts.tv_nsec, 0, 1000000000LL)) {
+        if (!linux_timespec_valid(&lts)) {
             host_fd_refs_close(host_refs, nfds);
             return -LINUX_EINVAL;
         }
@@ -321,7 +322,7 @@ int64_t sys_pselect6(guest_t *g,
         linux_timespec_t lts;
         if (guest_read_small(g, timeout_gva, &lts, sizeof(lts)) < 0)
             return -LINUX_EFAULT;
-        if (lts.tv_sec < 0 || !RANGE_CHECK(lts.tv_nsec, 0, 1000000000LL))
+        if (!linux_timespec_valid(&lts))
             return -LINUX_EINVAL;
         if (lts.tv_sec == 0 && lts.tv_nsec == 0)
             return 0;
@@ -443,7 +444,7 @@ int64_t sys_pselect6(guest_t *g,
         if (guest_read_small(g, timeout_gva, &lts, sizeof(lts)) < 0)
             goto pselect_fault;
         /* Linux returns EINVAL for negative or out-of-range timeout values */
-        if (lts.tv_sec < 0 || !RANGE_CHECK(lts.tv_nsec, 0, 1000000000LL))
+        if (!linux_timespec_valid(&lts))
             goto pselect_inval;
         ts.tv_sec = lts.tv_sec;
         ts.tv_nsec = lts.tv_nsec;

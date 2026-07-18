@@ -11,8 +11,21 @@
 
 #pragma once
 
+#include <stdbool.h>
 #include <stdint.h>
 #include "core/guest.h"
+#include "syscall/abi.h"
+
+/* Return true when a guest-supplied timespec is well-formed: non-negative
+ * seconds and a nanosecond field in [0, NSEC_PER_SEC). Mirrors the kernel
+ * hrtimer validation shared by the timeout-bearing syscalls.
+ */
+bool linux_timespec_valid(const linux_timespec_t *ts);
+
+/* Convert a validated guest timespec to a nanosecond count, saturating to
+ * INT64_MAX on overflow rather than wrapping. A negative tv_sec yields 0.
+ */
+int64_t linux_timespec_to_ns_sat(const linux_timespec_t *ts);
 
 /* Time/timer syscall handlers. */
 
