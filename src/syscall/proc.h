@@ -297,8 +297,6 @@ const char *proc_resolve_sysroot_create_path(const char *path,
 
 /* Process table (for fork/clone children). */
 
-#define PROC_TABLE_SIZE 1024
-
 typedef struct {
     bool active;       /* Slot is visible to guest wait operations */
     bool reserved;     /* Fork admission reserved this slot before spawn */

@@ -22,6 +22,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <limits.h>
+#include <stddef.h>
 #include <pthread.h>
 #include <signal.h>
 #include <sys/file.h> /* flock() */
@@ -74,8 +75,14 @@ static _Atomic bool rosetta_enabled = true;
  */
 static _Atomic bool rosetta_active = false;
 
-/* Process table for tracking fork children */
-static proc_entry_t proc_table[PROC_TABLE_SIZE];
+/* Process table for tracking direct and adopted fork children. Start small so
+ * lifecycle tests exercise growth deterministically; expand under pid_lock as
+ * the fork family grows. No pointer into this array survives unlocking.
+ */
+#define PROC_TABLE_INITIAL_CAPACITY 8U
+static proc_entry_t proc_table_initial[PROC_TABLE_INITIAL_CAPACITY];
+static proc_entry_t *proc_table = proc_table_initial;
+static size_t proc_table_capacity = PROC_TABLE_INITIAL_CAPACITY;
 static pthread_mutex_t pid_lock = PTHREAD_MUTEX_INITIALIZER; /* Lock order: 6 */
 static pthread_mutex_t autoreap_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t pid_cond =
@@ -155,7 +162,11 @@ static int64_t proc_wait_autoreap_children(int pid, int options);
 void proc_init(void)
 {
     proc_identity_init();
-    memset(proc_table, 0, sizeof(proc_table));
+    if (proc_table != proc_table_initial)
+        free(proc_table);
+    proc_table = proc_table_initial;
+    proc_table_capacity = PROC_TABLE_INITIAL_CAPACITY;
+    memset(proc_table_initial, 0, sizeof(proc_table_initial));
     proc_state_init();
     thread_init();
     futex_init();
@@ -228,16 +239,29 @@ static void proc_init_child_entry(proc_entry_t *entry,
 
 static proc_entry_t *proc_find_free_entry(void)
 {
-    for (int i = 0; i < PROC_TABLE_SIZE; i++) {
+    for (size_t i = 0; i < proc_table_capacity; i++) {
         if (!proc_table[i].active && !proc_table[i].reserved)
             return &proc_table[i];
     }
-    return NULL;
+
+    if (proc_table_capacity > (size_t) INT_MAX / 2)
+        return NULL;
+    size_t old_capacity = proc_table_capacity;
+    size_t new_capacity = old_capacity * 2;
+    proc_entry_t *grown = calloc(new_capacity, sizeof(*grown));
+    if (!grown)
+        return NULL;
+    memcpy(grown, proc_table, old_capacity * sizeof(*grown));
+    if (proc_table != proc_table_initial)
+        free(proc_table);
+    proc_table = grown;
+    proc_table_capacity = new_capacity;
+    return &proc_table[old_capacity];
 }
 
 static proc_entry_t *proc_find_host_entry(pid_t host_pid)
 {
-    for (int i = 0; i < PROC_TABLE_SIZE; i++) {
+    for (size_t i = 0; i < proc_table_capacity; i++) {
         if (proc_table[i].active && proc_table[i].host_pid == host_pid)
             return &proc_table[i];
     }
@@ -246,7 +270,7 @@ static proc_entry_t *proc_find_host_entry(pid_t host_pid)
 
 static proc_entry_t *proc_find_guest_entry(int64_t guest_pid_val)
 {
-    for (int i = 0; i < PROC_TABLE_SIZE; i++) {
+    for (size_t i = 0; i < proc_table_capacity; i++) {
         if (proc_table[i].active && proc_table[i].guest_pid == guest_pid_val)
             return &proc_table[i];
     }
@@ -255,7 +279,7 @@ static proc_entry_t *proc_find_guest_entry(int64_t guest_pid_val)
 
 static proc_entry_t *proc_find_reserved_guest_entry(int64_t guest_pid_val)
 {
-    for (int i = 0; i < PROC_TABLE_SIZE; i++) {
+    for (size_t i = 0; i < proc_table_capacity; i++) {
         if (proc_table[i].reserved && proc_table[i].guest_pid == guest_pid_val)
             return &proc_table[i];
     }
@@ -414,8 +438,9 @@ int proc_reserve_child(int64_t guest_pid_val, int64_t pgid)
     if (!entry) {
         pthread_mutex_unlock(&pid_lock);
         log_error(
-            "process table full (%d slots), cannot reserve child PID %lld",
-            PROC_TABLE_SIZE, (long long) guest_pid_val);
+            "cannot grow process table beyond %zu slots for child PID "
+            "%lld",
+            proc_table_capacity, (long long) guest_pid_val);
         return -LINUX_EAGAIN;
     }
     memset(entry, 0, sizeof(*entry));
@@ -548,13 +573,8 @@ static bool process_registry_path(char *out, size_t out_size)
  * registry protected by flock so unrelated signal/group readers stay simple.
  */
 #define LIFECYCLE_MAGIC 0x454C464CU /* "ELFL" */
-#define LIFECYCLE_VERSION 4
-/* One registry record belongs to this invocation's root/self process; the
- * remaining records match the maximum number of children any one local table
- * can own after reparenting. This preserves the adoption-capacity invariant
- * without reducing the advertised 1024-child table by one.
- */
-#define LIFECYCLE_MAX_ENTRIES (PROC_TABLE_SIZE + 1)
+#define LIFECYCLE_VERSION 5
+#define LIFECYCLE_INITIAL_CAPACITY 8U
 
 typedef struct {
     pid_t host_pid;
@@ -573,9 +593,11 @@ typedef struct {
     uint32_t magic;
     uint32_t version;
     uint32_t count;
-    uint32_t _pad;
-    lifecycle_entry_t entries[LIFECYCLE_MAX_ENTRIES];
+    uint32_t _capacity; /* Runtime allocation size; ignored when loading. */
+    lifecycle_entry_t entries[];
 } lifecycle_registry_t;
+
+#define LIFECYCLE_HEADER_SIZE offsetof(lifecycle_registry_t, entries)
 
 static bool lifecycle_registry_path(char *out, size_t out_size)
 {
@@ -603,28 +625,82 @@ static int lifecycle_read_full(int fd, void *buf, size_t len)
     return 0;
 }
 
-static lifecycle_registry_t *lifecycle_load_locked(int fd)
+static bool lifecycle_registry_size(uint32_t capacity, size_t *size_out)
 {
-    lifecycle_registry_t *registry = calloc(1, sizeof(*registry));
-    if (!registry)
+    if ((size_t) capacity >
+        (SIZE_MAX - LIFECYCLE_HEADER_SIZE) / sizeof(lifecycle_entry_t))
+        return false;
+    *size_out =
+        LIFECYCLE_HEADER_SIZE + (size_t) capacity * sizeof(lifecycle_entry_t);
+    return true;
+}
+
+static lifecycle_registry_t *lifecycle_registry_alloc(uint32_t capacity)
+{
+    size_t size;
+    if (!lifecycle_registry_size(capacity, &size))
         return NULL;
-    if (lseek(fd, 0, SEEK_SET) != 0 ||
-        lifecycle_read_full(fd, registry, sizeof(*registry)) < 0 ||
-        registry->magic != LIFECYCLE_MAGIC ||
-        registry->version != LIFECYCLE_VERSION ||
-        registry->count > LIFECYCLE_MAX_ENTRIES) {
-        memset(registry, 0, sizeof(*registry));
+    lifecycle_registry_t *registry = calloc(1, size);
+    if (registry)
+        registry->_capacity = capacity;
+    return registry;
+}
+
+static lifecycle_registry_t *lifecycle_registry_empty(void)
+{
+    lifecycle_registry_t *registry =
+        lifecycle_registry_alloc(LIFECYCLE_INITIAL_CAPACITY);
+    if (registry) {
         registry->magic = LIFECYCLE_MAGIC;
         registry->version = LIFECYCLE_VERSION;
     }
     return registry;
 }
 
+static lifecycle_registry_t *lifecycle_load_locked(int fd)
+{
+    struct stat st;
+    lifecycle_registry_t header;
+    if (fstat(fd, &st) != 0 || st.st_size < (off_t) LIFECYCLE_HEADER_SIZE ||
+        lseek(fd, 0, SEEK_SET) != 0 ||
+        lifecycle_read_full(fd, &header, LIFECYCLE_HEADER_SIZE) < 0 ||
+        header.magic != LIFECYCLE_MAGIC || header.version != LIFECYCLE_VERSION)
+        return lifecycle_registry_empty();
+
+    size_t disk_size;
+    if (!lifecycle_registry_size(header.count, &disk_size) ||
+        disk_size > (size_t) LLONG_MAX || st.st_size != (off_t) disk_size)
+        return lifecycle_registry_empty();
+
+    uint32_t capacity = header.count > LIFECYCLE_INITIAL_CAPACITY
+                            ? header.count
+                            : LIFECYCLE_INITIAL_CAPACITY;
+    lifecycle_registry_t *registry = lifecycle_registry_alloc(capacity);
+    if (!registry)
+        return NULL;
+    registry->magic = header.magic;
+    registry->version = header.version;
+    registry->count = header.count;
+    if (header.count > 0 &&
+        lifecycle_read_full(fd, registry->entries,
+                            (size_t) header.count * sizeof(lifecycle_entry_t)) <
+            0) {
+        free(registry);
+        return lifecycle_registry_empty();
+    }
+    return registry;
+}
+
 static int lifecycle_save_locked(int fd, const lifecycle_registry_t *registry)
 {
+    size_t disk_size;
+    if (registry->count > registry->_capacity ||
+        !lifecycle_registry_size(registry->count, &disk_size) ||
+        disk_size > (size_t) LLONG_MAX)
+        return -1;
     if (ftruncate(fd, 0) != 0 || lseek(fd, 0, SEEK_SET) != 0)
         return -1;
-    return proc_write_full(fd, registry, sizeof(*registry));
+    return proc_write_full(fd, registry, disk_size);
 }
 
 static int lifecycle_open_locked(char *path, size_t path_size)
@@ -654,14 +730,32 @@ static lifecycle_entry_t *lifecycle_find_guest(lifecycle_registry_t *registry,
     return NULL;
 }
 
-static lifecycle_entry_t *lifecycle_upsert(lifecycle_registry_t *registry,
+static lifecycle_entry_t *lifecycle_upsert(lifecycle_registry_t **registry_ptr,
                                            int64_t guest_pid)
 {
+    lifecycle_registry_t *registry = *registry_ptr;
     lifecycle_entry_t *entry = lifecycle_find_guest(registry, guest_pid);
     if (entry)
         return entry;
-    if (registry->count == LIFECYCLE_MAX_ENTRIES)
-        return NULL;
+    if (registry->count == registry->_capacity) {
+        if (registry->_capacity > UINT32_MAX / 2)
+            return NULL;
+        uint32_t old_capacity = registry->_capacity;
+        uint32_t new_capacity =
+            old_capacity ? old_capacity * 2 : LIFECYCLE_INITIAL_CAPACITY;
+        size_t new_size;
+        if (!lifecycle_registry_size(new_capacity, &new_size))
+            return NULL;
+        lifecycle_registry_t *grown = realloc(registry, new_size);
+        if (!grown)
+            return NULL;
+        memset(
+            &grown->entries[old_capacity], 0,
+            (size_t) (new_capacity - old_capacity) * sizeof(lifecycle_entry_t));
+        grown->_capacity = new_capacity;
+        *registry_ptr = grown;
+        registry = grown;
+    }
     entry = &registry->entries[registry->count++];
     memset(entry, 0, sizeof(*entry));
     entry->guest_pid = guest_pid;
@@ -685,7 +779,7 @@ static int lifecycle_reserve_child(int64_t guest_pid,
         return -1;
     lifecycle_registry_t *registry = lifecycle_load_locked(fd);
     if (registry) {
-        lifecycle_entry_t *entry = lifecycle_upsert(registry, guest_pid);
+        lifecycle_entry_t *entry = lifecycle_upsert(&registry, guest_pid);
         if (entry) {
             entry->host_pid = 0;
             entry->ppid = ppid;
@@ -741,7 +835,7 @@ static void lifecycle_publish_self(void)
         return;
     lifecycle_registry_t *registry = lifecycle_load_locked(fd);
     if (registry) {
-        lifecycle_entry_t *entry = lifecycle_upsert(registry, proc_get_pid());
+        lifecycle_entry_t *entry = lifecycle_upsert(&registry, proc_get_pid());
         if (entry) {
             entry->host_pid = getpid();
             /* A parent-exit transaction writes the authoritative adopter
@@ -947,15 +1041,15 @@ static void proc_register_adopted_local(const lifecycle_entry_t *source)
         }
         registered = true;
     } else {
-        /* Every local entry corresponds to one entry in the registry, while
-         * the registry has exactly one additional slot for this process
-         * itself. Therefore at most PROC_TABLE_SIZE registry children can
-         * belong to one adopter. Do not silently lose wait ownership if that
-         * invariant is ever broken by a future bookkeeping change.
+        /* Both tables grow geometrically, so an adopted child should acquire a
+         * local slot unless the host cannot allocate memory. Keep its shared
+         * lifecycle record intact and report the failure rather than silently
+         * losing wait ownership; a later import may succeed after memory
+         * pressure subsides.
          */
         log_error(
-            "process table invariant broken while importing adopted "
-            "child PID %lld",
+            "cannot grow process table while importing adopted child "
+            "PID %lld",
             (long long) source->guest_pid);
     }
     pthread_mutex_unlock(&pid_lock);
@@ -1005,7 +1099,7 @@ typedef struct {
     int64_t pgid;
 } registry_entry_t;
 
-#define REGISTRY_MAX_ENTRIES (PROC_TABLE_SIZE * 4)
+#define REGISTRY_MAX_ENTRIES 4096
 
 /* flock() retrying past EINTR. Returns 0 on success, -1 on failure. */
 static int flock_retry(int fd, int op)
@@ -1356,7 +1450,7 @@ void proc_process_exit(int wait_status)
     }
 
     int64_t self_pid = proc_get_pid();
-    lifecycle_entry_t *self = lifecycle_upsert(registry, self_pid);
+    lifecycle_entry_t *self = lifecycle_upsert(&registry, self_pid);
     if (!self) {
         free(registry);
         lifecycle_unlock_close(fd);
@@ -1525,7 +1619,7 @@ int proc_get_direct_child_pids(pid_t *out, int max_pids)
 {
     int count = 0;
     pthread_mutex_lock(&pid_lock);
-    for (int i = 0; i < PROC_TABLE_SIZE && count < max_pids; i++) {
+    for (size_t i = 0; i < proc_table_capacity && count < max_pids; i++) {
         if (proc_table[i].active && !proc_table[i].exited)
             out[count++] = proc_table[i].host_pid;
     }
@@ -1926,7 +2020,7 @@ void proc_autoreap_exited_children(void)
      */
     lifecycle_import_children();
 
-    for (int i = 0; i < PROC_TABLE_SIZE; i++) {
+    for (size_t i = 0; i < proc_table_capacity; i++) {
         pthread_mutex_lock(&pid_lock);
         if (!proc_table[i].active) {
             pthread_mutex_unlock(&pid_lock);
@@ -1960,12 +2054,12 @@ void proc_autoreap_exited_children(void)
         if (ret == host_pid) {
             proc_children_cpu_add(&ru);
             proc_pidfd_notify_exit(guest_pid);
-            proc_deactivate_slot_if_matches(i, host_pid);
+            proc_deactivate_slot_if_matches((int) i, host_pid);
         } else if (ret < 0 && errno == ECHILD) {
             /* A concurrent consuming wait won the host reap. The disposition
              * still makes this child non-waitable to subsequent guest waits.
              */
-            proc_deactivate_slot_if_matches(i, host_pid);
+            proc_deactivate_slot_if_matches((int) i, host_pid);
         }
     }
 
@@ -1995,7 +2089,7 @@ static int64_t proc_wait_autoreap_children(int pid, int options)
         bool still_active = false;
 
         pthread_mutex_lock(&pid_lock);
-        for (int i = 0; i < PROC_TABLE_SIZE; i++) {
+        for (size_t i = 0; i < proc_table_capacity; i++) {
             if (!proc_wait_selector_matches(&proc_table[i], pid, caller_pgid))
                 continue;
             found = true;
@@ -2113,7 +2207,7 @@ int64_t sys_wait4(guest_t *g,
          */
         for (;;) {
             bool found_any_child = false;
-            for (int i = 0; i < PROC_TABLE_SIZE; i++) {
+            for (size_t i = 0; i < proc_table_capacity; i++) {
                 if (!proc_table[i].active)
                     continue;
                 found_any_child = true;
@@ -2156,7 +2250,7 @@ int64_t sys_wait4(guest_t *g,
 
                 pid_t host_pid = proc_table[i].host_pid;
                 int64_t gpid = proc_table[i].guest_pid;
-                int slot = i;
+                int slot = (int) i;
                 pthread_mutex_unlock(&pid_lock);
 
                 int status;
@@ -2201,7 +2295,7 @@ int64_t sys_wait4(guest_t *g,
                 lifecycle_import_children();
                 pthread_mutex_lock(&pid_lock);
                 bool imported_child = false;
-                for (int i = 0; i < PROC_TABLE_SIZE; i++) {
+                for (size_t i = 0; i < proc_table_capacity; i++) {
                     if (proc_table[i].active) {
                         imported_child = true;
                         break;
@@ -2243,7 +2337,7 @@ int64_t sys_wait4(guest_t *g,
     }
 
     /* Wait for specific guest PID */
-    for (int i = 0; i < PROC_TABLE_SIZE; i++) {
+    for (size_t i = 0; i < proc_table_capacity; i++) {
         if (proc_table[i].active && proc_table[i].guest_pid == pid) {
             if (proc_table[i].exited) {
                 int64_t gpid = proc_table[i].guest_pid;
@@ -2279,7 +2373,7 @@ int64_t sys_wait4(guest_t *g,
 
             pid_t host_pid = proc_table[i].host_pid;
             int64_t gpid = proc_table[i].guest_pid;
-            int slot = i;
+            int slot = (int) i;
             pthread_mutex_unlock(&pid_lock);
 
             int status;
@@ -2438,7 +2532,7 @@ int64_t sys_waitid(guest_t *g,
     for (;;) {
         bool found_any = false;
 
-        for (int i = 0; i < PROC_TABLE_SIZE; i++) {
+        for (size_t i = 0; i < proc_table_capacity; i++) {
             if (!proc_table[i].active)
                 continue;
 
@@ -2558,7 +2652,7 @@ int64_t sys_waitid(guest_t *g,
             lifecycle_import_children();
             pthread_mutex_lock(&pid_lock);
             bool imported_match = false;
-            for (int i = 0; i < PROC_TABLE_SIZE; i++) {
+            for (size_t i = 0; i < proc_table_capacity; i++) {
                 if (!proc_table[i].active)
                     continue;
                 if ((idtype == P_PID || idtype == 3) &&

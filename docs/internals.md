@@ -565,13 +565,14 @@ The invocation-scoped lifecycle registry keeps the Linux wait-format terminal
 status (including signal and core-dump bits) and the exiting process's resource
 usage until the new parent consumes it. A parent already blocked in `wait*()`
 periodically imports newly adopted descendants; adoption of an already exited
-child also sends `SIGCHLD` to wake the adopter. Each local process table has
-1024 child slots, while the shared registry has one additional record for the
-invocation's root/self process. Fork admission is reserved before the host
-helper starts, so capacity pressure fails the new fork instead of silently
-dropping a waitable child. Pre-spawn registry reservations are not imported as
-adopted children, and a matching local reserved slot remains authoritative
-through the registry-publish/local-commit window.
+child also sends `SIGCHLD` to wake the adopter. Both the per-process wait table
+and the invocation-wide lifecycle registry grow geometrically with the actual
+fork-family population; the on-disk registry serializes only its live records.
+Fork admission is reserved before the host helper starts, so allocation failure
+fails the new fork instead of silently dropping a waitable child. Pre-spawn
+registry reservations are not imported as adopted children, and a matching
+local reserved slot remains authoritative through the
+registry-publish/local-commit window.
 
 An application runtime used directly as guest PID 1 may not perform that
 reaper role. In that case, adopted terminal statuses remain in elfuse's

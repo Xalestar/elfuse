@@ -15,6 +15,11 @@
  */
 #define MAPS_ENTRY_MAX 256
 
+/* Bound the transient host-PID snapshot used by /proc/net enumeration. This
+ * is an output-work limit, not the dynamically growing lifecycle-table cap.
+ */
+#define PROC_NET_PID_SNAPSHOT_MAX 1024
+
 /* Column at which the region name starts in /proc/self/maps output. Matches
  * observed Linux kernel formatting (verified via strace).
  */
@@ -840,9 +845,9 @@ typedef bool (*proc_net_socket_visitor)(const struct socket_fdinfo *sinfo,
  */
 static void proc_net_for_each_socket(proc_net_socket_visitor visit, void *ctx)
 {
-    pid_t pids[PROC_TABLE_SIZE + 1];
+    pid_t pids[PROC_NET_PID_SNAPSHOT_MAX + 1];
     pids[0] = getpid();
-    int npids = 1 + proc_get_child_pids(pids + 1, PROC_TABLE_SIZE);
+    int npids = 1 + proc_get_child_pids(pids + 1, PROC_NET_PID_SNAPSHOT_MAX);
 
     for (int p = 0; p < npids; p++) {
         struct proc_fdinfo fdinfo[512];
