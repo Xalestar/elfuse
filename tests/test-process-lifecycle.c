@@ -9,20 +9,25 @@
  * Keep host implementation details out of the assertions.
  *
  * Initial coverage:
- *   PID-01  nested-fork process IDs are unique
+ *   PID-01..02 process and thread IDs are unique across the fork family
  *   WAIT-01 WNOHANG does not consume a running child
  *   WAIT-02 WNOWAIT can be repeated before a consuming wait
  *   WAIT-03..04 waitid(P_PGID) honors process groups and auto-reap state
  *   Z-01..06 zombie retention, no-zombie dispositions, and SIGCHLD timing
  *   O-01..03 orphan adoption by PID 1 and a child subreaper
+ *   O-04..05 reserved for separate parent-death/job-control follow-ups
+ *   O-06     non-reaping PID 1 retains an adopted exit status
  */
 
 #include <errno.h>
+#include <pthread.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/prctl.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -141,6 +146,115 @@ static void test_nested_pid_uniqueness(void)
             (int) parent, (int) child, (int) observed.child,
             (int) observed.grandchild, child_ok, observed.grandchild_ok);
         FAIL("nested process IDs were not unique/waitable");
+        return;
+    }
+    PASS();
+}
+
+struct tid_probe {
+    int ready_fd;
+    int release_fd;
+    _Atomic int worker_tid;
+};
+
+static void *tid_probe_worker(void *opaque)
+{
+    struct tid_probe *probe = opaque;
+    int tid = (int) syscall(SYS_gettid);
+    atomic_store_explicit(&probe->worker_tid, tid, memory_order_release);
+
+    char byte = 'R';
+    if (write_full(probe->ready_fd, &byte, 1) < 0)
+        atomic_store_explicit(&probe->worker_tid, -1, memory_order_release);
+    close(probe->ready_fd);
+
+    if (read_full(probe->release_fd, &byte, 1) < 0)
+        atomic_store_explicit(&probe->worker_tid, -1, memory_order_release);
+    close(probe->release_fd);
+    return NULL;
+}
+
+struct pid_tid_report {
+    pid_t child_pid;
+    pid_t child_main_tid;
+    pid_t child_worker_tid;
+};
+
+static void test_pid_tid_namespace_uniqueness(void)
+{
+    TEST("PID-02 process PIDs and thread TIDs are unique");
+
+    int report_pipe[2];
+    if (pipe(report_pipe) < 0) {
+        FAIL("PID-02 report pipe failed");
+        return;
+    }
+
+    pid_t parent_pid = getpid();
+    pid_t child = fork();
+    if (child < 0) {
+        close(report_pipe[0]);
+        close(report_pipe[1]);
+        FAIL("PID-02 fork failed");
+        return;
+    }
+
+    if (child == 0) {
+        close(report_pipe[0]);
+        int ready[2];
+        int release[2];
+        if (pipe(ready) < 0 || pipe(release) < 0)
+            _exit(2);
+
+        struct tid_probe probe = {
+            .ready_fd = ready[1],
+            .release_fd = release[0],
+            .worker_tid = -1,
+        };
+        pthread_t worker;
+        if (pthread_create(&worker, NULL, tid_probe_worker, &probe) != 0)
+            _exit(3);
+
+        char byte;
+        int ready_ok = read_full(ready[0], &byte, 1) == 0;
+        close(ready[0]);
+        struct pid_tid_report report = {
+            .child_pid = getpid(),
+            .child_main_tid = (pid_t) syscall(SYS_gettid),
+            .child_worker_tid = (pid_t) atomic_load_explicit(
+                &probe.worker_tid, memory_order_acquire),
+        };
+        int report_ok =
+            write_full(report_pipe[1], &report, sizeof(report)) == 0;
+        close(report_pipe[1]);
+        int release_ok = write_full(release[1], "G", 1) == 0;
+        close(release[1]);
+        int join_ok = pthread_join(worker, NULL) == 0;
+        _exit(ready_ok && report_ok && release_ok && join_ok ? 0 : 4);
+    }
+
+    close(report_pipe[1]);
+    struct pid_tid_report report;
+    memset(&report, 0, sizeof(report));
+    int report_ok = read_full(report_pipe[0], &report, sizeof(report)) == 0;
+    close(report_pipe[0]);
+    int child_ok = child_exited_cleanly(child, 0);
+    int identity_ok =
+        report.child_pid == child && report.child_main_tid == report.child_pid;
+    int unique = parent_pid > 0 && report.child_pid > 0 &&
+                 report.child_worker_tid > 0 &&
+                 parent_pid != report.child_pid &&
+                 parent_pid != report.child_worker_tid &&
+                 report.child_pid != report.child_worker_tid;
+
+    if (!report_ok || !child_ok || !identity_ok || !unique) {
+        printf(
+            "[PID-02 parent=%d fork_child=%d child_pid=%d main_tid=%d "
+            "worker_tid=%d report=%d child_ok=%d identity=%d unique=%d] ",
+            (int) parent_pid, (int) child, (int) report.child_pid,
+            (int) report.child_main_tid, (int) report.child_worker_tid,
+            report_ok, child_ok, identity_ok, unique);
+        FAIL("process/thread IDs collided or leader TID differed from PID");
         return;
     }
     PASS();
@@ -865,11 +979,160 @@ static void test_subreaper_adopts_zombie(void)
     PASS();
 }
 
+static void test_pid1_retains_adopted_exit(void)
+{
+    TEST("O-06 non-reaping PID 1 retains adopted exit status");
+
+    int meta[2];
+    int result[2];
+    int ready[2];
+    int exit_barrier[2];
+    if (pipe(meta) < 0 || pipe(result) < 0 || pipe(ready) < 0 ||
+        pipe(exit_barrier) < 0) {
+        FAIL("O-06 pipe failed");
+        return;
+    }
+
+    pid_t observer = getpid();
+    pid_t middle = fork();
+    if (middle < 0) {
+        FAIL("O-06 middle fork failed");
+        return;
+    }
+    if (middle == 0) {
+        close(meta[0]);
+        close(result[0]);
+        close(exit_barrier[0]);
+
+        pid_t leaf = fork();
+        if (leaf == 0) {
+            close(meta[1]);
+            close(ready[0]);
+            struct orphan_report report = {
+                .child_pid = getpid(),
+                .original_ppid = getppid(),
+                .adopted_ppid = -1,
+            };
+            char byte = 'R';
+            if (write_full(ready[1], &byte, 1) < 0)
+                _exit(85);
+            close(ready[1]);
+            report.adopted_ppid = wait_for_ppid(1, 3000);
+            (void) write_full(result[1], &report, sizeof(report));
+            close(result[1]);
+            /* Keep exit_barrier[1] open until process teardown. EOF tells the
+             * observer that the leaf has finished, not merely that it sent
+             * the report above.
+             */
+            _exit(report.adopted_ppid == 1 ? 83 : 84);
+        }
+
+        close(ready[1]);
+        close(exit_barrier[1]);
+        char byte;
+        int ready_ok = leaf > 0 && read_full(ready[0], &byte, 1) == 0;
+        close(ready[0]);
+        int meta_ok = write_full(meta[1], &leaf, sizeof(leaf)) == 0;
+        close(meta[1]);
+        close(result[1]);
+        _exit(ready_ok && meta_ok ? 82 : 86);
+    }
+
+    close(meta[1]);
+    close(result[1]);
+    close(ready[0]);
+    close(ready[1]);
+    close(exit_barrier[1]);
+
+    pid_t leaf = -1;
+    int meta_ok = read_full(meta[0], &leaf, sizeof(leaf)) == 0;
+    close(meta[0]);
+    int middle_ok = child_exited_cleanly(middle, 82);
+
+    struct orphan_report report;
+    memset(&report, 0, sizeof(report));
+    int result_ok = read_full(result[0], &report, sizeof(report)) == 0;
+    close(result[0]);
+    char byte;
+    ssize_t barrier_ret;
+    do {
+        barrier_ret = read(exit_barrier[0], &byte, 1);
+    } while (barrier_ret < 0 && errno == EINTR);
+    close(exit_barrier[0]);
+    int barrier_ok = barrier_ret == 0;
+    int adoption_ok = leaf > 0 && report.child_pid == leaf &&
+                      report.original_ppid == middle &&
+                      report.adopted_ppid == 1;
+
+    int retained_ok = 0;
+    int cleanup_ok = 0;
+    int first_pid = -1, second_pid = -1;
+    int first_status = -1, second_status = -1;
+    int wait_errno = 0;
+    if (observer == 1 && leaf > 0) {
+        /* Deliberately leave the adopted terminal child unconsumed for a
+         * bounded interval. PID 1 is not magic in Linux: without wait(),
+         * SIG_IGN, or SA_NOCLDWAIT, the status must remain waitable.
+         */
+        usleep(50000);
+        siginfo_t first;
+        siginfo_t second;
+        memset(&first, 0, sizeof(first));
+        memset(&second, 0, sizeof(second));
+        int first_rc =
+            waitid(P_PID, (id_t) leaf, &first, WEXITED | WNOHANG | WNOWAIT);
+        int second_rc =
+            waitid(P_PID, (id_t) leaf, &second, WEXITED | WNOHANG | WNOWAIT);
+        first_pid = first.si_pid;
+        second_pid = second.si_pid;
+        first_status = first.si_status;
+        second_status = second.si_status;
+        retained_ok = first_rc == 0 && second_rc == 0 && first.si_pid == leaf &&
+                      second.si_pid == leaf && first.si_code == CLD_EXITED &&
+                      second.si_code == CLD_EXITED && first.si_status == 83 &&
+                      second.si_status == 83;
+
+        int status = 0;
+        errno = 0;
+        pid_t consumed = waitpid(leaf, &status, 0);
+        wait_errno = errno;
+        cleanup_ok =
+            consumed == leaf && WIFEXITED(status) && WEXITSTATUS(status) == 83;
+    } else if (leaf > 0) {
+        /* In the QEMU/Linux reference lane this test process is normally not
+         * PID 1; the system init owns the orphan, so this process must see
+         * ECHILD. Adoption and terminal exit are still verified above.
+         */
+        errno = 0;
+        pid_t foreign = waitpid(leaf, NULL, WNOHANG);
+        wait_errno = errno;
+        retained_ok = foreign == -1 && wait_errno == ECHILD;
+        cleanup_ok = retained_ok;
+    }
+
+    if (!meta_ok || !middle_ok || !result_ok || !barrier_ok || !adoption_ok ||
+        !retained_ok || !cleanup_ok) {
+        printf(
+            "[O-06 observer=%d middle=%d leaf=%d report=(pid=%d old=%d "
+            "new=%d) meta=%d middle_ok=%d result=%d barrier=%d "
+            "first=(pid=%d status=%d) second=(pid=%d status=%d) "
+            "retained=%d cleanup=%d errno=%d] ",
+            (int) observer, (int) middle, (int) leaf, (int) report.child_pid,
+            (int) report.original_ppid, (int) report.adopted_ppid, meta_ok,
+            middle_ok, result_ok, barrier_ok, first_pid, first_status,
+            second_pid, second_status, retained_ok, cleanup_ok, wait_errno);
+        FAIL("PID 1 did not retain the adopted terminal status");
+        return;
+    }
+    PASS();
+}
+
 int main(void)
 {
     printf("test-process-lifecycle: Linux process lifecycle semantics\n");
 
     test_nested_pid_uniqueness();
+    test_pid_tid_namespace_uniqueness();
     test_wnohang_running_child();
     test_waitid_wnowait_repeat();
     test_waitid_pgid_matching();
@@ -883,6 +1146,7 @@ int main(void)
     test_orphan_reparent_to_init();
     test_orphan_reparent_to_subreaper();
     test_subreaper_adopts_zombie();
+    test_pid1_retains_adopted_exit();
 
     SUMMARY("test-process-lifecycle");
     return fails == 0 ? 0 : 1;

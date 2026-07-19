@@ -543,6 +543,25 @@ state transfer:
    enters the vCPU loop with `X0 = 0` (the child return from `clone`).
 5. Parent records the child in the process table and returns the child PID.
 
+### Process Lifecycle And Guest PID 1
+
+The first guest process in an elfuse invocation has guest PID 1 and therefore
+becomes the fallback parent for orphaned descendants when no living child
+subreaper is closer. elfuse does not insert a hidden init process and does not
+automatically discard an adopted child's exit status merely because its new
+parent is PID 1. As on Linux, the new parent must consume that status with a
+`wait*()` call, or explicitly select no-zombie semantics with
+`SIGCHLD = SIG_IGN` or `SA_NOCLDWAIT`.
+
+An application runtime used directly as guest PID 1 may not perform that
+reaper role. In that case, adopted terminal statuses remain in elfuse's
+invocation-scoped lifecycle registry, and a direct macOS child of the PID 1
+elfuse process may also remain a host zombie until the guest waits, changes its
+SIGCHLD disposition, or exits. Guest waitability and host-process cleanup are
+separate concerns: a future host-only reaper could collect the macOS process
+while retaining its exit status for a later guest wait, but no such background
+reaper is currently provided.
+
 ### CoW Fork Path
 
 When `g->shm_fd >= 0` the guest memory is file-backed (`mkstemp` +
