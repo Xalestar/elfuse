@@ -441,7 +441,6 @@ bool proc_sysroot_casefold_enabled(void)
     pthread_mutex_unlock(&sysroot_lock);
     return enabled;
 }
-
 /* Confirm @resolved_path canonicalizes inside @sysroot. This is a
  * check-then-use sequence: callers issue the actual syscall after this returns,
  * so a symlink swapped in between will not be re-validated. openat2

@@ -7,10 +7,12 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <sys/xattr.h>
 #include <unistd.h>
 
@@ -293,7 +295,81 @@ int main(int argc, char **argv)
                 PASS();
             }
         }
-    unlink_symlink_escape_done:;
+    unlink_symlink_escape_done:
+        unlink(sysroot_tmp);
+        mkdir(sysroot_tmp, 0755);
+    }
+
+    TEST("open file in non-existent parent returns ENOENT, not ELOOP");
+    {
+        int fd = open("/etc/nonexistent_parent_dir_123/sub/file.txt",
+                      O_CREAT | O_WRONLY, 0644);
+        EXPECT_ERRNO(fd, ENOENT,
+                     "open on non-existent parent failed to return ENOENT");
+        if (fd >= 0)
+            close(fd);
+    }
+
+    TEST("open file in non-existent parent TOCTOU race stress pass");
+    {
+        char race_dir[512];
+        char race_file[512];
+        snprintf(race_dir, sizeof(race_dir), "%s/tmp/race_dir",
+                 mounted_sysroot_root);
+        snprintf(race_file, sizeof(race_file), "/tmp/race_dir/file.txt");
+
+        pid_t pid = fork();
+        if (pid < 0)
+            FAIL("fork failed");
+        else if (pid == 0) {
+            /* Child process: continuously create and delete the directory */
+            while (1) {
+                mkdir(race_dir, 0755);
+                rmdir(race_dir);
+            }
+            _exit(0);
+        }
+
+        int hit_eloop = 0;
+        int iterations = 0;
+        while (iterations < 10000) {
+            iterations++;
+            int fd = open("/tmp/race_dir/file.txt", O_CREAT | O_WRONLY, 0644);
+            if (fd >= 0) {
+                close(fd);
+                unlink("/tmp/race_dir/file.txt");
+            } else if (errno == ELOOP) {
+                hit_eloop = 1;
+                break;
+            }
+        }
+
+        kill(pid, SIGKILL);
+        int status;
+        waitpid(pid, &status, 0);
+
+        /* Cleanup guest paths */
+        unlink("/tmp/race_dir/file.txt");
+        rmdir("/tmp/race_dir");
+
+        /* Cleanup host paths inside sysroot */
+        char host_race_file[512], host_race_dir[512];
+        snprintf(host_race_file, sizeof(host_race_file),
+                 "%s/tmp/race_dir/file.txt", mounted_sysroot_root);
+        snprintf(host_race_dir, sizeof(host_race_dir), "%s/tmp/race_dir",
+                 mounted_sysroot_root);
+        unlink(host_race_file);
+        rmdir(host_race_dir);
+
+        /* Assert that no artifact exists outside mounted_sysroot_root on the
+         * host */
+        struct stat host_st;
+        if (stat("/tmp/race_dir", &host_st) == 0)
+            FAIL("TOCTOU race created directory outside of sysroot");
+        else if (hit_eloop)
+            FAIL("TOCTOU race returned ELOOP");
+        else
+            PASS();
     }
 
     SUMMARY("test-sysroot-create-paths");
