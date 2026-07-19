@@ -19,7 +19,7 @@
 /* Fork IPC protocol identity. Bump this whenever the header layout or ordered
  * fork payload changes incompatibly.
  */
-#define FORK_IPC_PROTOCOL_MAGIC 0x454C464DU /* "ELFM" */
+#define FORK_IPC_PROTOCOL_MAGIC 0x454C464EU /* "ELFN" */
 
 #define IPC_MAGIC_HEADER FORK_IPC_PROTOCOL_MAGIC
 #define IPC_MAGIC_SENTINEL 0x454C4F4BU /* "ELOK" */
@@ -34,6 +34,7 @@ typedef struct {
     uint64_t brk_base, brk_current;
     uint64_t stack_base;
     uint64_t stack_top;
+    uint64_t start_stack;
     uint64_t mmap_next, mmap_end, pt_pool_next, ttbr0;
     uint64_t mmap_rx_next;
     uint64_t mmap_rx_end;

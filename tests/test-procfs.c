@@ -17,7 +17,9 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
+#include <sys/wait.h>
 
 #include "test-harness.h"
 #include "test-util.h"
@@ -26,6 +28,93 @@ int passes = 0, fails = 0;
 
 #define AT_NULL 0
 #define AT_PAGESZ 6
+
+static bool parse_proc_stat_field_u64(const char *buf,
+                                      int target,
+                                      uint64_t *out)
+{
+    if (target < 4)
+        return false;
+
+    const char *p = strrchr(buf, ')');
+    if (!p)
+        return false;
+    p++;
+
+    int field = 3;
+    while (*p == ' ')
+        p++;
+    while (*p != '\0' && field <= target) {
+        char *endp;
+        if (field == 3) {
+            if (*p == '\0' || p[1] != ' ')
+                return false;
+            endp = (char *) p + 1;
+        } else {
+            unsigned long long val = strtoull(p, &endp, 10);
+            if (endp == p)
+                return false;
+            if (field == target) {
+                *out = (uint64_t) val;
+                return true;
+            }
+        }
+        p = endp;
+        while (*p == ' ')
+            p++;
+        field++;
+    }
+    return false;
+}
+
+static bool parse_stack_range(const char *buf, uint64_t *start, uint64_t *end)
+{
+    const char *line = buf;
+    while ((line = strstr(line, "[stack]")) != NULL) {
+        const char *begin = line;
+        while (begin > buf && begin[-1] != '\n')
+            begin--;
+
+        unsigned long long lo, hi;
+        if (sscanf(begin, "%llx-%llx", &lo, &hi) == 2) {
+            *start = (uint64_t) lo;
+            *end = (uint64_t) hi;
+            return true;
+        }
+        line += 7;
+    }
+    return false;
+}
+
+static bool read_stack_range(uint64_t *start, uint64_t *end)
+{
+    char mapsbuf[65536];
+    ssize_t maps_n =
+        raw_read_file_nul("/proc/self/maps", mapsbuf, sizeof(mapsbuf));
+    return maps_n > 0 && parse_stack_range(mapsbuf, start, end);
+}
+
+static bool read_start_stack(const char *path, uint64_t *start_stack)
+{
+    char statbuf[1024];
+    ssize_t stat_n = raw_read_file_nul(path, statbuf, sizeof(statbuf));
+    return stat_n > 0 && parse_proc_stat_field_u64(statbuf, 28, start_stack);
+}
+
+static bool start_stack_is_recorded(uint64_t start_stack, uint64_t stack_end)
+{
+    return start_stack != stack_end - 16;
+}
+
+static int child_write_start_stack(int fd)
+{
+    uint64_t start_stack = 0;
+    if (!read_start_stack("/proc/self/stat", &start_stack))
+        return 1;
+    if (write_fd_all(fd, &start_stack, sizeof(start_stack)) < 0)
+        return 2;
+    return 0;
+}
 
 int main(void)
 {
@@ -134,6 +223,71 @@ int main(void)
             } else {
                 FAIL("empty status");
             }
+        }
+    }
+
+    TEST("procfs: stat startstack is in [stack]");
+    {
+        uint64_t start_stack = 0, stack_start = 0, stack_end = 0;
+        bool ok = read_start_stack("/proc/self/stat", &start_stack) &&
+                  read_stack_range(&stack_start, &stack_end) &&
+                  start_stack >= stack_start && start_stack < stack_end;
+        EXPECT_TRUE(ok, "startstack not inside [stack]");
+    }
+
+    TEST("procfs: task stat startstack is in [stack]");
+    {
+        char path[128];
+        snprintf(path, sizeof(path), "/proc/self/task/%ld/stat",
+                 (long) raw_getpid());
+        uint64_t start_stack = 0, stack_start = 0, stack_end = 0;
+        bool ok = read_start_stack(path, &start_stack) &&
+                  read_stack_range(&stack_start, &stack_end) &&
+                  start_stack >= stack_start && start_stack < stack_end;
+        EXPECT_TRUE(ok, "task startstack not inside [stack]");
+    }
+
+    TEST("procfs: stat startstack is recorded SP");
+    {
+        uint64_t start_stack = 0, stack_start = 0, stack_end = 0;
+        bool ok = read_start_stack("/proc/self/stat", &start_stack) &&
+                  read_stack_range(&stack_start, &stack_end) &&
+                  start_stack >= stack_start && start_stack < stack_end &&
+                  start_stack_is_recorded(start_stack, stack_end);
+        EXPECT_TRUE(ok, "startstack used fallback value");
+    }
+
+    TEST("procfs: fork preserves stat startstack");
+    {
+        int pipefd[2];
+        uint64_t parent_start = 0, child_start = 0;
+        uint64_t stack_start = 0, stack_end = 0;
+        bool ok = read_start_stack("/proc/self/stat", &parent_start) &&
+                  read_stack_range(&stack_start, &stack_end) &&
+                  start_stack_is_recorded(parent_start, stack_end) &&
+                  pipe(pipefd) == 0;
+        if (!ok) {
+            EXPECT_TRUE(false, "fork startstack setup failed");
+        } else {
+            pid_t pid = fork();
+            if (pid == 0) {
+                close(pipefd[0]);
+                int rc = child_write_start_stack(pipefd[1]);
+                close(pipefd[1]);
+                _exit(rc);
+            }
+            close(pipefd[1]);
+            ssize_t nread = read(pipefd[0], &child_start, sizeof(child_start));
+            close(pipefd[0]);
+            int status = 0;
+            if (pid < 0 || waitpid(pid, &status, 0) < 0)
+                ok = false;
+            else
+                ok = nread == (ssize_t) sizeof(child_start) &&
+                     WIFEXITED(status) && WEXITSTATUS(status) == 0 &&
+                     child_start == parent_start &&
+                     start_stack_is_recorded(child_start, stack_end);
+            EXPECT_TRUE(ok, "fork child startstack mismatch");
         }
     }
 

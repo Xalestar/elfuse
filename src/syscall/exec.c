@@ -1282,6 +1282,7 @@ int64_t sys_execve(hv_vcpu_t vcpu,
         sp = build_linux_stack(g, g->stack_top, argc, argv_const, envp_const,
                                &elf_info, elf_load_base, interp_base, exec_vdso,
                                -1 /* no AT_EXECFD */, &auxv);
+        g->start_stack = sp;
 
         entry_point = (interp_base != 0) ? (interp_info.entry + interp_base)
                                          : (elf_info.entry + elf_load_base);

@@ -617,6 +617,7 @@ int guest_bootstrap_prepare(guest_t *g,
         free(rosetta_argv);
         return -1;
     }
+    g->start_stack = boot->stack_pointer;
     startup_trace_step("build_linux_stack", t0);
     /* rosetta_argv was copied into the guest stack; the host allocation is no
      * longer needed. The strings themselves are constants (ROSETTA_PATH) or
@@ -868,6 +869,7 @@ int guest_bootstrap_rosetta_post_reset(guest_t *g,
         log_error("build_linux_stack failed during exec re-bootstrap");
         return -1;
     }
+    g->start_stack = sp;
     proc_set_auxv(auxv.words, auxv.nwords * sizeof(auxv.words[0]));
 
     *out_entry_point = rr.entry_point;

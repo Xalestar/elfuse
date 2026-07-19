@@ -230,6 +230,7 @@ int fork_child_main(int ipc_fd,
     g.elf_load_min = hdr.elf_load_min;
     g.stack_base = hdr.stack_base;
     g.stack_top = hdr.stack_top;
+    g.start_stack = hdr.start_stack;
     g.mmap_next = hdr.mmap_next;
     g.mmap_end = hdr.mmap_end;
     g.pt_pool_next = hdr.pt_pool_next;
@@ -1678,6 +1679,7 @@ int64_t sys_clone(hv_vcpu_t vcpu,
         .brk_current = g->brk_current,
         .stack_base = g->stack_base,
         .stack_top = g->stack_top,
+        .start_stack = g->start_stack,
         .mmap_next = g->mmap_next,
         .mmap_end = g->mmap_end,
         .pt_pool_next = g->pt_pool_next,

@@ -432,6 +432,7 @@ typedef struct {
     uint64_t brk_current; /* Current brk position */
     uint64_t stack_base;  /* Bottom of stack region (dynamic, above brk) */
     uint64_t stack_top;   /* Top of stack (stack grows down from here) */
+    uint64_t start_stack; /* Initial userspace SP for /proc/<pid>/stat */
 
     uint64_t mmap_next; /* RW mmap high-water mark for fork IPC snapshots */
     uint64_t mmap_end;  /* Current page-table-covered RW mmap limit */

@@ -2538,7 +2538,18 @@ static int proc_open_meminfo(void)
  * the tid is unparseable or the leaf is unknown. Split out of
  * proc_intercept_open to keep that dispatcher readable.
  */
-static int proc_open_self_task_node(const char *path, int linux_flags)
+static uint64_t proc_start_stack(const guest_t *g)
+{
+    if (g->start_stack != 0)
+        return g->start_stack;
+    if (g->stack_top > g->stack_base)
+        return g->stack_top - 16;
+    return 0;
+}
+
+static int proc_open_self_task_node(const guest_t *g,
+                                    const char *path,
+                                    int linux_flags)
 {
     char *endp;
     long tid = strtol(path + 16, &endp, 10);
@@ -2552,13 +2563,17 @@ static int proc_open_self_task_node(const char *path, int linux_flags)
     }
 
     if (!strcmp(endp, "/stat")) {
+        uint64_t start_stack = proc_start_stack(g);
         return proc_emit_fmt(
-            "%ld (%.15s) R %lld %lld %lld 0 0 0 0 0 0 0 0 0 0 0 "
-            "20 0 %d 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 "
-            "0 0 0 0 0 0 0 0\n",
+            "%ld (%.15s) R %lld %lld %lld 0 0 0 "          /* 1-9 */
+            "0 0 0 0 0 0 0 0 "                             /* 10-17 */
+            "20 0 %d 0 0 0 0 "                             /* 18-24 */
+            "18446744073709551615 0 0 %llu 0 0 0 "         /* 25-31 */
+            "0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n", /* 32-52 */
             tid, proc_comm_name(), (long long) proc_get_ppid(),
             (long long) proc_get_pid(), /* pgid */
-            (long long) proc_get_sid(), thread_active_count());
+            (long long) proc_get_sid(), thread_active_count(),
+            (unsigned long long) start_stack);
     }
 
     if (!strcmp(endp, "/status")) {
@@ -3025,7 +3040,7 @@ int proc_intercept_open(const guest_t *g,
 
     /* /proc/self/task/<tid>/{stat,status} and the <tid> directory. */
     if (!strncmp(path, "/proc/self/task/", 16))
-        return proc_open_self_task_node(path, linux_flags);
+        return proc_open_self_task_node(g, path, linux_flags);
 
     /* /proc/self/maps -> generated from guest region tracking. Addresses are
      * page-aligned (rounded down/up) to match real Linux behavior. Output
@@ -3333,6 +3348,8 @@ int proc_intercept_open(const guest_t *g,
                 rss_pages += sz / (uint64_t) page_size;
         }
 
+        uint64_t start_stack = proc_start_stack(g);
+
         /* Fields: pid(1) (comm)(2) state(3) ppid(4) pgrp(5) session(6)
          *   tty_nr(7) tpgid(8) flags(9) minflt(10) cminflt(11) majflt(12)
          *   cmajflt(13) utime(14) stime(15) cutime(16) cstime(17)
@@ -3343,14 +3360,15 @@ int proc_intercept_open(const guest_t *g,
             "%lld (%.15s) R %lld %lld %lld 0 -1 0 "        /* 1-9 */
             "0 0 0 0 %ld %ld 0 0 "                         /* 10-17 */
             "20 0 %d 0 0 %llu %llu "                       /* 18-24 */
-            "18446744073709551615 0 0 0 0 0 0 "            /* 25-31 */
+            "18446744073709551615 0 0 %llu 0 0 0 "         /* 25-31 */
             "0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n", /* 32-52 */
             (long long) proc_get_pid(), proc_comm_name(),
             (long long) proc_get_ppid(),
             (long long) proc_get_pid(), /* pgrp = pid */
             (long long) proc_get_pid(), /* session = pid */
             utime_ticks, stime_ticks, thread_active_count(),
-            (unsigned long long) vsize, (unsigned long long) rss_pages);
+            (unsigned long long) vsize, (unsigned long long) rss_pages,
+            (unsigned long long) start_stack);
     }
 
     /* /proc/stat -> synthetic CPU statistics */
