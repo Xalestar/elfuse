@@ -568,10 +568,12 @@ periodically imports newly adopted descendants; adoption of an already exited
 child also sends `SIGCHLD` to wake the adopter. Both the per-process wait table
 and the invocation-wide lifecycle registry grow geometrically with the actual
 fork-family population; the on-disk registry serializes only its live records.
-Fork admission is reserved before the host helper starts, so allocation failure
-fails the new fork instead of silently dropping a waitable child. Pre-spawn
-registry reservations are not imported as adopted children, and a matching
-local reserved slot remains authoritative through the
+An empty newly created registry is initialized on first use; a nonempty record
+set that cannot be read or validated fails closed instead of being overwritten
+as empty. Fork admission is reserved before the host helper starts, so
+allocation or registry failure fails the new fork instead of silently dropping
+a waitable child. Pre-spawn registry reservations are not imported as adopted
+children, and a matching local reserved slot remains authoritative through the
 registry-publish/local-commit window.
 
 An application runtime used directly as guest PID 1 may not perform that

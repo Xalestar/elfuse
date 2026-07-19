@@ -427,8 +427,8 @@ int proc_reserve_child(int64_t guest_pid_val, int64_t pgid)
 {
     /* Explicit SIG_IGN/SA_NOCLDWAIT children are not guest-waitable. Reclaim
      * any that have already terminated before consuming another table slot,
-     * so a workload that intentionally never calls wait cannot exhaust the
-     * fixed bookkeeping table with stale children.
+     * so a workload that intentionally never calls wait does not retain stale
+     * bookkeeping entries indefinitely.
      */
     if (signal_sigchld_autoreap())
         (void) proc_wait_autoreap_children(-1, WNOHANG);
@@ -436,11 +436,12 @@ int proc_reserve_child(int64_t guest_pid_val, int64_t pgid)
     pthread_mutex_lock(&pid_lock);
     proc_entry_t *entry = proc_find_free_entry();
     if (!entry) {
+        size_t capacity = proc_table_capacity;
         pthread_mutex_unlock(&pid_lock);
         log_error(
             "cannot grow process table beyond %zu slots for child PID "
             "%lld",
-            proc_table_capacity, (long long) guest_pid_val);
+            capacity, (long long) guest_pid_val);
         return -LINUX_EAGAIN;
     }
     memset(entry, 0, sizeof(*entry));
@@ -660,17 +661,21 @@ static lifecycle_registry_t *lifecycle_registry_empty(void)
 static lifecycle_registry_t *lifecycle_load_locked(int fd)
 {
     struct stat st;
-    lifecycle_registry_t header;
-    if (fstat(fd, &st) != 0 || st.st_size < (off_t) LIFECYCLE_HEADER_SIZE ||
+    lifecycle_registry_t header = {0};
+    if (fstat(fd, &st) != 0)
+        return NULL;
+    if (st.st_size == 0)
+        return lifecycle_registry_empty();
+    if (st.st_size < (off_t) LIFECYCLE_HEADER_SIZE ||
         lseek(fd, 0, SEEK_SET) != 0 ||
         lifecycle_read_full(fd, &header, LIFECYCLE_HEADER_SIZE) < 0 ||
         header.magic != LIFECYCLE_MAGIC || header.version != LIFECYCLE_VERSION)
-        return lifecycle_registry_empty();
+        return NULL;
 
     size_t disk_size;
     if (!lifecycle_registry_size(header.count, &disk_size) ||
         disk_size > (size_t) LLONG_MAX || st.st_size != (off_t) disk_size)
-        return lifecycle_registry_empty();
+        return NULL;
 
     uint32_t capacity = header.count > LIFECYCLE_INITIAL_CAPACITY
                             ? header.count
@@ -686,7 +691,7 @@ static lifecycle_registry_t *lifecycle_load_locked(int fd)
                             (size_t) header.count * sizeof(lifecycle_entry_t)) <
             0) {
         free(registry);
-        return lifecycle_registry_empty();
+        return NULL;
     }
     return registry;
 }
@@ -2020,8 +2025,12 @@ void proc_autoreap_exited_children(void)
      */
     lifecycle_import_children();
 
-    for (size_t i = 0; i < proc_table_capacity; i++) {
+    for (size_t i = 0;; i++) {
         pthread_mutex_lock(&pid_lock);
+        if (i >= proc_table_capacity) {
+            pthread_mutex_unlock(&pid_lock);
+            break;
+        }
         if (!proc_table[i].active) {
             pthread_mutex_unlock(&pid_lock);
             continue;
