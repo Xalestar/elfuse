@@ -734,11 +734,8 @@ int guest_bootstrap_create_vcpu(guest_t *g,
      */
     shim_globals_set_singleton(g);
 
-    /* CNTKCTL_EL1.EL0VCTEN | EL0PCTEN: allow EL0 to read {CNTVCT,CNTPCT}_EL0.
-     * Required by the vDSO clock_gettime fast path (and is the default on
-     * native Linux), without which the guest gets 0 back from MRS.
-     */
-    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_CNTKCTL_EL1, 0x3ULL));
+    HV_CHECK(hv_vcpu_set_sys_reg(vcpu, HV_SYS_REG_CNTKCTL_EL1,
+                                 CNTKCTL_EL1_EL0_TIMER_EN));
 
     HV_CHECK(hv_vcpu_get_sys_reg(vcpu, HV_SYS_REG_SCTLR_EL1, &sctlr));
     log_debug("SCTLR_EL1 default=0x%llx", (unsigned long long) sctlr);

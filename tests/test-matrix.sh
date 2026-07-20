@@ -676,6 +676,8 @@ run_unit_tests()
     printf "\nThreading\n"
     test_check "$runner" "test-thread" "0 failed" "$bindir/test-thread"
     test_check "$runner" "test-pthread" "0 failed" "$bindir/test-pthread"
+    test_check "$runner" "test-cntvct-thread" "0 failed" \
+        "$bindir/test-cntvct-thread"
     test_check "$runner" "test-osync-requeue" "0 failed" "$bindir/test-osync-requeue"
     test_check "$runner" "test-simd-clone" "0 failed" "$bindir/test-simd-clone"
     test_check "$runner" "test-stress" "0 failed" "$bindir/test-stress"
@@ -1223,8 +1225,8 @@ run_suite()
 # observed counts diverge. apple-unknown is the fallback row for SoC strings the
 # detector does not recognize yet.
 EXPECTED_BASELINES=(
-    "elfuse-aarch64|237|0"
-    "qemu-aarch64|217|0"
+    "elfuse-aarch64|238|0"
+    "qemu-aarch64|218|0"
     "elfuse-x86_64:apple-m1-m2|71|0"
     "elfuse-x86_64:apple-m3-plus|71|0"
     "elfuse-x86_64:apple-unknown|71|0"

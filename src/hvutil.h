@@ -49,6 +49,12 @@
 #define SCTLR_UCT (1ULL << 15) /* EL0 access to CTR_EL0 (cache type) */
 #define SCTLR_UCI (1ULL << 26) /* EL0 cache maintenance (IC IVAU, DC CVA*) */
 
+/* CNTKCTL_EL1 bits exposed to EL0. Linux enables both virtual and physical
+ * counter reads for userspace; vDSO clock_gettime and runtime timer fast paths
+ * depend on cloned vCPUs matching bootstrap's timer access configuration.
+ */
+#define CNTKCTL_EL1_EL0_TIMER_EN 0x3ULL /* EL0VCTEN | EL0PCTEN */
+
 /* RES1 bits in SCTLR_EL1: these MUST be 1 for correct behavior. Apple
  * Hypervisor.framework returns default SCTLR=0x0, so the setup code must set
  * them explicitly. The hardware eventually auto-updates them, but the initial
