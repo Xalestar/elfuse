@@ -1,0 +1,25 @@
+tests/test-file-ops.c
+  s_09dcceb4adb99b::t_4a4e89e23fbef7 8-9,34-37,123-139,142-157
+  s_09dcceb4adb99b::t_0525b06ccc0525 140-141,160-162
+  s_09dcceb4adb99b::t_bd49a12d9e7120 158-159,163
+  s_09dcceb4adb99b::t_8b42d238b8c19d 164
+scripts/check-syscall-coverage.py
+  s_09dcceb4adb99b::t_301c98f4f36024 32-34,142-143
+  s_09dcceb4adb99b::t_4a4e89e23fbef7 123,134,138-141,144-151,155
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.15",
+  "base_commit_sha": "5836ae0586177053202acaecfb9f1d4421b9ce46",
+  "prompts": {},
+  "sessions": {
+    "s_09dcceb4adb99b": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019f8a6e-198d-7693-aee2-8ce1565e4a53",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "Xalestar <alex.h.r.lin@gmail.com>"
+    }
+  }
+}
