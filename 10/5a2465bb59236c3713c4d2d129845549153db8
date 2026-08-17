@@ -1,0 +1,65 @@
+src/syscall/net.h
+  s_f2b9c8a17f6ebf::t_792cccb556bb37 18
+  s_7260e18d4b4545::t_2f19158f7de47f 231-235,237,239
+  s_f2b9c8a17f6ebf::t_7b59e25ba0f35f 236,238,240
+tests/test-netlink.c
+  s_f2b9c8a17f6ebf::t_207e019a918764 32
+  s_f2b9c8a17f6ebf::t_ff865366744848 174-176,178-185
+  s_f2b9c8a17f6ebf::t_f1bcc2cf8682ee 26
+  s_f2b9c8a17f6ebf::t_f32b19fa31ce09 36-38
+  s_f2b9c8a17f6ebf::t_f00d6708cd0507 79-82
+  s_f2b9c8a17f6ebf::t_a81feb5321b53c 164-171,190-192,195-197
+  s_f2b9c8a17f6ebf::t_e6a6a54b4ef408 172-173,177,186-189,193-194,198-206,212-229
+  s_f2b9c8a17f6ebf::t_93969a2778c30e 65-68,74-77
+  s_f2b9c8a17f6ebf::t_0c4b40df8ded76 39-43
+  s_7260e18d4b4545::t_2f19158f7de47f 2-3,231-283,286
+  s_f2b9c8a17f6ebf::t_b0661a94b46d80 12-17
+  s_f2b9c8a17f6ebf::t_50e7a30fc0fbe9 63-64,70
+  s_f2b9c8a17f6ebf::t_4befc8419f8de4 207-211,230
+  s_f2b9c8a17f6ebf::t_ab1e86b212a588 69,71-73,78,83-96
+src/core/guest.h
+  s_7260e18d4b4545::t_2f19158f7de47f 1058-1071
+src/syscall/io.c
+  s_7260e18d4b4545::t_2f19158f7de47f 1424,1582
+  s_f2b9c8a17f6ebf::t_9cf569f20285c2 1008-1016,1596-1597
+  s_f2b9c8a17f6ebf::t_43b4d05aeb8b38 1578-1581
+  s_f2b9c8a17f6ebf::t_c3fcf5df4dcb23 1423
+src/syscall/netlink.c
+  s_7260e18d4b4545::t_1054e3cb0648c8 763-766
+  s_f2b9c8a17f6ebf::t_8d19c0595e6295 693-694,699,713-719,740,750,753,756-758,772,781-782
+  s_7260e18d4b4545::t_b5228364b3ddbf 992
+  s_f2b9c8a17f6ebf::t_2d37e3b2c41d74 695-698
+  s_7260e18d4b4545::t_150fd3a4d972cb 678
+  s_7260e18d4b4545::t_2638999520b5a7 679-681,686
+  s_f2b9c8a17f6ebf::t_b35006e92a655e 741
+  s_7260e18d4b4545::t_2f19158f7de47f 115-121,631-677,682-685,687-692,700-703,722-725,732-736,745-747,749,751-752,754-755,759,783,785-788,790-791,793-801,803-804,807-827,933-942,944-948,957-966,976,979-991,993-1001,1008-1026,1065,1068-1071,1073-1079,1082-1083,1091-1092,1094-1104,1110
+  s_f2b9c8a17f6ebf::t_3f330fcbb9d205 805,1109
+  s_f2b9c8a17f6ebf::t_0204eb56df9e97 726-728
+src/core/guest.c
+  s_7260e18d4b4545::t_b5228364b3ddbf 1740-1743
+  s_7260e18d4b4545::t_2f19158f7de47f 1744-1764
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "105a2465bb59236c3713c4d2d129845549153db8",
+  "prompts": {},
+  "sessions": {
+    "s_7260e18d4b4545": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "c562e209-a8c6-44e8-8bb6-508eeeae2e1e",
+        "model": "claude-opus-5"
+      },
+      "human_author": null
+    },
+    "s_f2b9c8a17f6ebf": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "397e380a-c142-43c2-9133-9b512e2ec0ef",
+        "model": "claude-opus-5"
+      },
+      "human_author": null
+    }
+  }
+}
