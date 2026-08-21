@@ -1,0 +1,29 @@
+src/syscall/poll.c
+  s_c114de0412ed3b::t_7a72baeffb4a17 499-503
+  s_c114de0412ed3b::t_3cb1bd319fa5f8 663-664
+  s_c114de0412ed3b::t_e7ca137c78eac0 867-868
+  s_c114de0412ed3b::t_620f7a49a8923b 621
+  s_c114de0412ed3b::t_b5622573d0dd98 481-487,490-498,504-564,807-811,814,828-832,847,856,870,874-875
+  s_c114de0412ed3b::t_264a89fb54e577 107-117,132,140-143,145,161-163,165,179,219,224,349,365-366,415-416,615-620,668,707,869,871-873
+  s_c114de0412ed3b::t_7b05dd51b5151f 488-489
+  s_c114de0412ed3b::t_d1700ead300ee7 876
+tests/test-poll.c
+  s_c114de0412ed3b::t_e7ca137c78eac0 602-604
+  s_c114de0412ed3b::t_79bbc3406c496c 561-601,605-640
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "54e970361f86bd7fbff39967d203babc9fcbbc50",
+  "prompts": {},
+  "sessions": {
+    "s_c114de0412ed3b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0f314946-321e-4549-a6ec-da02a7a0035e",
+        "model": "claude-opus-5"
+      },
+      "human_author": "xalestar <alex.h.r.lin@gmail.com>"
+    }
+  }
+}
