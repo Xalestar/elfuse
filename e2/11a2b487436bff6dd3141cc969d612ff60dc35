@@ -1,0 +1,31 @@
+src/syscall/internal.h
+  s_44fd69a4388f49::t_0cea3c4e1e922d 728-743,755-759,774-776,779-781,783,810-815,817-818
+  s_44fd69a4388f49::t_7c0cd34c08bc75 777-778
+tests/test-fd-ref-exhaustion-host.c
+  s_44fd69a4388f49::t_f3d28952e47fe4 28-39
+  s_44fd69a4388f49::t_535c5c93c01428 103-104
+  s_44fd69a4388f49::t_10407999419f8e 1-27,40-102,105-153
+Makefile
+  s_44fd69a4388f49::t_56580b3089ab87 237-245
+src/syscall/path.c
+  s_44fd69a4388f49::t_0cea3c4e1e922d 532-534,784-786,1204-1206,1526-1528,1807-1809
+mk/tests.mk
+  s_44fd69a4388f49::t_cac6a0cb6acfa6 198-199,217,1526-1528
+  s_44fd69a4388f49::t_c1ec6221ebf18e 1529
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "e211a2b487436bff6dd3141cc969d612ff60dc35",
+  "prompts": {},
+  "sessions": {
+    "s_44fd69a4388f49": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5e117d1b-6086-4cf1-a45a-4c26ecdff268",
+        "model": "claude-opus-5"
+      },
+      "human_author": "xalestar <alex.h.r.lin@gmail.com>"
+    }
+  }
+}
