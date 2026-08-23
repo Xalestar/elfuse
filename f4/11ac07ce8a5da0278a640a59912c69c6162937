@@ -1,0 +1,39 @@
+src/syscall/poll.c
+  s_44fd69a4388f49::t_fd2fc48241a9ea 1368-1370,1651-1653
+src/syscall/fs.c
+  s_44fd69a4388f49::t_82b79d3d4e04e4 2372,2703
+  s_44fd69a4388f49::t_fd2fc48241a9ea 730-732,1484-1486,1587-1589,1643-1645,1657-1659,1775-1777,2073-2075,2235-2237,2272-2274,2316-2318,2369-2371,2373,2375,2474-2476,2632-2634,2700-2702,2704,2706,2814-2816,2860-2862,2933-2935,2987-2989,3035-3037,3162-3164,3227-3229,3270-3272,3322-3324
+src/syscall/syscall.c
+  s_44fd69a4388f49::t_fd2fc48241a9ea 2216-2218,2243-2245
+src/syscall/fs-xattr.c
+  s_44fd69a4388f49::t_fd2fc48241a9ea 214-216,296-298
+src/syscall/mem.c
+  s_44fd69a4388f49::t_fd2fc48241a9ea 1082-1083,1086,2824-2826,3088-3090
+src/syscall/internal.h
+  s_44fd69a4388f49::t_ef7b3c8491617b 747,750-751,759,766,777-779,787,795,816
+  s_44fd69a4388f49::t_c00b1535a88adc 748-749
+src/syscall/fs-stat.c
+  s_44fd69a4388f49::t_fd2fc48241a9ea 259-261,319-320,322,578-580
+src/syscall/net.c
+  s_44fd69a4388f49::t_fd2fc48241a9ea 478-480,535-537,566-568,705-707,898-900,955-957,991-993,1125-1127,1443-1445,1610-1612,1735-1737
+src/syscall/net-msg.c
+  s_44fd69a4388f49::t_fd2fc48241a9ea 153-155,473-475,1066-1068,1166-1168,1292-1294
+src/syscall/io.c
+  s_44fd69a4388f49::t_fd2fc48241a9ea 1325-1327,1890-1892
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "f411ac07ce8a5da0278a640a59912c69c6162937",
+  "prompts": {},
+  "sessions": {
+    "s_44fd69a4388f49": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5e117d1b-6086-4cf1-a45a-4c26ecdff268",
+        "model": "claude-opus-5"
+      },
+      "human_author": "xalestar <alex.h.r.lin@gmail.com>"
+    }
+  }
+}
