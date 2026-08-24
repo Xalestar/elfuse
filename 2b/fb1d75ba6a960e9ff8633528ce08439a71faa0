@@ -1,0 +1,20 @@
+src/syscall/syscall.c
+  s_c9a3231c30132e::t_9fa52bd2b9f386 1598-1599
+  s_c9a3231c30132e::t_4a482b673fe93f 1597,1600-1603
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "2bfb1d75ba6a960e9ff8633528ce08439a71faa0",
+  "prompts": {},
+  "sessions": {
+    "s_c9a3231c30132e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9be718b0-ba43-4152-ba13-af4320517307",
+        "model": "claude-opus-5"
+      },
+      "human_author": "xalestar <alex.h.r.lin@gmail.com>"
+    }
+  }
+}
