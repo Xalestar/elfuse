@@ -1,0 +1,29 @@
+tests/test-epoll-unsupported.c
+  s_1714865df3808d::t_0f479a4ae9c33d 1,3-6,13,17-20,22-24,26-30,33,48-51,53-54,56,61,64,87-91,109,112-117
+  s_1714865df3808d::t_27a1b21e4a0e7b 2,7-8,12,14-16,21,25,31-32,34-47,52,55,57-60,62-63,65-76,79-86,92-97,99-108,110-111
+  s_1714865df3808d::t_420596a5d54b32 98
+  s_1714865df3808d::t_b347150ae0d7fd 9-11,77-78
+src/syscall/poll.c
+  s_1714865df3808d::t_218c6bcad463a1 1568-1569
+  s_1714865df3808d::t_b347150ae0d7fd 1558-1563
+  s_1714865df3808d::t_cc4e2f09c23857 1368-1384,1556-1557,1564-1567,1570-1572,1576-1579,1581
+  s_1714865df3808d::t_c56c1953d733fd 1580
+tests/test-matrix.sh
+  s_1714865df3808d::t_04b8ff8c112e96 757-758
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.24",
+  "base_commit_sha": "df32e81170043e62cac74cf102dc075d8f59b705",
+  "prompts": {},
+  "sessions": {
+    "s_1714865df3808d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0aa1c540-34a2-41a3-aa2f-d7241d31bea7",
+        "model": "claude-opus-5"
+      },
+      "human_author": null
+    }
+  }
+}
