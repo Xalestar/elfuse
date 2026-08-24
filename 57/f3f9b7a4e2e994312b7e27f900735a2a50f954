@@ -1,0 +1,27 @@
+Makefile
+  s_c9a3231c30132e::t_921fe1123d4f49 237-245
+mk/tests.mk
+  s_c9a3231c30132e::t_2387d50c772722 198-199,217,1526-1529
+src/syscall/internal.h
+  s_c9a3231c30132e::t_dfaf4272e88b57 807-811,829,864
+src/syscall/path.c
+  s_c9a3231c30132e::t_065bae8a49f955 563-565,819-821,1246-1248,1568-1570,1849-1851
+tests/test-fd-ref-exhaustion-host.c
+  s_c9a3231c30132e::t_4c9b8e19fb13ac 1-153
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "57f3f9b7a4e2e994312b7e27f900735a2a50f954",
+  "prompts": {},
+  "sessions": {
+    "s_c9a3231c30132e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9be718b0-ba43-4152-ba13-af4320517307",
+        "model": "claude-opus-5"
+      },
+      "human_author": "xalestar <alex.h.r.lin@gmail.com>"
+    }
+  }
+}
