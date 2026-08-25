@@ -1,0 +1,99 @@
+src/syscall/poll.c
+  s_38e8910f5e9384::t_dae72d94785479 21,1373-1386,1395-1398,1400-1404,1466-1470,1472-1474,1511-1512,1516-1519,1521-1526,1603-1619,1623-1626
+  s_1714865df3808d::t_c56c1953d733fd 1627
+  s_88e0f6ada225b0::t_42b35f6f9167c6 1390-1394
+  s_1714865df3808d::t_3f7090c20d5a50 1527-1528
+  s_88e0f6ada225b0::t_f8c2905b25e7be 1399,1520
+  s_88e0f6ada225b0::t_6fbc3510088135 1593-1594,1597,1599-1602
+  s_1714865df3808d::t_5d3dc1765f1883 1369-1372,1387-1389
+  s_1714865df3808d::t_cc4e2f09c23857 1628
+  s_88e0f6ada225b0::t_9c7d491875fe59 1595-1596,1598
+src/syscall/linux-wire.h
+  s_88e0f6ada225b0::t_f8c2905b25e7be 590
+  s_1714865df3808d::t_e7abd2f35f5c77 582,589
+  s_88e0f6ada225b0::t_d89c04034cba18 583-588
+src/runtime/fork-state.c
+  s_88e0f6ada225b0::t_f8c2905b25e7be 328
+  s_88e0f6ada225b0::t_e24c532c7a7980 471-472,506-507
+src/syscall/fdtable.c
+  s_88e0f6ada225b0::t_f8c2905b25e7be 310,863
+  s_88e0f6ada225b0::t_d89c04034cba18 346-347
+  s_88e0f6ada225b0::t_e24c532c7a7980 349-350
+  s_88e0f6ada225b0::t_72ce610999a938 343-345,348
+src/syscall/path.h
+  s_88e0f6ada225b0::t_ccc5133781f37d 144-151
+src/syscall/path.c
+  s_88e0f6ada225b0::t_e24c532c7a7980 131-135
+  s_88e0f6ada225b0::t_ef58a01e7735cd 115-118
+  s_88e0f6ada225b0::t_ccc5133781f37d 75-114,119-130,136-143
+tests/test-matrix.sh
+  s_1714865df3808d::t_04b8ff8c112e96 757-758
+tests/test-epoll-unsupported.c
+  s_88e0f6ada225b0::t_85936d8f9d9270 22-23
+  s_88e0f6ada225b0::t_e24c532c7a7980 200-202
+  s_1714865df3808d::t_0f479a4ae9c33d 1,3-6,14,18-21,25-27,31-35,38,54-57,60-61,113,118,121,311-315,368,371-372,399-402
+  s_1714865df3808d::t_e3547d1630c624 16,50,59
+  s_1714865df3808d::t_27a1b21e4a0e7b 2,15,17,24,29,36-37,39-49,51-53,58,112,114-117,119-120,122-133,304-310,316-317,354-356,358-367,369-370
+  s_88e0f6ada225b0::t_5fffc5df13c90c 260-303
+  s_88e0f6ada225b0::t_61aeeecf6a1daa 246-247,249
+  s_1714865df3808d::t_575b838141bc60 323-346,348,351-353
+  s_1714865df3808d::t_2bcbc746df3010 318
+  s_88e0f6ada225b0::t_6179ba9dd60373 251-259
+  s_88e0f6ada225b0::t_09312a751ac209 62-74,184-186,189,192-199,203-226
+  s_1714865df3808d::t_817d02d4764ed5 137-139,319-322
+  s_1714865df3808d::t_1d95bfcaa01349 7-13,28,136,140-144,166,174,176-177,179-181,183
+  s_88e0f6ada225b0::t_a62026c791648d 101-105,167-173,175,178,182
+  s_1714865df3808d::t_52cd07704111f0 30,373-398
+  s_1714865df3808d::t_13457c7f0a99ba 88-100,106-111,154-165
+  s_1714865df3808d::t_c1eb95a55b8e8d 347,349-350
+  s_1714865df3808d::t_420596a5d54b32 357
+  s_1714865df3808d::t_5d3dc1765f1883 75-87,187-188,190-191
+  s_88e0f6ada225b0::t_b3fcf4031a014e 145-153,227-245,248
+  s_1714865df3808d::t_b347150ae0d7fd 134-135
+  s_88e0f6ada225b0::t_f410eadbcdf76f 250
+tests/test-fork-ipc-protocol-host.c
+  s_88e0f6ada225b0::t_b982faf802bf3b 24,26-27,41-42
+src/syscall/internal.h
+  s_88e0f6ada225b0::t_d89c04034cba18 194-195
+  s_88e0f6ada225b0::t_82ae48136d46c8 196-198,200
+  s_88e0f6ada225b0::t_f8c2905b25e7be 199,237,254
+src/runtime/fork-state.h
+  s_88e0f6ada225b0::t_f8c2905b25e7be 124
+  s_88e0f6ada225b0::t_9c5e9f6f8b2320 22
+  s_88e0f6ada225b0::t_d89c04034cba18 119-122
+src/syscall/fs.c
+  s_88e0f6ada225b0::t_e24c532c7a7980 494-496
+  s_88e0f6ada225b0::t_969a2523351edc 497-501
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.24",
+  "base_commit_sha": "b05c1a90f2c4c732e1332fa2b551f7fe1e0818cc",
+  "prompts": {},
+  "sessions": {
+    "s_1714865df3808d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0aa1c540-34a2-41a3-aa2f-d7241d31bea7",
+        "model": "claude-opus-5"
+      },
+      "human_author": null
+    },
+    "s_38e8910f5e9384": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ea8f5490-7a14-44a5-9f0c-c9e92bbd67b2",
+        "model": "claude-opus-5"
+      },
+      "human_author": null
+    },
+    "s_88e0f6ada225b0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2098ec7b-5b91-4a57-a46e-7a0550b20c1f",
+        "model": "claude-opus-5"
+      },
+      "human_author": null
+    }
+  }
+}
