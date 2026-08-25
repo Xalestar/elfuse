@@ -1,0 +1,28 @@
+tests/manifest.txt
+  s_5e0bff0a449537::t_57a07aae8a70b1 76
+tests/test-epoll-del-leak.c
+  s_5e0bff0a449537::t_f6faa6c73996f8 1-5,14,17-71,78-82,84-94,101,103-104
+  s_5e0bff0a449537::t_93c9ad6f7946ca 11-12
+  s_5e0bff0a449537::t_17a0dccfac4ebe 72-77,83,95-100
+  s_5e0bff0a449537::t_38e9814667cff0 6-10,13,15-16,102
+src/syscall/poll.c
+  s_5e0bff0a449537::t_c5668748fca8e9 1512-1517,1520,1522-1524,1527-1529
+tests/test-matrix.sh
+  s_5e0bff0a449537::t_4b08bbf5ff3a0e 757-758
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.24",
+  "base_commit_sha": "2548742d930360a3cf93ed1bd942b79c1e579b84",
+  "prompts": {},
+  "sessions": {
+    "s_5e0bff0a449537": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7202e28b-cb89-4db3-a3cd-416b022c19fe",
+        "model": "claude-opus-5"
+      },
+      "human_author": "xalestar <alex.h.r.lin@gmail.com>"
+    }
+  }
+}
