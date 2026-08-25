@@ -1,0 +1,41 @@
+src/runtime/fork-state.c
+  s_88e0f6ada225b0::t_2284ee18939ce4 328,471-472,506-507
+src/runtime/fork-state.h
+  s_88e0f6ada225b0::t_e659b610192d07 22,119-122,124
+src/syscall/fdtable.c
+  s_88e0f6ada225b0::t_c2122f00989246 310,343-350,863
+src/syscall/fs.c
+  s_88e0f6ada225b0::t_024f1dca2a1584 494-501
+src/syscall/internal.h
+  s_88e0f6ada225b0::t_020258cc98cf38 219-225,262,279
+src/syscall/linux-wire.h
+  s_88e0f6ada225b0::t_c6bc7f28291932 582-590
+src/syscall/path.c
+  s_88e0f6ada225b0::t_77fc66ef0e7d8b 75-143
+src/syscall/path.h
+  s_88e0f6ada225b0::t_b22422814452ef 144-151
+src/syscall/poll.c
+  s_88e0f6ada225b0::t_90bdfe1128132b 21,1369-1404,1498-1502,1504-1506,1534-1548,1558-1559,1627-1653,1657-1662
+tests/test-epoll-unsupported.c
+  s_88e0f6ada225b0::t_00d48fb693bc87 1-402
+tests/test-fork-ipc-protocol-host.c
+  s_88e0f6ada225b0::t_d76e00a169b297 24,26-27,41-42
+tests/test-matrix.sh
+  s_88e0f6ada225b0::t_2c46998541fe45 757-758
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.24",
+  "base_commit_sha": "f55d36080269cabee4224aa8cd775b148bed437d",
+  "prompts": {},
+  "sessions": {
+    "s_88e0f6ada225b0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2098ec7b-5b91-4a57-a46e-7a0550b20c1f",
+        "model": "claude-opus-5"
+      },
+      "human_author": "xalestar <alex.h.r.lin@gmail.com>"
+    }
+  }
+}
