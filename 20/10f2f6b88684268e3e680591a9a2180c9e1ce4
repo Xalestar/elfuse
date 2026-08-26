@@ -1,0 +1,28 @@
+src/syscall/poll.c
+  s_5e0bff0a449537::t_f13f118b048b4b 1720-1724,1737,1749-1753,1778-1782,1786,1798,1801-1809,1942-1943,2092-2116
+  s_5e0bff0a449537::t_602a9d9c249f59 1052-1054,1057-1058,1085,1096-1097,1101,1409-1413,1415
+  s_5e0bff0a449537::t_95c55263457ded 1055-1056,1799-1800
+  s_5e0bff0a449537::t_745a406609c1b9 2117-2118
+src/syscall/path.c
+  s_5e0bff0a449537::t_602a9d9c249f59 148-157,163
+  s_5e0bff0a449537::t_05f39e566318eb 164
+tests/test-epoll-unsupported.c
+  s_5e0bff0a449537::t_95c55263457ded 112-146,194-215
+  s_5e0bff0a449537::t_e2dbecaa5ebe90 216
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.24",
+  "base_commit_sha": "2010f2f6b88684268e3e680591a9a2180c9e1ce4",
+  "prompts": {},
+  "sessions": {
+    "s_5e0bff0a449537": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7202e28b-cb89-4db3-a3cd-416b022c19fe",
+        "model": "claude-opus-5"
+      },
+      "human_author": "xalestar <alex.h.r.lin@gmail.com>"
+    }
+  }
+}
