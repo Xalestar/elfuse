@@ -1,0 +1,23 @@
+src/syscall/poll.c
+  s_5e0bff0a449537::t_2d2e53dde3c2d0 1423-1426
+  s_5e0bff0a449537::t_623045d10c2651 1422,1427-1450,1483-1485,1489-1504,1507-1508,1521
+tests/test-epoll-unsupported.c
+  s_5e0bff0a449537::t_2d2e53dde3c2d0 112-135,424-441
+  s_5e0bff0a449537::t_3a40a65b5449a2 442
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.24",
+  "base_commit_sha": "f0f00d0235c7c9b2992171e09ea55c68d3866ab8",
+  "prompts": {},
+  "sessions": {
+    "s_5e0bff0a449537": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7202e28b-cb89-4db3-a3cd-416b022c19fe",
+        "model": "claude-opus-5"
+      },
+      "human_author": "xalestar <alex.h.r.lin@gmail.com>"
+    }
+  }
+}
