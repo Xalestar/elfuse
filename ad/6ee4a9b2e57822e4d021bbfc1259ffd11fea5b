@@ -1,0 +1,19 @@
+src/syscall/poll.c
+  s_5e0bff0a449537::t_a4847d1c285239 1405-1421,1665-1675,1686
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.24",
+  "base_commit_sha": "ad6ee4a9b2e57822e4d021bbfc1259ffd11fea5b",
+  "prompts": {},
+  "sessions": {
+    "s_5e0bff0a449537": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7202e28b-cb89-4db3-a3cd-416b022c19fe",
+        "model": "claude-opus-5"
+      },
+      "human_author": "xalestar <alex.h.r.lin@gmail.com>"
+    }
+  }
+}
