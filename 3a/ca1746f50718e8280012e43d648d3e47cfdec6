@@ -1,5 +1,6 @@
 src/syscall/internal.h
   s_44fd69a4388f49::t_0cea3c4e1e922d 807,826,861,865
+  s_c9a3231c30132e::t_c5f7f96a89f96e 808-811,829,864
 tests/test-fd-ref-exhaustion-host.c
   s_44fd69a4388f49::t_f3d28952e47fe4 28-39
   s_44fd69a4388f49::t_535c5c93c01428 103-104
@@ -22,6 +23,14 @@ mk/tests.mk
       "agent_id": {
         "tool": "claude",
         "id": "5e117d1b-6086-4cf1-a45a-4c26ecdff268",
+        "model": "claude-opus-5"
+      },
+      "human_author": "xalestar <alex.h.r.lin@gmail.com>"
+    },
+    "s_c9a3231c30132e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9be718b0-ba43-4152-ba13-af4320517307",
         "model": "claude-opus-5"
       },
       "human_author": "xalestar <alex.h.r.lin@gmail.com>"
