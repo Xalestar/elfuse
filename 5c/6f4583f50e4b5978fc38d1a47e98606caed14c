@@ -1,0 +1,52 @@
+src/runtime/fork-state.c
+  s_869b4b47b597cc::t_a7372e281d8b07 531-533
+  s_869b4b47b597cc::t_988fe8d19a319e 522-529
+  s_869b4b47b597cc::t_a9d386d0632364 521
+src/syscall/internal.h
+  s_869b4b47b597cc::t_28d77dbbf9782f 346-347,765-786
+  s_869b4b47b597cc::t_16731df8b22c44 372-373,379-380
+src/syscall/fdtable.c
+  s_869b4b47b597cc::t_ff655e4f7fd70a 586-587,596-597,612-613,631-632,713-714,718,720
+  s_869b4b47b597cc::t_a9d386d0632364 50,1409-1411
+  s_869b4b47b597cc::t_7922f972f0a826 1400-1408,1412-1417,1442,1444-1449
+  s_869b4b47b597cc::t_a7372e281d8b07 1022
+  s_869b4b47b597cc::t_4eb83402ac295e 51-57,1016-1021,1023-1024,1121-1128
+tests/test-dir-fd-budget.c
+  s_869b4b47b597cc::t_a9d386d0632364 43-44,48-49
+  s_869b4b47b597cc::t_65ddd349b0b47e 179-182,191-194
+  s_869b4b47b597cc::t_a7372e281d8b07 200-202
+  s_869b4b47b597cc::t_4ede8d110bd252 1-24,27-30,32-35,37-42,45-47,50-69,83-85,87-88,104-174,184-185,199,203-221
+  s_869b4b47b597cc::t_efd9ffc8dd5fcf 25-26,31,36,70-82,86,89-103
+  s_869b4b47b597cc::t_03acbe99e10b46 175-178,183,186-190,195-198
+tests/manifest.txt
+  s_869b4b47b597cc::t_276560d62fbb07 83
+tests/test-matrix.sh
+  s_869b4b47b597cc::t_c8a9b6238eed04 770
+src/syscall/fs.c
+  s_869b4b47b597cc::t_46336943a96808 518-531,535-536
+  s_869b4b47b597cc::t_736bfcbcc92dc4 460-465,478,480-481,486-495,502,504-506
+  s_869b4b47b597cc::t_b32660ff55e469 958-961,963-965,975-976,986-993
+  s_869b4b47b597cc::t_918ce1d5a3057e 1134-1158,1170-1174
+  s_869b4b47b597cc::t_a5241ca91847a6 1179-1188
+  s_869b4b47b597cc::t_61ea30f775c036 349,351-355,357,360-369,371-382,389-396,398,400-402,433-440
+  s_869b4b47b597cc::t_a7372e281d8b07 496-499
+  s_869b4b47b597cc::t_fdeef29c559a16 675,739,763,786
+src/syscall/poll.c
+  s_869b4b47b597cc::t_c1a6d54e21d921 1219
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "5c6f4583f50e4b5978fc38d1a47e98606caed14c",
+  "prompts": {},
+  "sessions": {
+    "s_869b4b47b597cc": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "14d8ccac-0520-4bed-8f5f-a27b5de96448",
+        "model": "claude-opus-5"
+      },
+      "human_author": "xalestar <alex.h.r.lin@gmail.com>"
+    }
+  }
+}
