@@ -188,6 +188,23 @@ MUTATIONS = [
         "    return (uaddr & 0x3) == 0;",
         "    return (uaddr & 0x1) == 0;",
     ),
+    # ---- verify-futexreq ---------------------------------------------------
+    (
+        "futexreq",
+        "src/proved/futexreq.h",
+        "futex_requeue_counts_valid",
+        "accept any pair (a negative count survives as a huge unsigned)",
+        "    return nr_wake < FUTEX_COUNT_LIMIT && nr_requeue < FUTEX_COUNT_LIMIT;\n",
+        "    return 1;\n",
+    ),
+    (
+        "futexreq",
+        "src/proved/futexreq.h",
+        "futex_requeue_budget",
+        "bound the walk by the requeue half alone (the wake budget goes unwalked)",
+        "    return (uint64_t) nr_wake + nr_requeue;\n",
+        "    return (uint64_t) nr_requeue;\n",
+    ),
     # ---- verify-futexop ----------------------------------------------------
     (
         "futexop",

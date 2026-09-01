@@ -469,6 +469,15 @@ VERIFY_FUTEXOP_SCAN := src/proved/futexop.h
 VERIFY_FUTEXOP_CLAIM := for ANY guest-supplied val3 word
 VERIFY_FUTEXOP_UNPROVED := the wake and requeue walks around them stay test-covered
 
+VERIFY_FUTEXREQ_SRC  := src/proved/futexreq.h
+VERIFY_FUTEXREQ_FCTS := futex_requeue_counts_valid futex_requeue_budget
+VERIFY_FUTEXREQ_MIN_GOALS ?= 14
+# typed: two scalars in, one out, no buffer and no aliasing question.
+VERIFY_FUTEXREQ_MODEL := typed
+VERIFY_FUTEXREQ_SCAN := src/proved/futexreq.h
+VERIFY_FUTEXREQ_CLAIM := for ANY pair of guest-supplied requeue counts
+VERIFY_FUTEXREQ_UNPROVED := the bucket walk the budget bounds stays test-covered
+
 VERIFY_PATHDEPTH_SRC  := src/proved/pathdepth.h
 VERIFY_PATHDEPTH_FCTS := path_depth_push path_depth_pop
 VERIFY_PATHDEPTH_MIN_GOALS ?= 24

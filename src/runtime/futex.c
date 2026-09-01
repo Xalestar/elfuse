@@ -42,6 +42,7 @@
 #include "debug/log.h"
 #include "proved/futexhash.h"
 #include "proved/futexop.h"
+#include "proved/futexreq.h"
 #include "proved/timespec.h"
 
 /* macOS 14.4+ ships os_sync_{wait_on_address_with_timeout,wake_by_address_any}
@@ -1432,6 +1433,12 @@ static int64_t futex_requeue(guest_t *g,
                              int do_cmp,
                              uint32_t expected)
 {
+    /* Linux refuses these before taking either key; proved/futexreq.h carries
+     * why the sign is only visible as the top bit here.
+     */
+    if (!futex_requeue_counts_valid(wake_count, requeue_count))
+        return -LINUX_EINVAL;
+
     if (!futex_uaddr_is_aligned(uaddr) || !futex_uaddr_is_aligned(uaddr2))
         return -LINUX_EINVAL;
 
@@ -1462,34 +1469,28 @@ static int64_t futex_requeue(guest_t *g,
         }
     }
 
-    /* A PI waiter remains tied to its entry bucket while it retries the PI
-     * acquisition. FUTEX_REQUEUE has no PI-aware counterpart here, so reject an
-     * attempted migration before waking or moving any waiter.
+    /* A PI waiter stays tied to its entry bucket while it retries, and
+     * FUTEX_REQUEUE has no PI-aware form here, so reject one before anything
+     * moves. Every waiter the call could touch is checked, wake candidates
+     * included, matching where requeue.c makes the same decision. The budget is
+     * summed in 64 bits: both halves are guest-supplied and wake-all passes
+     * INT_MAX.
      */
-    if (uaddr != uaddr2 && requeue_count != 0) {
-        uint32_t skips = wake_count;
-        uint32_t remaining = requeue_count;
+    uint64_t checked = futex_requeue_budget(wake_count, requeue_count);
+    for (futex_waiter_t *w = b_src->head; w && checked != 0; w = w->next) {
+        if (w->uaddr != uaddr)
+            continue;
 
-        for (futex_waiter_t *w = b_src->head; w; w = w->next) {
-            if (w->uaddr != uaddr)
-                continue;
-            if (skips != 0) {
-                skips--;
-                continue;
-            }
-
-            /* pub_follows is false only for a PI waiter today; see where it is
-             * set in futex_lock_pi_inner.
-             */
-            if (!w->pub_follows) {
-                if (idx_src != idx_dst)
-                    pthread_mutex_unlock(&b_dst->lock);
-                pthread_mutex_unlock(&b_src->lock);
-                return -LINUX_EINVAL;
-            }
-            if (--remaining == 0)
-                break;
+        /* pub_follows is false only for a PI waiter today; see where it is set
+         * in futex_lock_pi_inner.
+         */
+        if (!w->pub_follows) {
+            if (idx_src != idx_dst)
+                pthread_mutex_unlock(&b_dst->lock);
+            pthread_mutex_unlock(&b_src->lock);
+            return -LINUX_EINVAL;
         }
+        checked--;
     }
 
     int woken = 0, requeued = 0;
@@ -1509,21 +1510,33 @@ static int64_t futex_requeue(guest_t *g,
             woken++;
             /* Leave pp unchanged because *pp is already the next node */
         } else if ((uint32_t) requeued < requeue_count) {
-            /* Requeue: remove from source, add to destination */
-            *pp = w->next;
+            if (idx_src == idx_dst) {
+                /* Same bucket: only the key changes. Linux's requeue_futex()
+                 * takes this path too (hb1 == hb2), rewriting q->key without
+                 * moving the entry. Unlinking and relinking here would put w
+                 * right back at *pp, so pp would never advance past it.
+                 */
+                w->uaddr = uaddr2;
+                pp = &w->next;
+            } else {
+                /* Requeue: remove from source, add to destination */
+                *pp = w->next;
 
-            /* Move the publication with the waiter. The destination is charged
-             * before the source is debited, so the shim never sees this parked
-             * waiter charged to no bucket.
-             */
-            shim_globals_futex_waiters_add(g, idx_dst, +1);
-            if (w->pub_follows) {
-                shim_globals_futex_waiters_add(g, w->pub_bucket, -1);
-                w->pub_bucket = idx_dst;
+                /* Credit the destination before debiting the source, so the
+                 * shim never sees this waiter charged to no bucket. Both halves
+                 * sit under pub_follows: a waiter carrying no charge of its own
+                 * must not gain one here, which is how a charge outlived its
+                 * waiter.
+                 */
+                if (w->pub_follows) {
+                    shim_globals_futex_waiters_add(g, idx_dst, +1);
+                    shim_globals_futex_waiters_add(g, w->pub_bucket, -1);
+                    w->pub_bucket = idx_dst;
+                }
+                w->uaddr = uaddr2;
+                w->next = b_dst->head;
+                b_dst->head = w;
             }
-            w->uaddr = uaddr2;
-            w->next = b_dst->head;
-            b_dst->head = w;
             requeued++;
         } else {
             break; /* Both limits reached */
