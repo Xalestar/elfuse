@@ -478,6 +478,16 @@ VERIFY_FUTEXREQ_SCAN := src/proved/futexreq.h
 VERIFY_FUTEXREQ_CLAIM := for ANY pair of guest-supplied requeue counts
 VERIFY_FUTEXREQ_UNPROVED := the bucket walk the budget bounds stays test-covered
 
+VERIFY_FUTEXWAKEOP_SRC  := src/proved/futexwakeop.h
+VERIFY_FUTEXWAKEOP_FCTS := futex_wake_op_supported futex_wake_cmp_supported \
+                           futex_wake_op_apply futex_wake_op_cmp
+VERIFY_FUTEXWAKEOP_MIN_GOALS ?= 92
+# typed: scalars in, one scalar out, no buffer and no aliasing question.
+VERIFY_FUTEXWAKEOP_MODEL := typed
+VERIFY_FUTEXWAKEOP_SCAN := src/proved/futexwakeop.h
+VERIFY_FUTEXWAKEOP_CLAIM := for ANY guest-supplied op and comparison selector
+VERIFY_FUTEXWAKEOP_UNPROVED := the wake walks the selectors gate stay test-covered
+
 VERIFY_PATHDEPTH_SRC  := src/proved/pathdepth.h
 VERIFY_PATHDEPTH_FCTS := path_depth_push path_depth_pop
 VERIFY_PATHDEPTH_MIN_GOALS ?= 24

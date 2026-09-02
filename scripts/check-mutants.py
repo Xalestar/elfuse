@@ -205,6 +205,39 @@ MUTATIONS = [
         "    return (uint64_t) nr_wake + nr_requeue;\n",
         "    return (uint64_t) nr_requeue;\n",
     ),
+    # ---- verify-futexwakeop ------------------------------------------------
+    (
+        "futexwakeop",
+        "src/proved/futexwakeop.h",
+        "futex_wake_op_supported",
+        "accept every op (an unassigned encoding stops being ENOSYS)",
+        "    return op <= FUTEX_WAKE_OP_MAX;\n",
+        "    return 1;\n",
+    ),
+    (
+        "futexwakeop",
+        "src/proved/futexwakeop.h",
+        "futex_wake_cmp_supported",
+        "accept every comparison selector",
+        "    return cmp <= FUTEX_WAKE_CMP_MAX;\n",
+        "    return 1;\n",
+    ),
+    (
+        "futexwakeop",
+        "src/proved/futexwakeop.h",
+        "futex_wake_op_apply",
+        "drop the complement from ANDN (it becomes AND)",
+        "        return old_val & ~op_val;\n",
+        "        return old_val & op_val;\n",
+    ),
+    (
+        "futexwakeop",
+        "src/proved/futexwakeop.h",
+        "futex_wake_op_cmp",
+        "widen LT to LE (the boundary case flips)",
+        "        return old_val < cmp_arg;\n",
+        "        return old_val <= cmp_arg;\n",
+    ),
     # ---- verify-futexop ----------------------------------------------------
     (
         "futexop",

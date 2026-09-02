@@ -43,6 +43,7 @@
 #include "proved/futexhash.h"
 #include "proved/futexop.h"
 #include "proved/futexreq.h"
+#include "proved/futexwakeop.h"
 #include "proved/timespec.h"
 
 /* macOS 14.4+ ships os_sync_{wait_on_address_with_timeout,wake_by_address_any}
@@ -1621,6 +1622,12 @@ static int64_t futex_wake_op(guest_t *g,
         op_val = 1U << futex_op_shift_arg_mask(op_arg);
     wake_op &= 7; /* Actual operation is bits 0-2 */
 
+    /* An op Linux does not implement stops here, before the modify and before
+     * any wake. proved/futexwakeop.h carries both gates.
+     */
+    if (!futex_wake_op_supported(wake_op))
+        return -LINUX_ENOSYS;
+
     unsigned idx1 = futex_hash(uaddr);
     unsigned idx2 = futex_hash(uaddr2);
     futex_bucket_t *b1 = &buckets[idx1];
@@ -1656,26 +1663,7 @@ static int64_t futex_wake_op(guest_t *g,
         ok = futex_word_load(word2, &old_val);
         if (!ok)
             break;
-        switch (wake_op) {
-        case 0:
-            new_val = op_val;
-            break; /* SET */
-        case 1:
-            new_val = old_val + op_val;
-            break; /* ADD */
-        case 2:
-            new_val = old_val | op_val;
-            break; /* OR */
-        case 3:
-            new_val = old_val & ~op_val;
-            break; /* ANDN */
-        case 4:
-            new_val = old_val ^ op_val;
-            break; /* XOR */
-        default:
-            new_val = old_val;
-            break;
-        }
+        new_val = futex_wake_op_apply(old_val, wake_op, op_val);
         ok = futex_word_cas(word2, &old_val, new_val, &swapped);
     } while (ok && !swapped);
 
@@ -1684,6 +1672,16 @@ static int64_t futex_wake_op(guest_t *g,
             pthread_mutex_unlock(&b2->lock);
         pthread_mutex_unlock(&b1->lock);
         return -LINUX_EFAULT;
+    }
+
+    /* A comparison Linux does not implement stops here: the modify above has
+     * already landed, and neither wake runs.
+     */
+    if (!futex_wake_cmp_supported(wake_cmp)) {
+        if (idx1 != idx2)
+            pthread_mutex_unlock(&b2->lock);
+        pthread_mutex_unlock(&b1->lock);
+        return -LINUX_ENOSYS;
     }
 
     /* Wake up to val waiters at uaddr (unlink woken entries) */
@@ -1699,32 +1697,8 @@ static int64_t futex_wake_op(guest_t *g,
         }
     }
 
-    /* Evaluate comparison predicate on old_val */
-    int cond_met = 0;
-    /* Linux FUTEX_WAKE_OP uses signed comparison semantics */
-    int32_t sv = (int32_t) old_val;
-    switch (wake_cmp) {
-    case 0:
-        cond_met = (sv == cmp_arg);
-        break; /* EQ */
-    case 1:
-        cond_met = (sv != cmp_arg);
-        break; /* NE */
-    case 2:
-        cond_met = (sv < cmp_arg);
-        break; /* LT (signed) */
-    case 3:
-        cond_met = (sv <= cmp_arg);
-        break; /* LE (signed) */
-    case 4:
-        cond_met = (sv > cmp_arg);
-        break; /* GT (signed) */
-    case 5:
-        cond_met = (sv >= cmp_arg);
-        break; /* GE (signed) */
-    default:
-        break;
-    }
+    /* Signed comparison on the word as it was before the modify. */
+    int cond_met = futex_wake_op_cmp((int32_t) old_val, wake_cmp, cmp_arg);
 
     /* Conditionally wake up to val2 waiters at uaddr2 (unlink woken) */
     int woken2 = 0;
