@@ -488,6 +488,17 @@ VERIFY_FUTEXWAKEOP_SCAN := src/proved/futexwakeop.h
 VERIFY_FUTEXWAKEOP_CLAIM := for ANY guest-supplied op and comparison selector
 VERIFY_FUTEXWAKEOP_UNPROVED := the wake walks the selectors gate stay test-covered
 
+VERIFY_FUTEXPI_SRC  := src/proved/futexpi.h
+VERIFY_FUTEXPI_FCTS := futex_pi_owner_tid futex_pi_unowned futex_pi_owner_died \
+                       futex_pi_has_waiters futex_pi_set_waiters \
+                       futex_pi_clear_waiters futex_pi_mark_owner_died
+VERIFY_FUTEXPI_MIN_GOALS ?= 38
+# typed: one scalar in, one scalar out, no buffer and no aliasing question.
+VERIFY_FUTEXPI_MODEL := typed
+VERIFY_FUTEXPI_SCAN := src/proved/futexpi.h
+VERIFY_FUTEXPI_CLAIM := for ANY bit pattern a guest can write to a PI lock word
+VERIFY_FUTEXPI_UNPROVED := the CAS loops around them stay test-covered
+
 VERIFY_PATHDEPTH_SRC  := src/proved/pathdepth.h
 VERIFY_PATHDEPTH_FCTS := path_depth_push path_depth_pop
 VERIFY_PATHDEPTH_MIN_GOALS ?= 24

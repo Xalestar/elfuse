@@ -42,6 +42,7 @@
 #include "debug/log.h"
 #include "proved/futexhash.h"
 #include "proved/futexop.h"
+#include "proved/futexpi.h"
 #include "proved/futexreq.h"
 #include "proved/futexwakeop.h"
 #include "proved/timespec.h"
@@ -108,18 +109,9 @@ _Static_assert(FUTEX_WAKE_BITSET == 10,
 
 #define FUTEX_BITSET_MATCH_ANY 0xFFFFFFFFU
 
-/* PI futex word layout (bits):
- *   0-29: TID of lock holder (0 = unlocked)
- *   30:   FUTEX_OWNER_DIED (set by robust_list_walk on thread exit)
- *   31:   FUTEX_WAITERS (at least one thread is blocked)
- *
- * Linux kernel: FUTEX_WAITERS=0x80000000 (bit 31), FUTEX_OWNER_DIED=0x40000000
- * (bit 30), FUTEX_TID_MASK=0x3FFFFFFF. FUTEX_OWNER_DIED=0x40000000 (bit 30) is
- * set by robust_list_walk on thread exit. FUTEX_TID_MASK is 30 bits.
+/* The PI word's three fields and the edits made to them are proved/futexpi.h,
+ * which carries the layout and Linux's own constants.
  */
-#define FUTEX_TID_MASK 0x3FFFFFFFU
-#define FUTEX_OWNER_DIED 0x40000000U
-#define FUTEX_WAITERS 0x80000000U
 
 /* Address-wait helper state.
  *
@@ -551,9 +543,9 @@ static void futex_clear_waiters_bit(uint32_t *word)
         bool cleared;
         if (!futex_word_load(word, &v))
             return;
-        if (!(v & FUTEX_WAITERS))
+        if (!futex_pi_has_waiters(v))
             return;
-        if (!futex_word_cas(word, &v, v & ~FUTEX_WAITERS, &cleared))
+        if (!futex_word_cas(word, &v, futex_pi_clear_waiters(v), &cleared))
             return;
         if (cleared)
             return;
@@ -1800,7 +1792,7 @@ static int64_t futex_lock_pi_inner(guest_t *g,
             return 0;
 
         /* Already own it? Deadlock (Linux returns EDEADLK) */
-        if ((expected & FUTEX_TID_MASK) == tid)
+        if (futex_pi_owner_tid(expected) == tid)
             return -LINUX_EDEADLK;
 
         /* Robust owner death: the robust-list walk sets FUTEX_OWNER_DIED and
@@ -1811,7 +1803,7 @@ static int64_t futex_lock_pi_inner(guest_t *g,
          * which never sees a robust-cleaned word (TID == 0) and would otherwise
          * spin forever.
          */
-        if (expected & FUTEX_OWNER_DIED) {
+        if (futex_pi_owner_died(expected)) {
             if (!futex_word_cas(word, &expected, 0, NULL))
                 return -LINUX_EFAULT;
             continue; /* Retry acquisition */
@@ -1822,7 +1814,7 @@ static int64_t futex_lock_pi_inner(guest_t *g,
          * FUTEX_LOCK_PI returns -ESRCH (attach_to_pi_owner ->
          * handle_exit_race).
          */
-        uint32_t owner_tid = expected & FUTEX_TID_MASK;
+        uint32_t owner_tid = futex_pi_owner_tid(expected);
         if (owner_tid != 0 && !thread_find((int64_t) owner_tid))
             return -LINUX_ESRCH;
 
@@ -1834,11 +1826,11 @@ static int64_t futex_lock_pi_inner(guest_t *g,
             uint32_t cur;
             if (!futex_word_load(word, &cur))
                 return -LINUX_EFAULT;
-            if ((cur & FUTEX_TID_MASK) == 0)
+            if (futex_pi_unowned(cur))
                 break; /* Owner released; retry outer loop */
-            if (cur & FUTEX_WAITERS)
+            if (futex_pi_has_waiters(cur))
                 break; /* Already set by another waiter */
-            uint32_t desired = cur | FUTEX_WAITERS;
+            uint32_t desired = futex_pi_set_waiters(cur);
             bool marked;
             if (!futex_word_cas(word, &cur, desired, &marked))
                 return -LINUX_EFAULT;
@@ -1850,7 +1842,7 @@ static int64_t futex_lock_pi_inner(guest_t *g,
         uint32_t cur;
         if (!futex_word_load(word, &cur))
             return -LINUX_EFAULT;
-        if ((cur & FUTEX_TID_MASK) == 0)
+        if (futex_pi_unowned(cur))
             continue;
 
         /* Enqueue and block */
@@ -1863,7 +1855,7 @@ static int64_t futex_lock_pi_inner(guest_t *g,
             pthread_mutex_unlock(&b->lock);
             return -LINUX_EFAULT;
         }
-        if ((cur & FUTEX_TID_MASK) == 0) {
+        if (futex_pi_unowned(cur)) {
             pthread_mutex_unlock(&b->lock);
             continue;
         }
@@ -2000,11 +1992,11 @@ static int64_t futex_lock_pi_inner(guest_t *g,
                     pthread_cond_destroy(&waiter.cond);
                     return -LINUX_EFAULT;
                 }
-                if (check & FUTEX_OWNER_DIED) {
+                if (futex_pi_owner_died(check)) {
                     owner_died = true;
                     break;
                 }
-                uint32_t check_tid = check & FUTEX_TID_MASK;
+                uint32_t check_tid = futex_pi_owner_tid(check);
                 if (check_tid != 0 && !thread_tid_alive((int64_t) check_tid)) {
                     bucket_unlink_locked(b, &waiter);
                     pthread_mutex_unlock(&b->lock);
@@ -2098,7 +2090,7 @@ static int64_t futex_unlock_pi(guest_t *g, uint64_t uaddr)
     uint32_t cur;
     if (guest_read_small(g, uaddr, &cur, sizeof(cur)) != 0)
         return -LINUX_EFAULT;
-    if ((cur & FUTEX_TID_MASK) != tid)
+    if (futex_pi_owner_tid(cur) != tid)
         return -LINUX_EPERM;
 
     /* Only the owner reaches here, and an owned PI lock is always aligned
@@ -2653,11 +2645,10 @@ void robust_list_walk(guest_t *g, thread_entry_t *t)
         if (guest_read_small(g, futex_gva, &futex_val, sizeof(futex_val)) ==
             0) {
             /* Only act if this thread owns the lock */
-            uint32_t owner = futex_val & FUTEX_TID_MASK;
+            uint32_t owner = futex_pi_owner_tid(futex_val);
             if (owner == (uint32_t) thread_tid(t)) {
                 /* Set FUTEX_OWNER_DIED and clear TID */
-                uint32_t new_val =
-                    (futex_val & ~FUTEX_TID_MASK) | FUTEX_OWNER_DIED;
+                uint32_t new_val = futex_pi_mark_owner_died(futex_val);
                 if (guest_write_small(g, futex_gva, &new_val, sizeof(new_val)) <
                     0)
                     log_debug(
@@ -2697,10 +2688,9 @@ void robust_list_walk(guest_t *g, thread_entry_t *t)
         uint32_t futex_val;
         if (guest_read_small(g, futex_gva, &futex_val, sizeof(futex_val)) ==
             0) {
-            uint32_t owner = futex_val & FUTEX_TID_MASK;
+            uint32_t owner = futex_pi_owner_tid(futex_val);
             if (owner == (uint32_t) thread_tid(t)) {
-                uint32_t new_val =
-                    (futex_val & ~FUTEX_TID_MASK) | FUTEX_OWNER_DIED;
+                uint32_t new_val = futex_pi_mark_owner_died(futex_val);
                 if (guest_write_small(g, futex_gva, &new_val, sizeof(new_val)) <
                     0)
                     log_debug(

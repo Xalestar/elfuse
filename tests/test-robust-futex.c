@@ -51,6 +51,7 @@ static struct robust_list_head rhead __attribute__((aligned(8)));
 static struct robust_list entry1 __attribute__((aligned(8)));
 
 static char child_stack[8192] __attribute__((aligned(16)));
+static volatile int preset_waiters;
 
 static int child_fn(void *arg)
 {
@@ -63,8 +64,11 @@ static int child_fn(void *arg)
     rhead.list_op_pending = NULL;
     entry1.next = &rhead.list; /* circular: points back to head */
 
-    /* "Acquire" the lock by writing the current TID */
-    lock_word = (uint32_t) tid;
+    /* "Acquire" the lock by writing the current TID, with WAITERS already set
+     * when the case under test wants it there.
+     */
+    lock_word =
+        (uint32_t) tid | (preset_waiters ? (uint32_t) FUTEX_WAITERS : 0u);
 
     /* Register robust list with kernel */
     raw_syscall2(99, (long) &rhead, sizeof(rhead)); /* set_robust_list */
@@ -76,48 +80,75 @@ static int child_fn(void *arg)
     test_unreachable();
 }
 
-int main(void)
+/* One owner-dies run.
+ *
+ * Returns the word the robust walk left behind, or 0 with *ok cleared if the
+ * thread could not be started.
+ */
+static uint32_t run_owner_death(int waiters, int *ok)
 {
-    TEST("robust-futex: owner-died on exit");
-
+    *ok = 1;
     lock_word = 0;
     memset(&rhead, 0, sizeof(rhead));
     memset(&entry1, 0, sizeof(entry1));
+    preset_waiters = waiters;
 
-    /* Clone a thread: CLONE_THREAD | CLONE_VM | CLONE_FS | CLONE_SIGHAND |
+    /* CLONE_THREAD | CLONE_VM | CLONE_FS | CLONE_SIGHAND |
      * CLONE_CHILD_CLEARTID. CLONE_THREAD implies CLONE_VM and CLONE_SIGHAND.
      */
-    long flags = 0x00010000    /* CLONE_THREAD */
-                 | 0x00000100  /* CLONE_VM */
-                 | 0x00000200  /* CLONE_FS */
-                 | 0x00000800  /* CLONE_SIGHAND */
-                 | 0x00200000; /* CLONE_CHILD_CLEARTID */
+    long flags = 0x00010000 | 0x00000100 | 0x00000200 | 0x00000800 | 0x00200000;
 
-    /* Use raw_syscall5 for clone(flags, stack, ptid, tls, ctid) */
     volatile int child_tid_addr = 0;
-    long ret = raw_syscall5(220, /* clone */
-                            flags, (long) (child_stack + sizeof(child_stack)),
-                            0,                     /* parent_tid */
-                            0,                     /* tls */
-                            (long) &child_tid_addr /* child_tid */
-    );
-
-    if (ret < 0) {
-        FAIL("clone failed");
-    } else if (ret == 0) {
-        /* Child */
+    long ret =
+        raw_syscall5(220, flags, (long) (child_stack + sizeof(child_stack)), 0,
+                     0, (long) &child_tid_addr);
+    if (ret == 0) {
         child_fn(NULL);
-    } else {
-        /* Parent: wait for child to exit via CLONE_CHILD_CLEARTID futex */
-        usleep(100000); /* 100ms grace period */
+        test_unreachable();
+    }
+    if (ret < 0) {
+        *ok = 0;
+        return 0;
+    }
+    usleep(100000); /* grace period for the exit-time walk */
+    return lock_word;
+}
 
-        /* Check if FUTEX_OWNER_DIED was set */
-        uint32_t val = lock_word;
-        if (val & FUTEX_OWNER_DIED) {
-            PASS();
-        } else {
-            FAIL("FUTEX_OWNER_DIED not set");
-        }
+int main(void)
+{
+    int ok;
+
+    TEST("robust-futex: owner-died on exit");
+    uint32_t plain = run_owner_death(0, &ok);
+    if (!ok) {
+        FAIL("clone failed");
+    } else {
+        EXPECT_TRUE(plain & FUTEX_OWNER_DIED, "FUTEX_OWNER_DIED not set");
+    }
+
+    /* The walk owes the word two more things than the flag. A TID left behind
+     * is an owner no LOCK_PI can displace, and it is what separates the robust
+     * path from an ordinary abandoned lock.
+     */
+    TEST("robust-futex: owner-died clears the TID");
+    EXPECT_TRUE(ok && (plain & FUTEX_TID_MASK) == 0,
+                "the dead owner's TID survived the walk");
+
+    TEST("robust-futex: owner-died keeps WAITERS clear");
+    EXPECT_TRUE(ok && (plain & FUTEX_WAITERS) == 0,
+                "WAITERS appeared on a word that never had it");
+
+    /* Same transition over a word that already had waiters: the bit has to
+     * survive, or the parked waiter is never woken.
+     */
+    TEST("robust-futex: owner-died keeps WAITERS set");
+    uint32_t contended = run_owner_death(1, &ok);
+    if (!ok) {
+        FAIL("clone failed");
+    } else {
+        EXPECT_TRUE(contended == ((uint32_t) FUTEX_WAITERS |
+                                  (uint32_t) FUTEX_OWNER_DIED),
+                    "a contended lock's word is not WAITERS|OWNER_DIED");
     }
 
     TEST("robust-futex: set_robust_list returns 0");
