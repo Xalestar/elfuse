@@ -205,6 +205,31 @@ MUTATIONS = [
         "    return (uint64_t) nr_wake + nr_requeue;\n",
         "    return (uint64_t) nr_requeue;\n",
     ),
+    # ---- verify-futexwaitv -------------------------------------------------
+    (
+        "futexwaitv",
+        "src/proved/futexwaitv.h",
+        "futex_bucket_insert",
+        "append without scanning (the set stops being sorted)",
+        "    unsigned pos = 0;\n",
+        "    unsigned pos = n;\n",
+    ),
+    (
+        "futexwaitv",
+        "src/proved/futexwaitv.h",
+        "futex_bucket_insert",
+        "drop the repeat check (one bucket is locked twice)",
+        "    if (pos < n && ids[pos] == idx)\n        return n;\n",
+        "    if (0)\n        return n;\n",
+    ),
+    (
+        "futexwaitv",
+        "src/proved/futexwaitv.h",
+        "futex_bucket_insert",
+        "stop the scan one short (an equal entry is missed)",
+        "    while (pos < n && ids[pos] < idx)\n",
+        "    while (pos + 1 < n && ids[pos] < idx)\n",
+    ),
     # ---- verify-futexpi ----------------------------------------------------
     (
         "futexpi",

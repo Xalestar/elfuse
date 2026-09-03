@@ -499,6 +499,15 @@ VERIFY_FUTEXPI_SCAN := src/proved/futexpi.h
 VERIFY_FUTEXPI_CLAIM := for ANY bit pattern a guest can write to a PI lock word
 VERIFY_FUTEXPI_UNPROVED := the CAS loops around them stay test-covered
 
+VERIFY_FUTEXWAITV_SRC  := src/proved/futexwaitv.h
+VERIFY_FUTEXWAITV_FCTS := futex_bucket_insert
+VERIFY_FUTEXWAITV_MIN_GOALS ?= 36
+# typed: one flat array of unsigned, no aliasing question beside it.
+VERIFY_FUTEXWAITV_MODEL := typed
+VERIFY_FUTEXWAITV_SCAN := src/proved/futexwaitv.h
+VERIFY_FUTEXWAITV_CLAIM := for ANY set of guest-chosen futex addresses
+VERIFY_FUTEXWAITV_UNPROVED := the walk that calls it stays test-covered
+
 VERIFY_PATHDEPTH_SRC  := src/proved/pathdepth.h
 VERIFY_PATHDEPTH_FCTS := path_depth_push path_depth_pop
 VERIFY_PATHDEPTH_MIN_GOALS ?= 24

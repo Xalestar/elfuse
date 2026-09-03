@@ -900,6 +900,8 @@ run_unit_tests()
         "$bindir/test-futex-requeue-pi"
     test_rc "$runner" "test-futex-wake-op-enosys" 0 \
         "$bindir/test-futex-wake-op-enosys"
+    test_rc "$runner" "test-futex-waitv-buckets" 0 \
+        "$bindir/test-futex-waitv-buckets"
     test_rc "$runner" "test-robust-futex" 0 "$bindir/test-robust-futex"
     test_rc "$runner" "test-futex-ops" 0 \
         "$bindir/test-futex-ops"

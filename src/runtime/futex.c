@@ -44,6 +44,7 @@
 #include "proved/futexop.h"
 #include "proved/futexpi.h"
 #include "proved/futexreq.h"
+#include "proved/futexwaitv.h"
 #include "proved/futexwakeop.h"
 #include "proved/timespec.h"
 
@@ -2293,30 +2294,22 @@ typedef struct {
 #define LINUX_CLOCK_REALTIME 0
 #define LINUX_CLOCK_MONOTONIC 1
 
+/* The distinct buckets the wait set covers, ascending. The locks below are
+ * taken in this order and released in reverse, so both properties of the answer
+ * are load-bearing: proved/futexwaitv.h carries them.
+ *
+ * nr_futexes is bounded by FUTEX_WAITV_MAX before the call, which is what keeps
+ * nbuckets below the array length at every insert.
+ */
 static int waitv_collect_buckets(const linux_futex_waitv_t *elts,
                                  uint32_t nr_futexes,
-                                 unsigned bucket_ids[FUTEX_WAITV_MAX],
-                                 futex_bucket_t *bucket_ptrs[FUTEX_WAITV_MAX])
+                                 unsigned bucket_ids[FUTEX_WAITV_MAX])
 {
     unsigned nbuckets = 0;
 
-    for (uint32_t i = 0; i < nr_futexes; i++) {
-        unsigned idx = futex_hash(elts[i].uaddr);
-        unsigned pos = 0;
-
-        while (pos < nbuckets && bucket_ids[pos] < idx)
-            pos++;
-        if (pos < nbuckets && bucket_ids[pos] == idx)
-            continue;
-
-        for (unsigned j = nbuckets; j > pos; j--) {
-            bucket_ids[j] = bucket_ids[j - 1];
-            bucket_ptrs[j] = bucket_ptrs[j - 1];
-        }
-        bucket_ids[pos] = idx;
-        bucket_ptrs[pos] = &buckets[idx];
-        nbuckets++;
-    }
+    for (uint32_t i = 0; i < nr_futexes; i++)
+        nbuckets = futex_bucket_insert(bucket_ids, nbuckets, FUTEX_WAITV_MAX,
+                                       futex_hash(elts[i].uaddr));
 
     return (int) nbuckets;
 }
@@ -2413,9 +2406,7 @@ int64_t sys_futex_waitv(guest_t *g,
      */
     futex_waiter_t waiters[FUTEX_WAITV_MAX];
     unsigned bucket_ids[FUTEX_WAITV_MAX];
-    futex_bucket_t *bucket_ptrs[FUTEX_WAITV_MAX];
-    int nbuckets =
-        waitv_collect_buckets(elts, nr_futexes, bucket_ids, bucket_ptrs);
+    int nbuckets = waitv_collect_buckets(elts, nr_futexes, bucket_ids);
     int enqueued = 0;
     int64_t result_err = 0;
 
@@ -2438,7 +2429,7 @@ int64_t sys_futex_waitv(guest_t *g,
     }
 
     for (int i = 0; i < nbuckets; i++)
-        pthread_mutex_lock(&bucket_ptrs[i]->lock);
+        pthread_mutex_lock(&buckets[bucket_ids[i]].lock);
 
     for (uint32_t i = 0; i < nr_futexes; i++) {
         uint64_t uaddr = elts[i].uaddr;
@@ -2467,7 +2458,7 @@ int64_t sys_futex_waitv(guest_t *g,
     }
 
     for (int i = nbuckets - 1; i >= 0; i--)
-        pthread_mutex_unlock(&bucket_ptrs[i]->lock);
+        pthread_mutex_unlock(&buckets[bucket_ids[i]].lock);
 
     /* All enqueued. Block on shared.cond until any wake site signals it. The
      * bounded sleep (capped at 100 ms or the user deadline, whichever is
@@ -2550,7 +2541,7 @@ int64_t sys_futex_waitv(guest_t *g,
 
 unlock_early:
     for (int i = nbuckets - 1; i >= 0; i--)
-        pthread_mutex_unlock(&bucket_ptrs[i]->lock);
+        pthread_mutex_unlock(&buckets[bucket_ids[i]].lock);
 
     for (int i = enqueued - 1; i >= 0; i--) {
         waitv_unlink(&waiters[i]);
