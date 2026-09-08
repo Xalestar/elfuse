@@ -2242,10 +2242,27 @@ static int64_t proc_wait_autoreap_children(int pid, int options)
             } else if (ret == 0) {
                 still_active = true;
             } else {
+                /* ret < 0, in practice ECHILD: the host child is gone. It can
+                 * be gone because proc_deferred_reap_poll() took it from the
+                 * watchdog tick, which reaches a single-threaded guest parked
+                 * here and not only one racing a second guest thread. When the
+                 * registry already carried the exit, the entry holds the status
+                 * and the rusage, so finish it the way the ret == host_pid
+                 * branch does: deactivating alone drops the child's time from
+                 * RUSAGE_CHILDREN and leaves the lifecycle row to be imported
+                 * again.
+                 */
                 proc_entry_t *entry =
                     proc_find_host_guest_entry(host_pid, guest_pid);
-                if (entry)
+                if (entry && entry->exited) {
+                    proc_account_entry_locked(entry);
                     entry->active = false;
+                    pthread_mutex_unlock(&pid_lock);
+                    lifecycle_consume(guest_pid);
+                    pthread_mutex_lock(&pid_lock);
+                } else if (entry) {
+                    entry->active = false;
+                }
             }
         }
         pthread_mutex_unlock(&pid_lock);
@@ -2301,24 +2318,37 @@ static void proc_deferred_reap_poll(void)
             proc_table[i].host_reap_pending = false;
             continue;
         }
+
+        /* Claim the entry by clearing the flag before dropping the lock, and
+         * put it back below if the child was not reapable after all. The
+         * watchdog tick made this a second concurrent caller even for a guest
+         * with one thread, and two callers that both saw the flag would both
+         * call wait4 on this host_pid. The host OS can hand that pid to a
+         * freshly spawned fork child the instant the first call reaps it, so
+         * the second would reap that one and discard its status. The paired
+         * lookup below guards which entry the flag is written back to, not the
+         * reap itself.
+         */
+        proc_table[i].host_reap_pending = false;
         pthread_mutex_unlock(&pid_lock);
         int st;
         pid_t r = wait4(host_pid, &st, WNOHANG, NULL);
         pthread_mutex_lock(&pid_lock);
 
-        /* Only clear the flag once the zombie is gone (r > 0) or the child is
-         * no longer ours to reap (r < 0, typically ECHILD). The guest_pid check
-         * guards against host_pid reuse: the host OS can hand this exact pid to
-         * a brand new process the instant wait4 above reaps it, and a second
-         * guest fork admitted on another thread during this unlocked window
-         * could land that new child in slot i under the same host_pid. Clearing
-         * host_reap_pending for it instead of (or in addition to) the original
-         * entry would strand a real pending zombie.
+        /* Restore the claim when the child was still running (r == 0), so a
+         * later sweep tries again; a reaped zombie (r > 0) or one that is no
+         * longer ours (r < 0, typically ECHILD) stays cleared. The guest_pid
+         * check guards against host_pid reuse: the host OS can hand this exact
+         * pid to a brand new process the instant wait4 above reaps it, and a
+         * second guest fork admitted on another thread during this unlocked
+         * window could land that new child in slot i under the same host_pid.
+         * Writing the flag back onto it would ask a later sweep to reap a live
+         * child.
          */
-        if (r != 0 && i < proc_table_capacity &&
+        if (r == 0 && i < proc_table_capacity &&
             proc_table[i].host_pid == host_pid &&
             proc_table[i].guest_pid == guest_pid)
-            proc_table[i].host_reap_pending = false;
+            proc_table[i].host_reap_pending = true;
     }
     pthread_mutex_unlock(&pid_lock);
 }
@@ -2625,6 +2655,22 @@ int64_t sys_wait4(guest_t *g,
             } else if (ret == 0) {
                 return 0; /* WNOHANG */
             }
+
+            /* ECHILD here does not have to mean the guest has no such child.
+             * proc_deferred_reap_poll() collects host zombies whose status the
+             * guest already has, and it runs from the watchdog tick as well as
+             * from this entry, so it can take this host_pid between the poll
+             * above and this line. The status is copied into the table before
+             * the reap is flagged, so ask the table before reporting the host
+             * errno; the re-entry answers from the lookup at the top.
+             */
+            int wait_errno = errno;
+            if (wait_errno == ECHILD) {
+                lifecycle_import_children();
+                if (proc_guest_child_exited(gpid))
+                    return sys_wait4(g, pid, status_gva, options, rusage_gva);
+            }
+            errno = wait_errno;
             return linux_errno();
         }
     }
@@ -3026,6 +3072,15 @@ static void *preempt_thread_main(void *arg)
             pthread_mutex_unlock(&pid_lock);
             wakeup_pipe_signal();
         } else if (sig == SIGALRM) {
+            /* sys_wait4's entry is the only other caller, so a guest that takes
+             * its last child's status and never waits again strands that
+             * child's host process as a zombie for the rest of the run. The
+             * tick already exists and already runs on this thread, so sweeping
+             * from it bounds the strand to a period or two without adding a
+             * thread, a wakeup, or a cost on the wait path.
+             */
+            proc_deferred_reap_poll();
+
             static uint64_t last_progress;
             uint64_t now =
                 atomic_load_explicit(&g_vcpu_progress, memory_order_relaxed);
