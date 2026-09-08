@@ -2263,6 +2263,25 @@ static int64_t proc_wait_autoreap_children(int pid, int options)
     }
 }
 
+/* Has the local table already recorded this child's exit? The lifecycle
+ * registry carries the guest exit before the child's host process finishes
+ * tearing down, so this can be true while waitpid(2) on the host pid still
+ * reports the process as running.
+ */
+static bool proc_guest_child_exited_locked(int64_t guest_pid)
+{
+    proc_entry_t *entry = proc_find_guest_entry(guest_pid);
+    return entry && entry->exited;
+}
+
+static bool proc_guest_child_exited(int64_t guest_pid)
+{
+    pthread_mutex_lock(&pid_lock);
+    bool exited = proc_guest_child_exited_locked(guest_pid);
+    pthread_mutex_unlock(&pid_lock);
+    return exited;
+}
+
 /* sys_wait4. */
 
 /* Reap host children whose terminal status the guest already consumed from the
@@ -2563,9 +2582,41 @@ int64_t sys_wait4(guest_t *g,
                         return -LINUX_EINTR;
                     struct timespec ts;
                     timespec_deadline_in_ms(&ts, 100);
+
+                    /* Import before the sleep as well as after it. The poll
+                     * above runs unlocked, so a broadcast landing between it
+                     * and the lock below finds nobody parked and evaporates:
+                     * pid_cond keeps no count. The doorbell sets entry->exited
+                     * under pid_lock before it broadcasts, so re-reading the
+                     * table inside the same critical section the sleep releases
+                     * is what closes that window. The import itself stays
+                     * outside the lock, like the poll: it touches the registry
+                     * file, and pid_lock holds only bounded table walks.
+                     */
+                    lifecycle_import_children();
                     pthread_mutex_lock(&pid_lock);
+                    if (proc_guest_child_exited_locked(gpid)) {
+                        pthread_mutex_unlock(&pid_lock);
+                        return sys_wait4(g, pid, status_gva, options,
+                                         rusage_gva);
+                    }
                     pthread_cond_timedwait(&pid_cond, &pid_lock, &ts);
                     pthread_mutex_unlock(&pid_lock);
+
+                    /* The doorbell reports the guest exit about a millisecond
+                     * before the child's host process becomes reapable, so the
+                     * poll above still says "running" when the wakeup arrives.
+                     * The registry carries the exit by then, so importing it
+                     * copies the status across and flags the host reap for
+                     * proc_deferred_reap_poll(), after which the table lookup
+                     * at the top of sys_wait4 answers without waiting for the
+                     * host process at all. Without this the wakeup is wasted
+                     * and the wait costs the full 100 ms timeout.
+                     */
+                    lifecycle_import_children();
+                    if (proc_guest_child_exited(gpid))
+                        return sys_wait4(g, pid, status_gva, options,
+                                         rusage_gva);
                 }
             }
             if (ret > 0) {
