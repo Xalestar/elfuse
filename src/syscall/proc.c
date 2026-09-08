@@ -2953,6 +2953,26 @@ static void *preempt_thread_main(void *arg)
             atomic_store_explicit(&g_external_guest_signal, 1,
                                   memory_order_release);
             drain_external_guest_signal();
+
+            /* The doorbell is also how a fork child reports that it exited.
+             * sys_wait4 and sys_waitid sleep on pid_cond between re-checks, and
+             * nothing on this path signaled it, so a waiting parent only
+             * re-checked when its 100 ms safety-net timeout expired: every
+             * fork/wait pair paid that timeout in full even though the child
+             * was already gone.
+             *
+             * Broadcast under pid_lock, not beside it. A sleeper holds the lock
+             * across its predicate check and only releases it inside
+             * pthread_cond_timedwait, so taking the lock here means the
+             * broadcast cannot land in the window between the two and be lost.
+             * pid_lock is a leaf (see the lock-order block in
+             * syscall/internal.h) and every critical section under it is a
+             * bounded table walk, so this cannot invert an order or park the
+             * sigwait thread on someone else's blocking call.
+             */
+            pthread_mutex_lock(&pid_lock);
+            pthread_cond_broadcast(&pid_cond);
+            pthread_mutex_unlock(&pid_lock);
             wakeup_pipe_signal();
         } else if (sig == SIGALRM) {
             static uint64_t last_progress;
