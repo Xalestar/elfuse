@@ -1,0 +1,19 @@
+src/syscall/proc.c
+  s_ff7192c32146c5::t_c02875f46e4696 2956-2975
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "18f71484795df65cd2426884bc2a6591e509b14b",
+  "prompts": {},
+  "sessions": {
+    "s_ff7192c32146c5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "15ed836e-f4a7-4699-80ba-cf632ca50ad9",
+        "model": "claude-opus-5"
+      },
+      "human_author": "xalestar <alex.h.r.lin@gmail.com>"
+    }
+  }
+}
