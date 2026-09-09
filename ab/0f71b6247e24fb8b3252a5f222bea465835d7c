@@ -1,0 +1,19 @@
+tests/test-fork-wait-latency.c
+  s_4402c8bb894863::t_ed8c7a8d514a58 44-50,52,54-98,101-106,108,112-115,119,121-125,127-128,132-138,144-146,149,151-153,158,161
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "ab0f71b6247e24fb8b3252a5f222bea465835d7c",
+  "prompts": {},
+  "sessions": {
+    "s_4402c8bb894863": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d24400ed-b014-4073-bbf5-2a254d57e8f6",
+        "model": "claude-opus-5"
+      },
+      "human_author": "xalestar <alex.h.r.lin@gmail.com>"
+    }
+  }
+}
