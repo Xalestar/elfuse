@@ -1,0 +1,19 @@
+src/syscall/proc.c
+  s_4402c8bb894863::t_a8ef4f9ffbbb9a 2288-2293,2297,2615-2626,2628-2632,2636-2640
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "8811a4c0b13064ee2984b8de559269a581d72f2e",
+  "prompts": {},
+  "sessions": {
+    "s_4402c8bb894863": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d24400ed-b014-4073-bbf5-2a254d57e8f6",
+        "model": "claude-opus-5"
+      },
+      "human_author": "xalestar <alex.h.r.lin@gmail.com>"
+    }
+  }
+}
