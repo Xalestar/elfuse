@@ -1,0 +1,23 @@
+src/syscall/proc.c
+  s_4402c8bb894863::t_62fa8e3a21cb05 2266-2284,2585-2596,2598-2602,2605-2619
+tests/test-fork-wait-latency.c
+  s_4402c8bb894863::t_d17ee957511548 1-182
+tests/test-matrix.sh
+  s_4402c8bb894863::t_074a46c47bcca1 709-710
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.2",
+  "base_commit_sha": "b7d917700d61af7f5f662185bcef7499bcfc1ac3",
+  "prompts": {},
+  "sessions": {
+    "s_4402c8bb894863": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d24400ed-b014-4073-bbf5-2a254d57e8f6",
+        "model": "claude-opus-5"
+      },
+      "human_author": "xalestar <alex.h.r.lin@gmail.com>"
+    }
+  }
+}
