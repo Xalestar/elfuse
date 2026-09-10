@@ -1324,6 +1324,34 @@ static int64_t futex_wait(guest_t *g,
     return rc;
 }
 
+/* Whether a plain wake would meet a PI waiter among the first budget entries it
+ * would touch at uaddr. A PI waiter stays tied to its entry bucket while it
+ * retries and is not woken by a plain wake, so Linux answers EINVAL from inside
+ * futex_wake() and futex_wake_op(); this decides before anything is woken, the
+ * way futex_requeue decides, so a refused call leaves the chain as it found it.
+ *
+ * The budget is what bounds the walk, because a waiter Linux never reaches
+ * cannot refuse the call: its loops stop once nr_wake entries are woken.
+ */
+static bool futex_pi_waiter_within(const futex_bucket_t *b,
+                                   uint64_t uaddr,
+                                   uint32_t bitset,
+                                   uint32_t budget)
+{
+    for (const futex_waiter_t *w = b->head; w && budget != 0; w = w->next) {
+        if (w->uaddr != uaddr || (w->bitset & bitset) == 0)
+            continue;
+
+        /* pub_follows is false only for a PI waiter today; see where it is set
+         * in futex_lock_pi_inner.
+         */
+        if (!w->pub_follows)
+            return true;
+        budget--;
+    }
+    return false;
+}
+
 static int64_t futex_wake(const guest_t *g,
                           uint64_t uaddr,
                           uint32_t val,
@@ -1389,6 +1417,11 @@ static int64_t futex_wake(const guest_t *g,
         }
     }
 #endif
+
+    if (futex_pi_waiter_within(b, uaddr, bitset, val)) {
+        pthread_mutex_unlock(&b->lock);
+        return -LINUX_EINVAL;
+    }
 
     futex_waiter_t **pp = &b->head;
     while (*pp && (uint32_t) woken < val) {
@@ -1677,6 +1710,26 @@ static int64_t futex_wake_op(guest_t *g,
         return -LINUX_ENOSYS;
     }
 
+    /* Signed comparison on the word as it was before the modify. Evaluated here
+     * because the test below has to know whether the second wake runs at all: a
+     * walk the comparison never reaches cannot refuse the call.
+     */
+    int cond_met = futex_wake_op_cmp((int32_t) old_val, wake_cmp, cmp_arg);
+
+    /* Neither wake reaches a PI waiter. Both walks are tested before either one
+     * wakes anybody, so a refused call leaves both chains as it found them. The
+     * modify above stays: Linux applies it before its own walks reach the
+     * waiter that answers EINVAL.
+     */
+    if (futex_pi_waiter_within(b1, uaddr, FUTEX_BITSET_MATCH_ANY, val) ||
+        (cond_met &&
+         futex_pi_waiter_within(b2, uaddr2, FUTEX_BITSET_MATCH_ANY, val2))) {
+        if (idx1 != idx2)
+            pthread_mutex_unlock(&b2->lock);
+        pthread_mutex_unlock(&b1->lock);
+        return -LINUX_EINVAL;
+    }
+
     /* Wake up to val waiters at uaddr (unlink woken entries) */
     int woken1 = 0;
     futex_waiter_t **pp1 = &b1->head;
@@ -1689,9 +1742,6 @@ static int64_t futex_wake_op(guest_t *g,
             pp1 = &w->next;
         }
     }
-
-    /* Signed comparison on the word as it was before the modify. */
-    int cond_met = futex_wake_op_cmp((int32_t) old_val, wake_cmp, cmp_arg);
 
     /* Conditionally wake up to val2 waiters at uaddr2 (unlink woken) */
     int woken2 = 0;
