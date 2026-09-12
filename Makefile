@@ -536,6 +536,12 @@ $(BUILD_DIR)/test-futex-requeue-account: tests/test-futex-requeue-account.c \
 	@echo "  CROSS   $< (with -lpthread)"
 	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
 
+# test-futex-requeue-samebucket parks a waiter, so it needs threads.
+$(BUILD_DIR)/test-futex-requeue-samebucket: \
+    tests/test-futex-requeue-samebucket.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
+
 # test-futex-wake-nowaiter races a waker against a waiter to prove the EL1 wake
 # path never answers 0 for an address that still has one, so it needs a thread.
 $(BUILD_DIR)/test-futex-wake-nowaiter: tests/test-futex-wake-nowaiter.c \
