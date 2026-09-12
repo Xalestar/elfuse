@@ -27,6 +27,7 @@
 #include "syscall/proc.h" /* proc_exit_group_requested, proc_get_pid */
 #include "syscall/signal.h"
 #include "syscall/time.h"
+#include "syscall/wakeup-pipe.h"
 
 /* Linux TIMER_ABSTIME (not defined on all macOS SDK versions) */
 #ifndef TIMER_ABSTIME
@@ -117,8 +118,40 @@ static int64_t interruptible_sleep_ns(guest_t *g,
 {
     int64_t requested_ns = remaining_ns;
 
+    struct timespec start;
+    if (clock_gettime(CLOCK_MONOTONIC, &start) < 0)
+        return linux_errno();
+
+    int64_t elapsed_ns = 0;
+    int64_t stop_due_ns = 0;
+
     while (remaining_ns > 0) {
-        if (thread_stop_requested() || signal_pending()) {
+        /* Read the wake counter before testing the predicate, not after. A wake
+         * that lands in between then moves the counter and wakeup_wait_ns
+         * returns without parking, instead of broadcasting to a thread that has
+         * not arrived yet and being lost.
+         */
+        uint64_t counter = wakeup_counter();
+
+        /* A queued signal ends the sleep as soon as the wake reaches this
+         * thread, which is what joining the wake is for. A stop request keeps
+         * the cadence it had when no wake could reach a sleep at all, one test
+         * per SLEEP_CHUNK_NS, because the two are not the same condition.
+         *
+         * A signal is what the guest asked to be interrupted for. A stop
+         * request is this tree asking its own threads to leave the guest, and
+         * an exec handoff issues one thousands of times a second. Testing it on
+         * every wake turns each of those into a guest-visible EINTR, and the
+         * guest reissues the rest of its interval after every one:
+         * test-exec-handoff measured the 400 ms sleep it runs under handoff
+         * pressure taking 3150 ms across 29390 returns, against 432 ms across 3
+         * on this cadence.
+         */
+        bool stop_due = elapsed_ns >= stop_due_ns;
+        if (stop_due)
+            stop_due_ns = elapsed_ns + SLEEP_CHUNK_NS;
+
+        if (signal_pending() || (stop_due && thread_stop_requested())) {
             /* Only once part of a relative interval is spent, because the
              * restart re-runs the original request rather than the remainder.
              * This check also runs before the first chunk, where nothing is
@@ -135,24 +168,26 @@ static int64_t interruptible_sleep_ns(guest_t *g,
             return -LINUX_EINTR;
         }
 
-        int64_t sleep_ns =
-            (remaining_ns < SLEEP_CHUNK_NS) ? remaining_ns : SLEEP_CHUNK_NS;
-        struct timespec req = ns_to_host_timespec(sleep_ns);
-        struct timespec rem = {0};
+        /* Park until whichever comes first, the end of the interval or the next
+         * stop test. A wake cuts the park short, so this bounds the stop
+         * cadence rather than what the sleep waits on.
+         */
+        int64_t chunk_ns = stop_due_ns - elapsed_ns;
+        if (remaining_ns < chunk_ns)
+            chunk_ns = remaining_ns;
+        wakeup_wait_ns(chunk_ns, counter);
 
-        if (nanosleep(&req, &rem) < 0) {
-            int64_t slept_ns = sleep_ns - host_timespec_to_ns_sat(&rem);
-            if (slept_ns < 0)
-                slept_ns = 0;
-            remaining_ns -= slept_ns;
-            if (write_rem && remaining_ns != requested_ns)
-                syscall_restart_forbid();
-            if (write_rem &&
-                write_remaining_sleep(g, rem_gva, remaining_ns) < 0)
-                return -LINUX_EFAULT;
-            return -LINUX_EINTR;
-        }
-        remaining_ns -= sleep_ns;
+        /* Charge the time that actually passed. The wake is process-wide, so
+         * the park also returns early on another thread's, and a condition
+         * variable may return spuriously. Neither the chunk nor the request is
+         * a safe measure of what was spent.
+         */
+        struct timespec now;
+        if (clock_gettime(CLOCK_MONOTONIC, &now) < 0)
+            return linux_errno();
+        elapsed_ns =
+            host_timespec_to_ns_sat(&now) - host_timespec_to_ns_sat(&start);
+        remaining_ns = requested_ns - elapsed_ns;
     }
 
     return 0;

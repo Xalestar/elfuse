@@ -141,6 +141,7 @@
  *                                    sysinfo_lock (sys.c)
  *                                    sysroot_lock (proc-state.c)
  *                                    usb_lock (runtime/usb-sysfs.c)
+ *   wake_lock (syscall/wakeup-pipe.c)
  *
  * log_mutex is the one leaf every other entry may hold: a lock anywhere in
  * either list can log while held. It sits below the whole order rather than

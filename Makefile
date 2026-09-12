@@ -398,6 +398,14 @@ $(BUILD_DIR)/test-socket-accept-contended: \
 	@echo "  CROSS   $< (with -lpthread)"
 	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
 
+# test-nanosleep-signal-latency aims a signal at a sibling thread parked in a
+# sleep, which is the only way to hold one thread in the wait while another
+# times the delivery.
+$(BUILD_DIR)/test-nanosleep-signal-latency: \
+		tests/test-nanosleep-signal-latency.c | $(BUILD_DIR)
+	@echo "  CROSS   $< (with -lpthread)"
+	$(Q)$(CROSS_COMPILE)gcc $(CROSS_TEST_CFLAGS) -o $@ $< -lpthread
+
 # test-socket-waitall drips the tail of a MSG_WAITALL request from a second
 # thread.
 $(BUILD_DIR)/test-socket-waitall: tests/test-socket-waitall.c | $(BUILD_DIR)

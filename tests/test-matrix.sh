@@ -720,6 +720,8 @@ run_unit_tests()
     test_check "$runner" "test-signal-thread" "PASS|0 failed" "$bindir/test-signal-thread"
     test_check "$runner" "test-signal-in-shim" "0 failed" \
         "$bindir/test-signal-in-shim"
+    test_check "$runner" "test-nanosleep-signal-latency" "PASS" \
+        "$bindir/test-nanosleep-signal-latency"
     test_check "$runner" "test-ptrace-interrupt" "OK: ptrace-stop reports EL0" \
         "$bindir/test-ptrace-interrupt"
     test_check "$runner" "test-sigsuspend" "PASS|0 failed" "$bindir/test-sigsuspend"
